@@ -15,12 +15,33 @@ use crate::utils::stream_failure::{
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 static H2_ALPN_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
+static CLIENT_VERSION: OnceLock<String> = OnceLock::new();
+
+/// Set the product version reported in the default `User-Agent`
+/// (`prime-agent/<version>`) of every provider request. The binary passes its
+/// runtime version: a release restamps the packaged manifest, not the
+/// compiled-in crate version. The first call wins; requests that carry their
+/// own `User-Agent` header (provider identity parity) always override it.
+pub fn set_client_version(version: &str) {
+    let _ = CLIENT_VERSION.set(version.to_string());
+}
+
+/// The default `User-Agent` value: the version given to
+/// [`set_client_version`], else the compiled-in crate version.
+fn client_user_agent() -> String {
+    let version = CLIENT_VERSION
+        .get()
+        .map_or(env!("CARGO_PKG_VERSION"), String::as_str);
+    format!("prime-agent/{version}")
+}
+
 /// The HTTP/1.1 client every provider shares, pinned with `http1_only()` so that enabling the
 /// reqwest `http2` feature (bedrock) cannot change the transport of any other provider.
 fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .http1_only()
+            .user_agent(client_user_agent())
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()
             .expect("reqwest client")
@@ -32,6 +53,7 @@ fn client() -> &'static reqwest::Client {
 fn h2_alpn_client() -> &'static reqwest::Client {
     H2_ALPN_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .user_agent(client_user_agent())
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()
             .expect("reqwest h2 client")
@@ -431,5 +453,55 @@ mod tests {
             text.push_str(&chunk);
         }
         assert_eq!(text, "cut \u{FFFD}");
+    }
+
+    /// Capture the request head the shared client puts on the wire.
+    async fn capture_request_head(headers: Vec<(String, String)>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let read = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..read]).to_string()
+        });
+        send(RequestOptions {
+            headers,
+            ..RequestOptions::new(reqwest::Method::GET, format!("http://{addr}/"))
+        })
+        .await
+        .unwrap();
+        server.await.unwrap()
+    }
+
+    #[test]
+    fn the_client_version_setter_drives_the_identity_value() {
+        set_client_version("9.9.9-test");
+        assert_eq!(client_user_agent(), "prime-agent/9.9.9-test");
+    }
+
+    #[tokio::test]
+    async fn provider_requests_report_the_prime_agent_identity() {
+        let head = capture_request_head(Vec::new()).await;
+        assert!(head.contains("\r\nuser-agent: prime-agent/"), "got: {head}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_user_agent_overrides_the_product_identity() {
+        let head = capture_request_head(vec![(
+            "user-agent".to_string(),
+            "spoofed-agent/1.0".to_string(),
+        )])
+        .await;
+        assert!(
+            head.contains("user-agent: spoofed-agent/1.0\r\n"),
+            "got: {head}"
+        );
+        assert!(!head.contains("prime-agent/"), "got: {head}");
     }
 }

@@ -1,7 +1,9 @@
 //! Provider APIs and model registry for Prime Agent.
 //!
 //! The wire/domain types live in `pa-types` (the only dependency, one-way) and are re-exported
-//! from [`types`]; per-provider internals are `pub(crate)`.
+//! from [`types`]; per-provider internals are `pub(crate)`. The one exception the binary needs
+//! is [`set_client_version`], the product version every provider request reports in its
+//! default `User-Agent`.
 //!
 //! Wire-shape enums mirror the TS tagged unions 1:1, so `large_enum_variant` and
 //! `result_large_err` are allowed crate-wide rather than boxing payloads.
@@ -35,6 +37,7 @@ pub mod codex_debug {
 pub use providers::simple_options::{default_request_max_tokens, effective_request_max_tokens};
 pub use registry::{Provider, ProviderRegistry};
 pub use stream::{complete, complete_simple, stream, stream_simple};
+pub use utils_inner::http::set_client_version;
 
 // Cross-crate surface consumed by the agent layer (pa-ai owned).
 pub mod utils {
