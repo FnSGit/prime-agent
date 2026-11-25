@@ -17,6 +17,7 @@ mod flush;
 mod frame;
 mod geometry;
 mod handoff;
+mod inbox_run;
 mod layout;
 pub(crate) mod lazy;
 mod panels;
@@ -50,6 +51,41 @@ impl Default for ShareLoader {
     }
 }
 
+/// A panel that owns the frame (in place of the editor dock) while it is open.
+pub(crate) enum Overlay {
+    /// The onboarding splash: covers the whole pane while its own input loop drives it.
+    Onboarding(crate::onboarding::OnboardingScreen),
+    /// The `/model` picker.
+    ModelPicker(crate::model_picker::ModelPicker),
+    /// The `/effort` inline picker (TS `ThinkingSelectorComponent` seam).
+    ChoicePicker(crate::choice_picker::ChoicePicker),
+    /// The `/mcp` connections view.
+    Mcp(crate::mcp_view::McpView),
+    /// The factory page: the activity dock's factory group's destination.
+    Factory(crate::factory_view::FactoryView),
+    /// The `/heartbeats` inline management view (TS `HeartbeatManagerComponent`).
+    Heartbeats(crate::heartbeats_picker::HeartbeatsPicker),
+    Goal(crate::goal_surface::GoalPanel),
+    Bash(crate::bash_view::BashView),
+    /// The read-only info panel (operator directive 2026-09-26: the `/context`-family displays
+    /// dock instead of flooding the transcript).
+    Info(crate::info_panel::InfoPanel),
+    Tree(crate::tree_selector::TreeSelector),
+    Fork(crate::user_message_selector::UserMessageSelector),
+    /// A `/share` upload in flight.
+    ShareLoader(ShareLoader),
+    /// A yes/no question and the action its `Yes` runs.
+    Confirm {
+        panel: crate::confirm::ConfirmPanel,
+        pending: crate::session_ui::PendingConfirm,
+    },
+    ProviderAuth(crate::provider_auth::ProviderAuthSelector),
+    AuthPanel(crate::auth_panel::AuthPanel),
+    /// The `/reload` progress box.
+    Reload(String),
+    Settings(crate::settings_menu::SettingsMenu),
+}
+
 pub struct AgentView {
     pub theme: Theme,
     /// The chat markdown fenced-code indent (`markdown.codeBlockIndent`;
@@ -78,32 +114,11 @@ pub struct AgentView {
     /// When the current working loader started (elapsed label).
     pub working_since: Option<std::time::Instant>,
     pub retry: Option<crate::chat::RetryState>,
-    pub onboarding: Option<crate::onboarding::OnboardingScreen>,
-    pub model_picker: Option<crate::model_picker::ModelPicker>,
-    pub tree_selector: Option<crate::tree_selector::TreeSelector>,
-    pub confirm: Option<crate::confirm::ConfirmPanel>,
-    pub provider_auth: Option<crate::provider_auth::ProviderAuthSelector>,
-    pub auth_panel: Option<crate::auth_panel::AuthPanel>,
-    pub fork_selector: Option<crate::user_message_selector::UserMessageSelector>,
-    pub effort_picker: Option<crate::effort_picker::EffortPicker>,
-    pub mcp_view: Option<crate::mcp_view::McpView>,
-    /// The factory page: while set, it owns the editor dock like the
-    /// inline pickers (one panel per live factory run) — the activity
-    /// dock's factory group's destination.
-    pub factory_view: Option<crate::factory_view::FactoryView>,
-    /// The `/heartbeats` inline management view (TS
-    /// `HeartbeatManagerComponent`, inline-picker style): while set, it
-    /// owns the editor dock like the `/model` and `/effort` pickers.
-    pub heartbeats_picker: Option<crate::heartbeats_picker::HeartbeatsPicker>,
-    pub goal_panel: Option<crate::goal_surface::GoalPanel>,
-    pub bash_view: Option<crate::bash_view::BashView>,
-    pub share_loader: Option<ShareLoader>,
-    pub reload_box: Option<String>,
+    /// The one panel that owns the frame while open; `None` is the bare editor dock. One field holds
+    /// it, so two panels can never be open at once, and keys, render, paste, mouse and cursor all
+    /// dispatch on the same value.
+    pub(crate) overlay: Option<Overlay>,
     pub side_pane: Option<crate::side_question::SideQuestionPane>,
-    pub settings_menu: Option<crate::settings_menu::SettingsMenu>,
-    /// The read-only info panel (operator directive 2026-09-26: the
-    /// `/context`-family displays dock instead of flooding the transcript).
-    pub info_panel: Option<crate::info_panel::InfoPanel>,
     /// The `terminal.showImages` setting (default true): image blocks
     /// render metadata rows when set, `[Image: ...]` placeholders otherwise.
     pub show_images: bool,
@@ -113,6 +128,8 @@ pub struct AgentView {
     /// The brand splash never renders while set (operator ruling 2026-09-26, zero layout
     /// shift): an opening non-empty transcript suppresses it.
     pub splash_suppressed: bool,
+    /// An older history page is on its way: a marker row stands above the first entry.
+    pub(crate) older_history_loading: bool,
     pub(crate) scroll_top: usize,
     following: bool,
     /// The transcript-tail offset of the last composed frame: scroll
@@ -132,9 +149,6 @@ pub struct AgentView {
     /// The hovered screen cell, while its row is a clickable card row
     /// (operator directive 2026-09-26); revalidated every frame.
     pub(crate) hover_pos: Option<(usize, usize)>,
-    /// Plain text of the last frame's rows: OSC zone-marker emission only
-    /// re-emits rows whose content changed.
-    osc_last_rows: std::collections::HashMap<usize, String>,
     /// Rendered rows per chat entry and detail mode: a frame re-renders only entries invalidated
     /// since the last frame, so a transcript-scale frame pays full layout once per entry/detail.
     entry_layout: Vec<[Option<EntryLayout>; 3]>,
@@ -154,6 +168,9 @@ pub struct AgentView {
     /// Entries whose card a click flipped away from the level's
     /// tool-output expansion (see `view/expansion.rs`).
     toggled_cards: std::collections::BTreeSet<usize>,
+    /// The inbox-notice run head of each chat entry, filled lazily from the
+    /// front (see `view/inbox_run.rs`); a mutation at an index truncates it there.
+    inbox_run_heads: std::cell::RefCell<Vec<usize>>,
     /// Per-assistant-entry markdown block caches: a streaming message re-renders every frame, so
     /// settled blocks replay from the cache. `RefCell` because the layout pass borrows immutably.
     md_caches:
@@ -161,7 +178,7 @@ pub struct AgentView {
     /// The width the cached rows were laid out for.
     pub(crate) layout_width: usize,
     /// Rendering options that affect cached entry rows.
-    layout_options: Option<(Theme, String, bool, bool)>,
+    layout_options: Option<layout::LayoutOptions>,
     /// Row texts of the inline frame at the last main-screen flush: the
     /// next flush diffs against this, so exits never duplicate scrollback.
     flushed_frame: Vec<String>,
@@ -212,65 +229,70 @@ fn chunk_selection(
 }
 
 impl AgentView {
-    /// Agent messages, tool calls, bash executions, and shell completions
-    /// render flush against each other.
+    /// Agent messages, tool calls, bash executions, shell completions, and
+    /// the inbox notices render flush against each other.
     pub(super) fn is_compact_neighbor(entry: &ChatEntry) -> bool {
-        matches!(
-            entry,
-            ChatEntry::Tool(_)
-                | ChatEntry::AgentMessage(_)
-                | ChatEntry::ShellCompletion(_)
-                | ChatEntry::BashExecution(_)
-        )
+        entry.is_envelope_row() || matches!(entry, ChatEntry::BashExecution(_))
     }
 
-    /// One paste routed by the open overlay, the key dispatch's order:
-    /// the overlay's own input takes it, the input-less overlays consume
-    /// it, and the bare dock's editor takes it when nothing is open.
+    /// One paste routed by the open overlay: the overlay's own input takes it, the input-less
+    /// overlays consume it, and the bare dock's editor takes it when nothing is open.
     /// Returns whether an overlay took or consumed the paste.
     pub fn route_paste(&mut self, text: &str) -> bool {
-        if let Some(picker) = self.model_picker.as_mut() {
-            picker.paste(text);
-            return true;
+        match self.overlay.as_mut() {
+            None => false,
+            Some(Overlay::ModelPicker(picker)) => {
+                picker.paste(text);
+                true
+            }
+            Some(Overlay::ChoicePicker(picker)) => {
+                picker.paste(text);
+                true
+            }
+            Some(Overlay::Mcp(mcp)) => {
+                mcp.paste(text);
+                true
+            }
+            Some(Overlay::Tree(selector)) => {
+                selector.paste(text);
+                true
+            }
+            Some(Overlay::ProviderAuth(auth)) => {
+                auth.paste(text);
+                true
+            }
+            Some(Overlay::Settings(menu)) => {
+                menu.paste(text);
+                true
+            }
+            // The auth panel's mounted input takes it: never the hidden editor, where a later
+            // Enter could submit the secret as a prompt.
+            Some(Overlay::AuthPanel(panel)) => {
+                panel.handle_paste(text);
+                true
+            }
+            // The input-less frame owners never leave a paste to the editor behind.
+            Some(
+                Overlay::Onboarding(_)
+                | Overlay::Factory(_)
+                | Overlay::Heartbeats(_)
+                | Overlay::Bash(_)
+                | Overlay::Goal(_)
+                | Overlay::Info(_)
+                | Overlay::Fork(_)
+                | Overlay::Confirm { .. }
+                | Overlay::ShareLoader(_)
+                | Overlay::Reload(_),
+            ) => true,
         }
-        if let Some(picker) = self.effort_picker.as_mut() {
-            picker.paste(text);
-            return true;
+    }
+
+    /// Close the open overlay when `is_kind` names it: an async settle (an upload, a reload, a
+    /// login flow, a rebind) closes only its own panel, never one the user opened since.
+    pub(crate) fn close_overlay_if(&mut self, is_kind: impl FnOnce(&Overlay) -> bool) {
+        if self.overlay.as_ref().is_some_and(is_kind) {
+            self.overlay = None;
         }
-        if let Some(mcp) = self.mcp_view.as_mut() {
-            mcp.paste(text);
-            return true;
-        }
-        if let Some(selector) = self.tree_selector.as_mut() {
-            selector.paste(text);
-            return true;
-        }
-        if let Some(auth) = self.provider_auth.as_mut() {
-            auth.paste(text);
-            return true;
-        }
-        if let Some(menu) = self.settings_menu.as_mut() {
-            menu.paste(text);
-            return true;
-        }
-        // The input-less frame owners (the key dispatch's same set): the
-        // heartbeats picker, the bash view, the read-only goal and info
-        // panels, the fork selector, the pending confirm, the share
-        // loader, the reload box, and the auth panel (its own channel
-        // drives it). None of them leaves a paste to the editor behind.
-        if self.heartbeats_picker.is_some()
-            || self.bash_view.is_some()
-            || self.goal_panel.is_some()
-            || self.info_panel.is_some()
-            || self.fork_selector.is_some()
-            || self.confirm.is_some()
-            || self.share_loader.is_some()
-            || self.reload_box.is_some()
-            || self.auth_panel.is_some()
-        {
-            return true;
-        }
-        false
     }
 
     #[must_use]
@@ -293,27 +315,12 @@ impl AgentView {
             pulse_frame: 0,
             working_since: None,
             retry: None,
-            onboarding: None,
-            model_picker: None,
-            tree_selector: None,
-            confirm: None,
-            provider_auth: None,
-            auth_panel: None,
-            fork_selector: None,
-            effort_picker: None,
-            mcp_view: None,
-            factory_view: None,
-            heartbeats_picker: None,
-            goal_panel: None,
-            bash_view: None,
-            share_loader: None,
-            reload_box: None,
+            overlay: None,
             side_pane: None,
-            settings_menu: None,
-            info_panel: None,
             show_images: true,
             show_hardware_cursor: false,
             splash_suppressed: false,
+            older_history_loading: false,
             scroll_top: 0,
             following: true,
             last_max_scroll: 0,
@@ -323,7 +330,6 @@ impl AgentView {
             window_shows_tail: false,
             detail_transition: false,
             hover_pos: None,
-            osc_last_rows: std::collections::HashMap::new(),
             toasts: crate::toast::Toasts::default(),
             entry_layout: Vec::new(),
             entry_heights: Vec::new(),
@@ -331,6 +337,7 @@ impl AgentView {
             sparse_enabled: true,
             sparse_entries: std::collections::BTreeSet::new(),
             toggled_cards: std::collections::BTreeSet::new(),
+            inbox_run_heads: std::cell::RefCell::new(Vec::new()),
             md_caches: std::cell::RefCell::new(std::collections::HashMap::new()),
             layout_width: 0,
             layout_options: None,
@@ -344,35 +351,6 @@ impl AgentView {
             handoff_seeds: 0,
             click: click::ClickSurface::default(),
         }
-    }
-
-    /// Zone-marker emission plan for a freshly composed frame: every
-    /// marked row whose content changed since the last frame.
-    pub fn take_osc_emissions(
-        &mut self,
-        frame: &[Line],
-    ) -> Vec<(usize, crate::osc133::RowMarkers)> {
-        // Only candidate rows build their text: joining the whole frame
-        // costs O(transcript) per render.
-        let mut plan = Vec::new();
-        let mut last_rows = std::collections::HashMap::new();
-        for (row, line) in frame.iter().enumerate() {
-            let markers = crate::osc133::row_markers(line);
-            if !markers.start && !markers.end {
-                continue;
-            }
-            let text: String = line.iter().map(|s| s.content.as_str()).collect();
-            let changed = self
-                .osc_last_rows
-                .get(&row)
-                .is_none_or(|prev| prev != &text);
-            if changed {
-                plan.push((row, markers));
-            }
-            last_rows.insert(row, text);
-        }
-        self.osc_last_rows = last_rows;
-        plan
     }
 
     pub fn terminal_rows(&self) -> u16 {
@@ -409,6 +387,7 @@ impl AgentView {
         self.md_caches.borrow_mut().remove(&index);
         self.sparse_entries.remove(&index);
         self.toggled_cards.remove(&index);
+        self.inbox_run_heads.get_mut().truncate(index);
         self.entry_heights.pop();
         self.entry_layout.pop();
         self.chat.pop()
@@ -497,10 +476,134 @@ impl AgentView {
         }
         let mut entry = item_to_entry(item);
         if let ChatEntry::BashExecution(card) = &mut entry {
-            card.suppress_leading_space =
-                matches!(self.chat.last(), Some(ChatEntry::AgentMessage(_)));
+            card.suppress_leading_space = matches!(
+                self.chat.last(),
+                Some(ChatEntry::AgentMessage(_) | ChatEntry::InboxNotice(_))
+            );
         }
         self.push_entry(entry);
+    }
+
+    pub fn prepend_entries(&mut self, entries: Vec<ChatEntry>) {
+        let count = entries.len();
+        if count == 0 {
+            return;
+        }
+        self.pending_handoff = None;
+        let seam_before = if self.layout_width > 0 && !self.chat.is_empty() {
+            self.count_entry_rows(0, self.layout_width)
+        } else {
+            0
+        };
+        self.reanchor_paused_window_for_prepend();
+        let cursor_spacing_before = self.prepend_cursor_spacing(0);
+        self.splice_chat(0..0, entries);
+        self.note_prepended_entries(count, seam_before, cursor_spacing_before);
+    }
+
+    /// Replace `range`, which lies below the viewport, with `entries`: a paused
+    /// viewport keeps its rows.
+    pub fn replace_entries(&mut self, range: std::ops::Range<usize>, entries: Vec<ChatEntry>) {
+        self.pending_handoff = None;
+        let width = self.layout_width;
+        // The entry after the range re-measures too: its spacing follows its neighbor.
+        let follower = usize::from(range.end < self.chat.len());
+        let rows = |view: &Self, from: usize, to: usize| -> usize {
+            (from..to)
+                .map(|index| view.count_entry_rows(index, width))
+                .sum()
+        };
+        let before = if width > 0 {
+            rows(self, range.start, range.end + follower)
+        } else {
+            0
+        };
+        let start = range.start;
+        let inserted = entries.len();
+        self.splice_chat(range, entries);
+        if width > 0 {
+            let after = rows(self, start, start + inserted + follower);
+            self.sparse_tail_delta(after as isize - before as isize, start);
+        }
+    }
+
+    /// Drop the first `count` entries, which lie above the viewport: the window
+    /// re-anchors to the tail, which they do not touch.
+    pub fn drop_leading_entries(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.pending_handoff = None;
+        self.reanchor_paused_window_for_prepend();
+        self.splice_chat(0..count, Vec::new());
+        self.note_dropped_entries(count);
+    }
+
+    /// Splice the chat and every per-entry cache keyed by its index.
+    fn splice_chat(&mut self, range: std::ops::Range<usize>, entries: Vec<ChatEntry>) {
+        let inserted = entries.len();
+        let removed = range.len();
+        let shift = |index: usize| -> Option<usize> {
+            if index < range.start {
+                Some(index)
+            } else if index < range.end {
+                None
+            } else {
+                Some(index - removed + inserted)
+            }
+        };
+        if let Some((index, rows)) = self.sparse_mutation {
+            self.sparse_mutation = shift(index).map(|index| (index, rows));
+        }
+        {
+            let mut caches = self.md_caches.borrow_mut();
+            let shifted: std::collections::HashMap<usize, crate::markdown::MarkdownBlockCache> =
+                caches
+                    .drain()
+                    .filter_map(|(index, cache)| Some((shift(index)?, cache)))
+                    .collect();
+            *caches = shifted;
+        }
+        self.sparse_entries = self
+            .sparse_entries
+            .iter()
+            .filter_map(|i| shift(*i))
+            .collect();
+        // A toggled run head the splice removes hands its expansion to the
+        // run's first surviving notice.
+        let orphaned_runs = self.toggled_cards.range(range.clone()).any(|&index| {
+            matches!(self.chat[index], ChatEntry::InboxNotice(_))
+                && self.inbox_run(index).end > range.end
+        });
+        self.toggled_cards = self
+            .toggled_cards
+            .iter()
+            .filter_map(|i| shift(*i))
+            .collect();
+        if orphaned_runs {
+            self.toggled_cards.insert(range.start + inserted);
+        }
+        self.entry_layout.splice(
+            range.clone(),
+            std::iter::repeat_n([None, None, None], inserted),
+        );
+        self.entry_heights.splice(
+            range.clone(),
+            std::iter::repeat_n([None, None, None], inserted),
+        );
+        self.inbox_run_heads.get_mut().truncate(range.start);
+        self.chat.splice(range, entries);
+        self.follow_inbox_run_heads();
+    }
+
+    /// The first and last chat entries the last frame showed.
+    pub(crate) fn visible_entries(&self) -> Option<(usize, usize)> {
+        let entries = self
+            .click
+            .window_sections
+            .iter()
+            .map(|section| section.entry);
+        Some((entries.clone().min()?, entries.max()?))
     }
 
     /// Drop the whole transcript and its cached layout (a fresh snapshot
@@ -510,12 +613,14 @@ impl AgentView {
         self.sparse_enabled = true;
         self.sparse_entries.clear();
         self.toggled_cards.clear();
+        self.inbox_run_heads.get_mut().clear();
         self.sparse_window = None;
         self.chat.clear();
         self.entry_layout.clear();
         self.entry_heights.clear();
         self.md_caches.borrow_mut().clear();
         self.pending_bash.clear();
+        self.older_history_loading = false;
     }
 
     /// Prepare an in-place mutation of one entry: capture its current
@@ -545,10 +650,7 @@ impl AgentView {
             *slot = [None, None, None];
         }
         for (offset, entry) in self.chat.iter().enumerate().skip(index + 1) {
-            if matches!(
-                entry,
-                ChatEntry::AgentMessage(_) | ChatEntry::ShellCompletion(_) | ChatEntry::Tool(_)
-            ) {
+            if entry.is_envelope_row() {
                 if let Some(slot) = self.entry_layout.get_mut(offset) {
                     *slot = [None, None, None];
                 }
@@ -729,6 +831,8 @@ fn item_to_entry(item: TranscriptItem) -> ChatEntry {
     }
 }
 
+#[cfg(test)]
+mod prepend_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

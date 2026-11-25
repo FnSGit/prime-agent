@@ -131,6 +131,7 @@ mod tests {
                 max_tokens: 1,
                 max_tokens_explicit: false,
                 featured: None,
+                serving: None,
                 headers,
                 compat: None,
             }
@@ -188,6 +189,10 @@ mod tests {
                 .unwrap(),
             "cli/1"
         );
+        let unpinned = json!({"schemaVersion": 1, "models": [
+            catalog_entry("unknown", "openai-completions", "prov", "https://elsewhere.example"),
+        ]});
+        assert!(parse_provider_model_catalog(&unpinned, &templates).is_err());
     }
 
     #[test]
@@ -206,15 +211,6 @@ mod tests {
                 .unwrap(),
             "special/2"
         );
-    }
-
-    #[test]
-    fn empty_result_is_an_error() {
-        let templates = compiled_fixture();
-        let payload = json!({"schemaVersion": 1, "models": [
-            catalog_entry("unknown", "openai-completions", "prov", "https://elsewhere.example"),
-        ]});
-        assert!(parse_provider_model_catalog(&payload, &templates).is_err());
     }
 
     #[test]

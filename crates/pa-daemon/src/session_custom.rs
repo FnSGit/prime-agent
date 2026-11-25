@@ -26,6 +26,13 @@ impl Worker {
                 None,
             );
         };
+        // The reserved kinds are daemon provenance: a caller-supplied row
+        // claiming one is refused loudly, never persisted (the queue-fold
+        // anti-spoof rule the prompt, queued-lane, and `restore_actions`
+        // intakes already make).
+        if let Err(response) = refuse_reserved_custom_row("append_custom_message", &message) {
+            return response;
+        }
         self.emit_custom_row(&message);
         response_success(None, "append_custom_message", None)
     }
@@ -54,6 +61,11 @@ impl Worker {
                     None,
                 );
             };
+            // The same anti-spoof refusal: a reserved kind refuses the
+            // whole array before any row parks.
+            if let Err(response) = refuse_reserved_custom_row("restore_next_turn", &row) {
+                return response;
+            }
             rows.push(row);
         }
         self.core.lock().unwrap().pending_next_turn.extend(rows);
@@ -136,6 +148,8 @@ impl Worker {
             // The reserved child-status kinds are daemon provenance (the queue-fold
             // anti-spoof): a restored row claiming one refuses the whole snapshot
             // before any action admits; only the recovery journal may park one.
+            // The inbox notice kind refuses identically (the daemon's inbox
+            // paths admit it, never a client-supplied snapshot).
             if let Some(row) = payload.get("customMessage") {
                 if crate::child_status_notices::is_reserved_child_status_custom_type(row) {
                     return response_failure(
@@ -148,6 +162,48 @@ impl Worker {
                         None,
                     );
                 }
+                if crate::worker::is_inbox_notice_custom_type(row) {
+                    return response_failure(
+                        None,
+                        "restore_actions",
+                        &format!(
+                            "{} (action {id})",
+                            crate::worker::inbox_notice_intake_error()
+                        ),
+                        None,
+                    );
+                }
+            }
+            // The reserved inbox coalescing keys are daemon provenance
+            // too (the anti-spoof rule's key half): a plain-user
+            // restore_actions action claiming one parks a row the inbox
+            // sweeps would silently delete — the emptied read's key
+            // sweep, the next arrival's coalescing replace — so the
+            // snapshot refuses before any action admits; only the
+            // recovery journal may park one (it replays the daemon's
+            // own typed rows).
+            if action
+                .get("queueKey")
+                .and_then(Value::as_str)
+                .is_some_and(|key| {
+                    matches!(
+                        key,
+                        crate::worker::INBOX_ARRIVAL_QUEUE_KEY
+                            | crate::worker::INBOX_REMINDER_QUEUE_KEY
+                    )
+                })
+            {
+                return response_failure(
+                    None,
+                    "restore_actions",
+                    &format!(
+                        "Invalid queueKey: the {} and {} queue keys are reserved for \
+                         daemon-authored agent-inbox notices (action {id})",
+                        crate::worker::INBOX_ARRIVAL_QUEUE_KEY,
+                        crate::worker::INBOX_REMINDER_QUEUE_KEY,
+                    ),
+                    None,
+                );
             }
         }
         // Restore pass: each action lands in its delivery lane —
@@ -259,6 +315,12 @@ impl Worker {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
         };
+        let origin = {
+            let core = self.core.lock().unwrap();
+            core.store
+                .as_ref()
+                .map(|store| (store.session_id().to_string(), core.generation.clone()))
+        };
         let engine = std::sync::Arc::clone(&self.engine);
         let result = tokio::task::spawn_blocking(move || engine.run_refinement(options))
             .await
@@ -266,24 +328,38 @@ impl Worker {
         let result = match result {
             Ok(result) => result,
             Err(error) => {
-                self.emit_worker_event(json!({
-                    "type": "refine_failed",
-                    "error": format!("{error:#}"),
-                }));
+                if let Some((session_id, generation)) = &origin {
+                    crate::worker::emit_refinement_event_for_generation(
+                        &self.core,
+                        &self.events,
+                        session_id,
+                        Some(generation),
+                        json!({
+                            "type": "refine_failed", "error": format!("{error:#}"),
+                        }),
+                    );
+                }
                 return response_failure(None, "refine", &format!("{error:#}"), None);
             }
         };
         // The refinement's durable rows: the TUI outcome, plus the model-facing
         // notice when edits applied.
-        if let Ok(typed) =
-            serde_json::from_value::<pa_core::refinement::RefinementResult>(result.clone())
-        {
+        if let (Some((session_id, generation)), Ok(typed)) = (
+            &origin,
+            serde_json::from_value::<pa_core::refinement::RefinementResult>(result.clone()),
+        ) {
             let outcome =
                 pa_core::session_engine::refine::create_refinement_outcome_message(&typed);
             if let Ok(value) =
                 serde_json::to_value(pa_types::session::AgentMessage::Custom(outcome))
             {
-                self.emit_custom_row(&value);
+                crate::worker::emit_refinement_row_for_generation(
+                    &self.core,
+                    &self.events,
+                    session_id,
+                    Some(generation),
+                    &value,
+                );
             }
             if typed.applied_edits.iter().any(|edit| edit.applied) {
                 let notice = pa_core::session_engine::refine::create_refinement_notice_message(
@@ -293,27 +369,97 @@ impl Worker {
                 if let Ok(value) =
                     serde_json::to_value(pa_types::session::AgentMessage::Custom(notice))
                 {
-                    self.emit_custom_row(&value);
+                    crate::worker::emit_refinement_row_for_generation(
+                        &self.core,
+                        &self.events,
+                        session_id,
+                        Some(generation),
+                        &value,
+                    );
                 }
             }
-            crate::user_bash::emit_session_event_frame(
+            crate::worker::emit_refinement_event_for_generation(
                 &self.core,
                 &self.events,
+                session_id,
+                Some(generation),
                 crate::worker::refine_complete_event(&typed),
             );
         }
         response_success(None, "refine", Some(result))
     }
 
-    /// `reload`: re-read the session's live inputs — settings, provider auth,
-    /// the MCP user-server config. This port resolves each per use, so the
-    /// command answers the TS success.
-    pub(crate) fn handle_reload(&self) -> DaemonResponse {
+    /// `reload`: re-read the session's live inputs — the MCP manager
+    /// re-reads its settings and auth state. Request auth needs no
+    /// re-read: the live session's stream re-resolves it from the
+    /// credential store on every provider call, so a `/login` from
+    /// another process serves the next request with or without a reload.
+    /// Settings and the model catalog resolve per use and need no
+    /// re-read. The reload touches the MCP auth store, whose snapshot
+    /// takes a blocking lock — it parks on a blocking thread, the same
+    /// posture as `get_mcp_connections`.
+    pub(crate) async fn handle_reload(&self) -> DaemonResponse {
         if let Err(response) = self.require_created("reload") {
             return response;
         }
+        if let Some(engine) = &self.agent_engine {
+            let engine = std::sync::Arc::clone(engine);
+            // The blocking thread's reload can fail two ways: the auth
+            // store's reload (a malformed document, an unacquirable lock)
+            // or the join itself (a panic). Both answer the client's
+            // reload with the failure, never a success the session did
+            // not apply.
+            match tokio::task::spawn_blocking(move || engine.reload_live_inputs()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return response_failure(
+                        None,
+                        "reload",
+                        &format!("session reload failed: {error}"),
+                        None,
+                    );
+                }
+                Err(error) => {
+                    return response_failure(
+                        None,
+                        "reload",
+                        &format!("session reload failed: {error}"),
+                        None,
+                    );
+                }
+            }
+        }
         response_success(None, "reload", None)
     }
+}
+
+/// The reserved custom kinds are daemon provenance (the queue-fold
+/// anti-spoof): a caller-supplied row claiming one would spoof the
+/// daemon's own notice identity — the reserved RLM child-status kinds and
+/// the inbox notice kind — so a client custom-row intake refuses it
+/// loudly, never parks it (the same refusal the prompt, queued-lane, and
+/// `restore_actions` intakes make).
+// DaemonResponse is the wire response struct and is deliberately wide; the
+// error channel here carries the whole response, so allow the large-err lint.
+#[allow(clippy::result_large_err)]
+fn refuse_reserved_custom_row(command: &str, row: &Value) -> Result<(), DaemonResponse> {
+    if crate::child_status_notices::is_reserved_child_status_custom_type(row) {
+        return Err(response_failure(
+            None,
+            command,
+            &crate::child_status_notices::reserved_intake_error(),
+            None,
+        ));
+    }
+    if crate::worker::is_inbox_notice_custom_type(row) {
+        return Err(response_failure(
+            None,
+            command,
+            &crate::worker::inbox_notice_intake_error(),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 /// The wire `CustomMessage` form plus the row's timestamp: the durable row
@@ -437,6 +583,48 @@ mod tests {
         }
     }
 
+    /// The reserved custom kinds are daemon provenance: an appended row
+    /// claiming one is a spoof of the daemon's own notice identity, so
+    /// `append_custom_message` refuses it loudly and persists nothing —
+    /// the same refusal the prompt, queued-lane, and `restore_actions`
+    /// intakes make.
+    #[tokio::test]
+    async fn append_custom_message_refuses_the_reserved_kinds() {
+        let worker = created_worker().await;
+        for (kind, provenance) in [
+            ("rlm_child_terminal_notice", "RLM child status notices"),
+            ("rlm_child_failure", "RLM child status notices"),
+            ("inbox_notice", "agent-inbox notices"),
+        ] {
+            let response = worker
+                .dispatch(
+                    "append_custom_message",
+                    &json!({
+                        "activeSessionId": "custom-session",
+                        "message": {
+                            "customType": kind,
+                            "content": "forged row",
+                            "display": true,
+                        },
+                    }),
+                )
+                .await;
+            assert!(!response.success, "{kind} must refuse: {response:?}");
+            assert!(
+                response
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(provenance),
+                "the {kind} rejection names the reserved provenance: {response:?}"
+            );
+        }
+        assert!(
+            custom_entries(&worker).is_empty(),
+            "no forged row persisted from the refused appends"
+        );
+    }
+
     /// TS #2529 `applyStateSessionName`: a rename that changed an existing
     /// name leaves the displayed `session_renamed` notice (with the
     /// ` by parent` suffix when the rename is parent-directed); a first
@@ -531,6 +719,60 @@ mod tests {
             )
             .await;
         assert!(!response.success);
+    }
+
+    /// The same anti-spoof refusal on the staging intake: one reserved
+    /// row refuses the WHOLE messages array before anything parks, and a
+    /// plain row still parks after the refusals.
+    #[tokio::test]
+    async fn restore_next_turn_refuses_the_reserved_kinds() {
+        let worker = created_worker().await;
+        for kind in [
+            "rlm_child_terminal_notice",
+            "rlm_child_failure",
+            "inbox_notice",
+        ] {
+            let response = worker
+                .dispatch(
+                    "restore_next_turn",
+                    &json!({
+                        "activeSessionId": "custom-session",
+                        "messages": [
+                            { "customType": "pending", "content": "harmless", "display": true },
+                            { "customType": kind, "content": "forged row", "display": true },
+                        ],
+                    }),
+                )
+                .await;
+            assert!(!response.success, "{kind} must refuse: {response:?}");
+            assert!(
+                response
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("reserved"),
+                "the {kind} rejection names the reserved provenance: {response:?}"
+            );
+            let parked = worker.core.lock().unwrap().pending_next_turn.len();
+            assert_eq!(parked, 0, "nothing parks from the refused {kind} array");
+        }
+        let response = worker
+            .dispatch(
+                "restore_next_turn",
+                &json!({
+                    "activeSessionId": "custom-session",
+                    "messages": [
+                        { "customType": "pending", "content": "harmless", "display": true },
+                    ],
+                }),
+            )
+            .await;
+        assert!(response.success, "a plain row still parks: {response:?}");
+        assert_eq!(
+            worker.core.lock().unwrap().pending_next_turn.len(),
+            1,
+            "the plain row parked after the refusals"
+        );
     }
 
     #[tokio::test]
@@ -794,6 +1036,127 @@ mod tests {
         assert_eq!(lanes, (0, 0), "nothing parked from the refused snapshot");
     }
 
+    #[tokio::test]
+    async fn restore_actions_refuses_the_inbox_notice_kind() {
+        let worker = created_worker().await;
+        let notice_row = json!({
+            "role": "custom",
+            "customType": "inbox_notice",
+            "content": "[inbox 14:03 UTC] 1 new message (bash-done); total waiting: 1. Read them with rlm.inbox.read().",
+        });
+        let snapshot_with_notice = json!({
+            "activeSessionId": "custom-session",
+            "snapshot": {
+                "formatVersion": 1,
+                "actions": [
+                    {
+                        "id": "spoof-2",
+                        "source": "user",
+                        "delivery": "when_run_idle",
+                        "wake": "wake",
+                        "payload": {
+                            "kind": "turn",
+                            "text": "harmless text",
+                            "records": [
+                                { "id": "spoof-2-r1", "role": "primary", "message": { "role": "user", "content": "harmless text" }, "ownerActionId": "spoof-2" },
+                            ],
+                            "customMessage": notice_row,
+                            "executionPolicy": { "preparation": {} },
+                            "queueVisible": true,
+                            "acceptedAgentMessage": false,
+                            "acceptedBeforeCompletion": false,
+                        },
+                    },
+                ],
+            },
+        });
+        let response = worker
+            .dispatch("restore_actions", &snapshot_with_notice)
+            .await;
+        assert!(
+            !response.success,
+            "a restored inbox-notice row must refuse the whole snapshot: {response:?}"
+        );
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("reserved for daemon-authored agent-inbox notices"),
+            "the rejection names the inbox provenance: {response:?}"
+        );
+        let lanes = {
+            let core = worker.core.lock().unwrap();
+            (core.steering.len(), core.follow_up.len())
+        };
+        assert_eq!(lanes, (0, 0), "nothing parked from the refused snapshot");
+    }
+
+    /// A plain-user action claiming one of the daemon's reserved inbox
+    /// coalescing keys (`queueKey` without a custom row — the anti-spoof
+    /// reservation's key half) refuses the whole snapshot before any
+    /// action admits: a parked row holding one would silently delete at
+    /// the next emptied read (the key sweep) or at the next arrival's
+    /// coalescing replace, a loss after a success receipt. One dispatch
+    /// per key, a valid plain action first: the validation loop returns
+    /// at the first reserved action, so a shared snapshot could never
+    /// reach the second key's arm, and the plain rider pins the
+    /// whole-snapshot refusal — nothing parks, it included.
+    #[tokio::test]
+    async fn restore_actions_refuses_the_reserved_inbox_queue_keys() {
+        for (reserved_key, spoof_id) in [
+            ("inbox:arrival", "spoof-key-arrival"),
+            ("inbox:reminder", "spoof-key-reminder"),
+        ] {
+            let worker = created_worker().await;
+            let snapshot_with_key = json!({
+                "activeSessionId": "custom-session",
+                "snapshot": {
+                    "formatVersion": 1,
+                    "actions": [
+                        {
+                            "id": "plain-first",
+                            "source": "user",
+                            "delivery": "when_run_idle",
+                            "wake": "wake",
+                            "payload": { "kind": "turn", "text": "harmless text" },
+                        },
+                        {
+                            "id": spoof_id,
+                            "source": "user",
+                            "delivery": "when_run_idle",
+                            "wake": "wake",
+                            "queueKey": reserved_key,
+                            "payload": { "kind": "turn", "text": "harmless text too" },
+                        },
+                    ],
+                },
+            });
+            let response = worker.dispatch("restore_actions", &snapshot_with_key).await;
+            assert!(
+                !response.success,
+                "a plain action claiming {reserved_key} must refuse the whole snapshot: {response:?}"
+            );
+            assert!(
+                response
+                    .error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("queue keys are reserved for daemon-authored agent-inbox notices"),
+                "the rejection names the reserved queue keys: {response:?}"
+            );
+            let lanes = {
+                let core = worker.core.lock().unwrap();
+                (core.steering.len(), core.follow_up.len())
+            };
+            assert_eq!(
+                lanes,
+                (0, 0),
+                "nothing parks from the refused snapshot, the plain first action included: {reserved_key}"
+            );
+        }
+    }
+
     /// A restored queued heartbeat still reads `Heartbeat prompt: <text>` and delivers as the
     /// `heartbeat_prompt` component.
     #[tokio::test]
@@ -926,6 +1289,151 @@ mod tests {
         }
     }
 
+    /// A queued row restored WITHOUT a timestamp (the crash-recovery
+    /// snapshot shape the restore fixtures carry) delivers as one
+    /// normalized row: the type default fills the clock at the
+    /// injected-row parse, so the frames clients get carry the same row
+    /// the model context holds.
+    #[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
+    #[tokio::test]
+    async fn a_restored_row_without_a_timestamp_delivers_one_normalized_row() {
+        let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::TempDir::new().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let config = crate::worker::WorkerConfig {
+            socket_path: dir_path.join("worker.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "restored-row-session".to_string(),
+            agent_dir: dir_path.join("agent"),
+            recovery_journal_path: dir_path.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(
+                json!({ "engine": "faux", "responses": [{ "text": "notice acknowledged" }] }),
+            ),
+        };
+        let worker = Arc::new(crate::worker::Worker::new(config, None));
+        let created = worker
+            .dispatch("create", &json!({ "noSession": true, "cwd": "/tmp" }))
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        assert!(
+            worker.agent_engine.is_some(),
+            "the faux script must build a real agent engine"
+        );
+        let mut subscription = worker.events.subscribe();
+        let content = "[heartbeat: every 10m run#0]\n\nnudge the mission";
+        let response = worker
+            .dispatch(
+                "restore_actions",
+                &json!({
+                    "activeSessionId": "restored-row-session",
+                    "snapshot": {
+                        "formatVersion": 1,
+                        "actions": [
+                            {
+                                "id": "hb-restored",
+                                "source": "user",
+                                "delivery": "next_turn_boundary",
+                                "wake": "wake",
+                                "queueKey": "heartbeat:hb-restored",
+                                "payload": {
+                                    "kind": "turn",
+                                    "text": content,
+                                    "records": [],
+                                    // The snapshot row carries NO timestamp.
+                                    "customMessage": {
+                                        "role": "custom",
+                                        "customType": "heartbeat_prompt",
+                                        "content": content,
+                                        "display": true
+                                    },
+                                    "executionPolicy": { "preparation": {} },
+                                    "queueVisible": true,
+                                    "acceptedAgentMessage": false,
+                                    "acceptedBeforeCompletion": false,
+                                },
+                            },
+                        ],
+                    },
+                }),
+            )
+            .await;
+        assert!(response.success, "restore failed: {response:?}");
+        assert_eq!(response.data, Some(json!({ "restored": 1 })));
+        // The runner delivers the restored row; the idle wait holds while
+        // the lanes carry it and returns only after the turn settled.
+        let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+        assert!(idle.success, "the restored turn never settled: {idle:?}");
+        let mut events = Vec::new();
+        while let Ok(frame) = subscription.try_recv() {
+            if frame.outbound_type == "session_event" {
+                let outbound: Value = serde_json::from_slice(&frame.payload).unwrap();
+                events.push(outbound["event"].clone());
+            }
+        }
+        // The turn admitted: no parse-failure settle frame.
+        let parse_failed = events.iter().any(|event| {
+            event["type"] == "turn_end"
+                && event["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("parse failed"))
+        });
+        assert!(
+            !parse_failed,
+            "the missing clock killed the restored turn: {events:?}"
+        );
+        // The turn ran to its model response.
+        assert!(
+            events.iter().any(|event| {
+                event["type"] == "message_end" && event["message"]["role"] == "assistant"
+            }),
+            "the restored turn never reached its model response: {events:?}"
+        );
+        // The frames carry the row WITH the default-filled clock...
+        let frame_row = events
+            .iter()
+            .find_map(|event| {
+                (event["type"] == "message_start"
+                    && event["message"]["customType"] == "heartbeat_prompt")
+                    .then(|| event["message"].clone())
+            })
+            .expect("the restored row's message_start frame");
+        let frame_timestamp = frame_row["timestamp"]
+            .as_u64()
+            .expect("the frame row carries the filled clock");
+        assert!(frame_timestamp > 0);
+        // ...and the model context holds the SAME row (frame/context match).
+        let built = {
+            let engine = worker.agent_engine.as_ref().expect("the real agent engine");
+            let session = engine.session.lock().await;
+            Arc::clone(session.as_ref().expect("the built session"))
+        };
+        let state = built.session.agent().state().await;
+        let context_row = state
+            .messages
+            .iter()
+            .find_map(|message| match message {
+                pa_agent::types::AgentMessage::Custom(custom)
+                    if custom.payload["customType"] == "heartbeat_prompt" =>
+                {
+                    Some(custom.payload.clone())
+                }
+                _ => None,
+            })
+            .expect("the model context admitted the restored row");
+        assert_eq!(
+            context_row["timestamp"],
+            json!(frame_timestamp),
+            "the frames and the model context hold one normalized row"
+        );
+        assert_eq!(frame_row["role"], "custom");
+        assert_eq!(frame_row["content"], json!(content));
+    }
+
     /// The scripted harness has no refiner: `refine` answers the failure the engine seam
     /// carries.
     #[tokio::test]
@@ -964,6 +1472,43 @@ mod tests {
     #[tokio::test]
     async fn reload_answers_success() {
         let worker = created_worker().await;
+        let response = worker
+            .dispatch("reload", &json!({ "activeSessionId": "custom-session" }))
+            .await;
+        assert!(response.success, "failed: {response:?}");
+        assert!(response.data.is_none());
+    }
+
+    /// The reload parks the engine's blocking work off the async executor:
+    /// with a REAL agent engine behind the worker (the faux-script engine)
+    /// the reload reaches the MCP auth store's blocking lock, which panics
+    /// when taken on the runtime — this fails if the blocking work moves
+    /// back onto the executor.
+    #[tokio::test]
+    async fn reload_parks_the_engine_reload_off_the_runtime() {
+        // A TempDir keeps the worker's files from piling up in /tmp.
+        let dir = tempfile::TempDir::new().unwrap();
+        let dir_path = dir.path().to_path_buf();
+        let config = crate::worker::WorkerConfig {
+            socket_path: dir_path.join("worker.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "custom-session".to_string(),
+            agent_dir: dir_path.join("agent"),
+            recovery_journal_path: dir_path.join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({ "engine": "faux", "responses": ["ack"] })),
+        };
+        let worker = Arc::new(crate::worker::Worker::new(config, None));
+        let created = worker
+            .dispatch("create", &json!({ "noSession": true, "cwd": "/tmp" }))
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        assert!(
+            worker.agent_engine.is_some(),
+            "the faux script must build a real agent engine"
+        );
         let response = worker
             .dispatch("reload", &json!({ "activeSessionId": "custom-session" }))
             .await;

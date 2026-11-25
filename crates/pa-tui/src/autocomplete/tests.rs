@@ -157,13 +157,27 @@ fn tier_argument_completions_list_filter_and_mark_current() {
 fn slash_completion_applies_separator_by_argument() {
     let provider = provider("/tmp");
     // Argument-taking command: completes into the parameter position.
-    let result = provider.apply_completion(&["/goa".to_string()], 0, 4, &item("goal"), "/goa");
+    let result = provider.apply_completion(&["/goa".to_string()], 0, 4, &item("goal"));
     assert_eq!(result.lines[0], "/goal ");
     assert_eq!(result.cursor_col, 6);
     // Bare command: no trailing separator.
-    let result = provider.apply_completion(&["/refi".to_string()], 0, 5, &item("refine"), "/refi");
+    let result = provider.apply_completion(&["/refi".to_string()], 0, 5, &item("refine"));
     assert_eq!(result.lines[0], "/refine");
     assert_eq!(result.cursor_col, 7);
+}
+
+/// Accepting an argument item replaces the whole typed argument, a trailing space included; a
+/// forced path completion there still replaces only the path token.
+#[test]
+fn argument_completion_replaces_the_typed_argument() {
+    let mut provider = provider("/tmp");
+    provider.set_argument_completions("tier", vec![item("default")]);
+    let result = provider.apply_completion(&["/tier de ".to_string()], 0, 9, &item("default"));
+    assert_eq!(result.lines[0], "/tier default");
+    assert_eq!(result.cursor_col, 13);
+    let result =
+        provider.apply_completion(&["/tier a src/ma".to_string()], 0, 14, &item("src/main.rs"));
+    assert_eq!(result.lines[0], "/tier a src/main.rs");
 }
 
 #[test]
@@ -188,6 +202,12 @@ fn path_completion_lists_directories_first() {
         values.iter().position(|v| *v == "./main.rs").unwrap()
             > values.iter().position(|v| *v == "./src/").unwrap()
     );
+    // `=` and quotes delimit a path token.
+    for text in ["--config=./ma", "'./ma"] {
+        let suggestions =
+            ready(provider.get_suggestions(&[text.to_string()], 0, text.chars().count(), false));
+        assert_eq!(suggestions.items[0].value, "./main.rs");
+    }
     // Non-path tokens do not trigger on natural typing.
     assert!(provider
         .get_suggestions(&["hello wor".to_string()], 0, 9, false)
@@ -254,28 +274,26 @@ fn at_prefix_lists_nested_fuzzy_matches() {
     std::fs::write(base.join(".hidden/partial"), "x").expect("write");
     std::fs::write(base.join(".git/partial"), "x").expect("write");
     std::fs::write(base.join("other.md"), "x").expect("write");
+    std::fs::write(base.join("shot\u{202F}AM.png"), "x").expect("write");
     let provider = provider(base.to_str().unwrap());
     let values = |text: &str| -> Vec<String> {
-        match provider.get_suggestions(&[text.to_string()], 0, text.chars().count(), false) {
-            Some(SuggestionLookup::Searching(search)) => search
-                .results
-                .recv()
-                .expect("the search finishes")
-                .expect("suggestions")
-                .items
-                .into_iter()
-                .map(|item| item.value)
-                .collect(),
-            other => panic!("expected a searching lookup, got {other:?}"),
-        }
+        at_suggestions(&provider, text)
+            .expect("suggestions")
+            .items
+            .into_iter()
+            .map(|item| item.value)
+            .collect()
     };
-    // The exact `.hidden/partial` name (score 100) sorts ahead of
-    // the `partial_match.rs` prefix match (80); `.git` never lists.
+    // The exact `.hidden/partial` name sorts ahead of the
+    // `partial_match.rs` prefix match; `.git` never lists.
     assert_eq!(
         values("see @partial"),
         ["@.hidden/partial", "@src/deep/partial_match.rs"]
     );
     assert_eq!(values("@src/par"), ["@src/deep/partial_match.rs"]);
+    assert_eq!(values("cfg=@src/par"), ["@src/deep/partial_match.rs"]);
+    // Any whitespace in a name quotes it (macOS screenshots carry U+202F).
+    assert_eq!(values("@shot"), ["@\"shot\u{202F}AM.png\""]);
     let item = CompletionItem {
         value: "@src/deep/partial_match.rs".to_string(),
         label: "partial_match.rs".to_string(),
@@ -283,7 +301,7 @@ fn at_prefix_lists_nested_fuzzy_matches() {
         argument_hint: None,
         source_tag: None,
     };
-    let result = provider.apply_completion(&["see @partial".to_string()], 0, 12, &item, "@partial");
+    let result = provider.apply_completion(&["see @partial".to_string()], 0, 12, &item);
     assert_eq!(result.lines[0], "see @src/deep/partial_match.rs ");
     assert_eq!(result.cursor_col, 31);
 }
@@ -310,12 +328,7 @@ fn render_uses_the_menu_panel_grammar() {
             source_tag: None,
         })
         .collect();
-    let state = AutocompleteState::new(
-        items,
-        5,
-        "/".to_string(),
-        Some(SuggestionKind::SlashCommand),
-    );
+    let state = AutocompleteState::new(items, 5, Some(SuggestionKind::SlashCommand));
     let lines = state.render(&theme(), 60);
     let text = |line: &Line| -> String { line.iter().map(|s| s.content.as_str()).collect() };
     let rendered: Vec<String> = lines.iter().map(text).collect();
@@ -331,7 +344,7 @@ fn render_uses_the_menu_panel_grammar() {
 
 #[test]
 fn empty_items_render_the_shared_no_match_row() {
-    let state = AutocompleteState::new(Vec::new(), 5, String::new(), None);
+    let state = AutocompleteState::new(Vec::new(), 5, None);
     let lines = state.render(&theme(), 40);
     let text: String = lines[0].iter().map(|s| s.content.as_str()).collect();
     assert_eq!(text, "  No matching commands");
@@ -346,12 +359,7 @@ fn narrow_renders_never_exceed_the_frame_width() {
         .chain((1..7).map(|index| item(&format!("cmd{index}"))))
         .collect();
     for width in [4usize, 6, 9, 40] {
-        let state = AutocompleteState::new(
-            items.clone(),
-            5,
-            "/".to_string(),
-            Some(SuggestionKind::SlashCommand),
-        );
+        let state = AutocompleteState::new(items.clone(), 5, Some(SuggestionKind::SlashCommand));
         for line in &state.render(&theme(), width) {
             assert!(
                 crate::width::spans_width(line) <= width,
@@ -359,7 +367,7 @@ fn narrow_renders_never_exceed_the_frame_width() {
             );
         }
     }
-    let empty = AutocompleteState::new(Vec::new(), 5, String::new(), None);
+    let empty = AutocompleteState::new(Vec::new(), 5, None);
     for line in &empty.render(&theme(), 6) {
         assert!(
             crate::width::spans_width(line) <= 6,
@@ -373,7 +381,6 @@ fn best_match_prefers_exact_then_prefix() {
     let state = AutocompleteState::new(
         vec![item("help"), item("hello")],
         5,
-        "/hel".to_string(),
         Some(SuggestionKind::SlashCommand),
     );
     assert_eq!(state.best_match_index("hel"), Some(0));
@@ -472,8 +479,7 @@ fn skill_completions_apply_through_the_slash_path() {
     // submission (the file path would drop it).
     let provider = provider_with_skill("/tmp");
     let item = item("skill:brainstorm");
-    let result =
-        provider.apply_completion(&["/skill:brain".to_string()], 0, 12, &item, "/skill:brain");
+    let result = provider.apply_completion(&["/skill:brain".to_string()], 0, 12, &item);
     assert_eq!(result.lines[0], "/skill:brainstorm ");
     assert_eq!(result.cursor_col, "/skill:brainstorm ".chars().count());
 }
@@ -572,12 +578,7 @@ fn render_shows_the_source_tag_as_a_trailing_segment() {
     let mut described = item("skill:web-search");
     described.description = Some("Search Google".to_string());
     described.source_tag = Some("#user".to_string());
-    let state = AutocompleteState::new(
-        vec![described],
-        5,
-        "/skill:web".to_string(),
-        Some(SuggestionKind::SlashCommand),
-    );
+    let state = AutocompleteState::new(vec![described], 5, Some(SuggestionKind::SlashCommand));
     let rendered = state.render(&theme(), 80);
     let all: String = rendered
         .iter()
@@ -599,4 +600,433 @@ fn render_shows_the_source_tag_as_a_trailing_segment() {
         all.contains("Search Google"),
         "the selected description renders: {all}"
     );
+}
+
+/// One `@` provider query's answer: the built index's inline one, or the background
+/// walk's once it finishes.
+fn at_suggestions(provider: &CombinedAutocompleteProvider, text: &str) -> Option<Suggestions> {
+    match provider.get_suggestions(&[text.to_string()], 0, text.chars().count(), false) {
+        Some(SuggestionLookup::Searching(search)) => {
+            search.results.recv().expect("the search finishes")
+        }
+        Some(SuggestionLookup::Ready(suggestions)) => Some(suggestions),
+        None => None,
+    }
+}
+
+/// The `@` suggestion items of one provider query.
+fn at_values(provider: &CombinedAutocompleteProvider, text: &str) -> Vec<CompletionItem> {
+    at_suggestions(provider, text)
+        .map(|suggestions| suggestions.items)
+        .unwrap_or_default()
+}
+
+/// The `@` item values of one provider query.
+fn at_item_values(provider: &CombinedAutocompleteProvider, text: &str) -> Vec<String> {
+    at_values(provider, text)
+        .into_iter()
+        .map(|item| item.value)
+        .collect()
+}
+
+/// A completion keeps the typed quote, switching to the other one for a path holding it, and
+/// the typed escape form on macOS/Linux.
+#[test]
+fn at_completion_keeps_the_typed_quoting() {
+    let base = tempfile::TempDir::new().expect("temp dir");
+    std::fs::create_dir_all(base.path().join("my target")).expect("mkdir");
+    std::fs::write(base.path().join("it's.md"), "x").expect("write");
+    let provider = provider(base.path().to_str().expect("utf8"));
+    assert_eq!(at_item_values(&provider, "@'my"), ["@'my target/'"]);
+    assert_eq!(at_item_values(&provider, "@'it"), ["@\"it's.md\""]);
+    // Accepting it before the typed closing quote replaces that quote too.
+    let result = provider.apply_completion(&["@'it'".to_string()], 0, 4, &item("@\"it's.md\""));
+    assert_eq!(result.lines[0], "@\"it's.md\" ");
+    // A quote that is a name char, not the closing quote, stays after the cursor.
+    let result =
+        provider.apply_completion(&["@'it's.md'".to_string()], 0, 4, &item("@\"it's.md\""));
+    assert_eq!(result.lines[0], "@\"it's.md\" 's.md'");
+    #[cfg(not(windows))]
+    assert_eq!(at_item_values(&provider, r"@my\ ta"), [r"@my\ target/"]);
+}
+
+/// A typed directory scope with an empty query lists the directory's children.
+#[test]
+fn at_directory_scope_lists_its_children() {
+    let base = tempfile::TempDir::new().expect("temp dir");
+    std::fs::create_dir_all(base.path().join("prime-agent/src")).expect("mkdir");
+    for file in [
+        "prime-agent/src/lib.rs",
+        "prime-agent/README.md",
+        "prime-agent/Cargo.toml",
+        "prime-agent/.env",
+        "other.md",
+    ] {
+        std::fs::write(base.path().join(file), "x").expect("write");
+    }
+    let provider = provider(base.path().to_str().expect("utf8"));
+    assert_eq!(
+        at_item_values(&provider, "@prime-agent/"),
+        [
+            "@prime-agent/src/",
+            "@prime-agent/README.md",
+            "@prime-agent/Cargo.toml",
+            "@prime-agent/src/lib.rs",
+            "@prime-agent/.env",
+        ]
+    );
+}
+
+/// The `@` ranking: match class, hidden entries below unless the query is dotted, fewer
+/// segments, fewer chars, directories before files, then byte order.
+#[test]
+fn at_ranking_orders_by_class_hidden_and_length() {
+    let base = tempfile::TempDir::new().expect("temp dir");
+    for dir in ["main/", "main.d/", "src/", ".github/", "deploy/k8s/"] {
+        std::fs::create_dir_all(base.path().join(dir)).expect("mkdir");
+    }
+    for file in [
+        "main.c",
+        "main.rs",
+        "main.json",
+        "src/main.rs",
+        "src/domain.rs",
+        ".mainrc",
+        ".github/main.yml",
+        "deploy/k8s/app.yml",
+    ] {
+        std::fs::write(base.path().join(file), "x").expect("write");
+    }
+    let provider = provider(base.path().to_str().expect("utf8"));
+    for (query, expected) in [
+        (
+            "@main",
+            vec![
+                "@main/",
+                "@main.d/",
+                "@main.c",
+                "@main.rs",
+                "@main.json",
+                "@src/main.rs",
+                "@.github/main.yml",
+                "@src/domain.rs",
+                "@.mainrc",
+            ],
+        ),
+        ("@yml", vec!["@deploy/k8s/app.yml", "@.github/main.yml"]),
+        ("@.yml", vec!["@.github/main.yml", "@deploy/k8s/app.yml"]),
+    ] {
+        assert_eq!(at_item_values(&provider, query), expected, "query {query}");
+    }
+}
+
+/// The parity fixture: nested directories, a hidden file, a pruned `.git`, a gitignored
+/// directory (the `.git` directory makes the gitignore rules apply), a directory entry,
+/// and mixed case.
+fn parity_fixture() -> tempfile::TempDir {
+    let outer = tempfile::TempDir::new().expect("temp dir");
+    let base = outer.path().join("base");
+    std::fs::create_dir_all(base.join(".git/objects")).expect("mkdir");
+    std::fs::write(base.join(".git/config"), "git").expect("write");
+    std::fs::write(base.join(".gitignore"), "ignored/\n").expect("write");
+    std::fs::create_dir_all(base.join("src/deep")).expect("mkdir");
+    std::fs::create_dir_all(base.join("ignored")).expect("mkdir");
+    std::fs::write(base.join("src/partial_match.rs"), "x").expect("write");
+    std::fs::write(base.join("src/ExactCase.rs"), "x").expect("write");
+    std::fs::write(base.join("src/deep/other.rs"), "x").expect("write");
+    std::fs::write(base.join("ignored/never.rs"), "x").expect("write");
+    std::fs::write(base.join(".hidden"), "x").expect("write");
+    std::fs::write(base.join("README.md"), "x").expect("write");
+    outer
+}
+
+/// The index answers exactly what the walk answers: one provider on the built index,
+/// one forced onto the walk path (an over-cap build disables its index), across the
+/// scope and case shapes the two paths could drift on.
+#[test]
+fn at_index_matches_the_walk_suggestions() {
+    let outer = parity_fixture();
+    let base = outer.path().join("base");
+    let indexed = provider(base.to_str().expect("utf8"));
+    let walked = provider(base.to_str().expect("utf8"));
+    assert!(indexed
+        .file_index
+        .build(&base, file_index::MAX_INDEX_ENTRIES));
+    assert!(!walked.file_index.build(&base, 1));
+    for query in [
+        "",
+        "match",
+        "par",
+        "README.md",
+        "ExactCase",
+        "deep/other",
+        "src/",
+        "src/deep/",
+        "src/par",
+        "src/deep/o",
+        "./READ",
+        "ignored/ne",
+    ] {
+        assert_eq!(
+            at_values(&indexed, &format!("@{query}")),
+            at_values(&walked, &format!("@{query}")),
+            "query @{query}"
+        );
+    }
+}
+
+#[test]
+fn at_lookup_answers_inline_from_a_built_index() {
+    let outer = parity_fixture();
+    let base = outer.path().join("base");
+    let provider = provider(base.to_str().expect("utf8"));
+    assert!(provider
+        .file_index
+        .build(&base, file_index::MAX_INDEX_ENTRIES));
+    let text = "@par";
+    assert!(matches!(
+        provider.get_suggestions(&[text.to_string()], 0, text.len(), false),
+        Some(SuggestionLookup::Ready(_))
+    ));
+}
+
+/// A xorshift generator: the random trees need no dependency.
+struct XorShift(u64);
+
+impl XorShift {
+    fn below(&mut self, bound: usize) -> usize {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        usize::try_from(self.0 % bound as u64).expect("below a usize bound")
+    }
+
+    fn pick<'a>(&mut self, items: &[&'a str]) -> &'a str {
+        items[self.below(items.len())]
+    }
+}
+
+/// A random tree of at least `entries` index entries under `base`, returned as their
+/// printed forms: nested directories; names mixing ASCII case, Unicode (case-fold
+/// outliers included), and regex metacharacters; a hidden file; and a gitignored
+/// directory beside `.git`.
+fn random_tree(base: &std::path::Path, rng: &mut XorShift, entries: usize) -> Vec<String> {
+    const WORDS: [&str; 16] = [
+        "src", "Lib", "main", "README", "Test", "util", "MODULE", "café", "Straße", "İzmir",
+        "ſtate", "日本", "文件", "🦀crab", "naïve", "data",
+    ];
+    const MARKS: [&str; 12] = ["", ".", "-", "#", "&", "~", "+", "(", "[", "$", "_", ""];
+    const EXTENSIONS: [&str; 6] = ["", ".rs", ".md", ".TXT", ".tar.gz", ".json"];
+    std::fs::create_dir_all(base.join(".git")).expect("mkdir");
+    std::fs::write(base.join(".git/config"), "git").expect("write");
+    std::fs::write(base.join(".gitignore"), "ignored/\n").expect("write");
+    std::fs::create_dir_all(base.join("ignored")).expect("mkdir");
+    std::fs::write(base.join("ignored/Ignored-main.rs"), "x").expect("write");
+    std::fs::write(base.join(".hidden-main.rs"), "x").expect("write");
+    let mut dirs = vec![String::new()];
+    let mut forms = vec![".gitignore".to_string(), ".hidden-main.rs".to_string()];
+    while forms.len() < entries {
+        let parent = dirs[rng.below(dirs.len())].clone();
+        let stem = format!(
+            "{parent}{}{}{}{}",
+            rng.pick(&WORDS),
+            rng.pick(&MARKS),
+            rng.pick(&WORDS),
+            forms.len()
+        );
+        if parent.matches('/').count() < 4 && rng.below(8) == 0 {
+            std::fs::create_dir(base.join(&stem)).expect("mkdir");
+            dirs.push(format!("{stem}/"));
+            forms.push(format!("{stem}/"));
+        } else {
+            let rel = format!("{stem}{}", rng.pick(&EXTENSIONS));
+            std::fs::write(base.join(&rel), "x").expect("write");
+            forms.push(rel);
+        }
+    }
+    forms
+}
+
+/// Queries over a random tree: the bare query, metacharacter and Unicode fragments (an
+/// invalid regex among them), and from real entries their exact names, prefixes,
+/// substrings, case variants, scoped, `./` scoped, and full-path shapes.
+fn random_queries(forms: &[String], rng: &mut XorShift) -> Vec<String> {
+    let mut queries: Vec<String> = [
+        "", ".", "-", "#", "&", "~", "+", "(", "[", "$", ".*", "s.c", "[a-z]+0", "é", "ß", "SS",
+        "İ", "i", "ſ", "s", "日本", "🦀", "MAIN", "./", "./main", "ignored/",
+    ]
+    .map(String::from)
+    .to_vec();
+    queries.push("ignored/Ig".to_string());
+    for _ in 0..8 {
+        let form = &forms[rng.below(forms.len())];
+        let path = fuzzy_file_search::form_trimmed(form);
+        let name: Vec<char> = fuzzy_file_search::form_name(form).chars().collect();
+        let start = rng.below(name.len());
+        let end = start + 1 + rng.below(name.len() - start);
+        let part: String = name[start..end].iter().collect();
+        queries.push(name.iter().collect());
+        queries.push(name[..end].iter().collect());
+        queries.push(part.to_uppercase());
+        queries.push(part.to_lowercase());
+        if let Some((parent, _)) = path.rsplit_once('/') {
+            let parent_name = parent.rsplit('/').next().unwrap_or_default();
+            queries.push(format!("{parent}/{part}"));
+            queries.push(format!("./{parent}/"));
+            queries.push(format!("{parent_name}/{part}"));
+        }
+        queries.push(part);
+    }
+    queries
+}
+
+/// The index answers what the full, uncut walk ranks — fd's walk rules, the shared
+/// matcher, and the shared ranking — on random trees, one small and one large enough
+/// for a multi-chunk scan; where the walk's result cut cannot apply (at most
+/// [`fuzzy_file_search::MAX_WALK_RESULTS`] matches), the walk provider answers the same.
+#[test]
+fn at_index_matches_the_walk_on_random_trees() {
+    const SEEDS: u64 = 1;
+    let large = (2 * file_index::SCAN_CHUNK_MIN).max(32_768) + 1_000;
+    for seed in 0..SEEDS {
+        for entries in [300, large] {
+            let mut rng = XorShift(0x9E37_79B9_7F4A_7C15 ^ seed);
+            let outer = tempfile::TempDir::new().expect("temp dir");
+            let base = outer.path().join("base");
+            let forms = random_tree(&base, &mut rng, entries);
+            let indexed = provider(base.to_str().expect("utf8"));
+            let walked = provider(base.to_str().expect("utf8"));
+            assert!(indexed
+                .file_index
+                .build(&base, file_index::MAX_INDEX_ENTRIES));
+            assert!(!walked.file_index.build(&base, 1));
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let mut walks: HashMap<std::path::PathBuf, Vec<String>> = HashMap::new();
+            for query in random_queries(&forms, &mut rng) {
+                let at_prefix = format!("@{query}");
+                let token = crate::path_token::at_token_before(
+                    &at_prefix.chars().collect::<Vec<_>>(),
+                    None,
+                )
+                .expect("token");
+                let mut matched = 0;
+                let expected =
+                    fuzzy_file_search::resolve_search(&base, &token, &cancel, |search, _| {
+                        let walk =
+                            walks
+                                .entry(search.walk_base.to_path_buf())
+                                .or_insert_with(|| {
+                                    fuzzy_file_search::walk_builder(search.walk_base)
+                                        .build()
+                                        .filter_map(Result::ok)
+                                        .filter_map(|entry| {
+                                            fuzzy_file_search::fd_printed_form(
+                                                &entry,
+                                                search.walk_base,
+                                            )
+                                        })
+                                        .collect()
+                                });
+                        let walk_base = search.walk_base.to_string_lossy();
+                        let mut target = String::new();
+                        let found: Vec<&String> = walk
+                            .iter()
+                            .filter(|form| search.matches(&walk_base, form, &mut target))
+                            .collect();
+                        matched = found.len();
+                        fuzzy_file_search::suggestions(
+                            fuzzy_file_search::top_ranked(
+                                found.into_iter().filter_map(|form| search.score(form)),
+                            ),
+                            search,
+                        )
+                    })
+                    .map(|suggestions| suggestions.items)
+                    .unwrap_or_default();
+                let context = format!("seed {seed}, {entries} entries, query {at_prefix}");
+                assert_eq!(at_values(&indexed, &at_prefix), expected, "{context}");
+                if matched <= fuzzy_file_search::MAX_WALK_RESULTS {
+                    assert_eq!(at_values(&walked, &at_prefix), expected, "{context}");
+                }
+            }
+        }
+    }
+}
+
+/// Watched changes land: a new file and a new directory with a file appear in the
+/// index, and vanish with their deletion. The bounded polling waits on external
+/// OS events.
+#[test]
+fn at_index_tracks_watcher_events() {
+    let outer = parity_fixture();
+    let base = outer.path().join("base");
+    let provider = provider(base.to_str().expect("utf8"));
+    assert!(provider
+        .file_index
+        .build(&base, file_index::MAX_INDEX_ENTRIES));
+    let values = |query: &str| {
+        at_values(&provider, &format!("@{query}"))
+            .into_iter()
+            .map(|item| item.value)
+            .collect::<Vec<_>>()
+    };
+    let settle = |present: bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let settled = if present {
+                values("watched.rs").contains(&"@watched.rs".to_string())
+                    && values("watched_dir").contains(&"@watched_dir/".to_string())
+                    && values("inside").contains(&"@watched_dir/inside.rs".to_string())
+            } else {
+                values("watched.rs").is_empty()
+                    && values("watched_dir").is_empty()
+                    && values("inside").is_empty()
+            };
+            if settled {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watcher never settled the entries (present={present})"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    };
+    std::fs::write(base.join("watched.rs"), "x").expect("write");
+    std::fs::create_dir_all(base.join("watched_dir")).expect("mkdir");
+    std::fs::write(base.join("watched_dir/inside.rs"), "x").expect("write");
+    settle(true);
+    // A directory replaced by a file drops the directory's descendants too.
+    std::fs::remove_dir_all(base.join("watched_dir")).expect("remove");
+    std::fs::write(base.join("watched_dir"), "x").expect("write");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let replaced = values("inside").is_empty()
+            && values("watched_dir").contains(&"@watched_dir".to_string());
+        if replaced {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher never settled the replaced directory"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    std::fs::remove_file(base.join("watched.rs")).expect("remove");
+    std::fs::remove_file(base.join("watched_dir")).expect("remove");
+    settle(false);
+    // A deleted session base drops the whole index: the next query rebuilds into
+    // whatever the tree still holds (nothing) instead of serving stale entries.
+    std::fs::remove_dir_all(base).expect("remove");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if values("par").is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the watcher never dropped the deleted base's index"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
 }

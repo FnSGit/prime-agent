@@ -1,5 +1,5 @@
 //! The composition root's MCP auth flows behind the TUI's
-//! `/mcp login <name>` and `/mcp logout <name>` plus the `/mcp` view's
+//! `/mcp` view's connect flows plus its
 //! api-key credential flow (`key <name>`): resolve the server through
 //! the settings + builtin catalog, run the pa-core OAuth login against
 //! the inline auth panel (the authorization URL block and the paste
@@ -22,43 +22,45 @@ use pa_core::mcp::{
 use pa_tui::auth_panel::{PastePromptTone, PasteStyle};
 use pa_tui::client_auth::{AuthFuture, ClientAuthCommands};
 
-/// The CLI's live MCP manager: the shared auth store, `mcpServers`, and
-/// `mcpCatalogSources` all re-read per resolve. No interactive login: hosts with
+/// The CLI's live MCP manager: the shared auth store and global-only `mcpServers` and
+/// `mcpCatalogSources`, re-read per resolve. No interactive login: hosts with
 /// a login UI call `set_begin_login` before the session registers host handlers.
 pub(crate) fn cli_mcp_manager(cwd: &std::path::Path, agent_dir: &std::path::Path) -> McpManager {
     let user_cwd = cwd.to_path_buf();
     let user_agent_dir = agent_dir.to_path_buf();
     let catalog_cwd = cwd.to_path_buf();
     let catalog_agent_dir = agent_dir.to_path_buf();
+    let user_servers: pa_core::mcp::UserServersFn = std::sync::Arc::new(move || {
+        let settings = pa_core::settings::SettingsManager::create(&user_cwd, &user_agent_dir);
+        Some(
+            settings
+                .global_settings()
+                .mcp_servers
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(server, config)| {
+                    serde_json::from_value::<McpServerConfig>(config)
+                        .ok()
+                        .map(|parsed| (server, parsed))
+                })
+                .collect(),
+        )
+    });
+    let oauth_user_servers = std::sync::Arc::clone(&user_servers);
     McpManager::new(McpManagerOptions {
         auth_storage: AuthStorage::create_with_oauth(
             agent_dir,
-            std::sync::Arc::new(pa_core::mcp::McpOAuth::new()),
+            std::sync::Arc::new(pa_core::mcp::McpOAuth::new(oauth_user_servers)),
         ),
-        get_user_servers: Box::new(move || {
-            let settings = pa_core::settings::SettingsManager::create(&user_cwd, &user_agent_dir);
-            Some(
-                settings
-                    .settings()
-                    .mcp_servers
-                    .clone()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter_map(|(server, config)| {
-                        serde_json::from_value::<McpServerConfig>(config)
-                            .ok()
-                            .map(|parsed| (server, parsed))
-                    })
-                    .collect(),
-            )
-        }),
+        get_user_servers: Box::new(move || user_servers()),
         begin_login: None,
         agent_dir: Some(agent_dir.to_path_buf()),
         get_catalog_sources: Some(Box::new(move || {
             let settings =
                 pa_core::settings::SettingsManager::create(&catalog_cwd, &catalog_agent_dir);
             settings
-                .settings()
+                .global_settings()
                 .mcp_catalog_sources
                 .clone()
                 .unwrap_or_default()
@@ -161,7 +163,7 @@ impl TerminalMcpAuth {
     /// The api-key credential flow (the `/mcp` view's key rows): prompt
     /// for the ONE key the credential collects (the masked field never
     /// renders the secret) and store it in the credential's auth slot —
-    /// the exact contract the runtime reads (auth.json's `serper` key,
+    /// the exact contract the runtime reads (e.g. auth.json's `serper` key,
     /// the `AuthCredential::ApiKey` form).
     async fn api_key_inner(
         &self,
@@ -193,22 +195,13 @@ impl TerminalMcpAuth {
         if let Some(error) = auth.drain_errors().pop() {
             return Err(anyhow!(error)).context("could not save the API key");
         }
-        Ok(format!("Saved API key for {label}. Web search is ready."))
-    }
-
-    fn logout_inner(&self, server: &str) -> Result<String> {
-        let provider = format!("mcp:{server}");
-        let mut auth = AuthStorage::create(&self.agent_dir);
-        // A missing credential is a no-op notice, not an error.
-        if auth.get_all().get(&provider).is_none() {
-            return Ok(format!("{server} is not connected."));
-        }
-        auth.logout(&provider);
-        if let Some(error) = auth.drain_errors().pop() {
-            return Err(anyhow!(error)).context("could not remove the stored credential");
-        }
+        // The skill gate follows this credential (unset
+        // `bundledSkills.websearch` resolves with the key), but the skill
+        // list resolves at session build — the same moment the key reaches
+        // the kernel — so the message carries the activation state like the
+        // MCP login flow's wording.
         Ok(format!(
-            "Disconnected {server}. Its skill deactivates in new sessions (/new)."
+            "Saved API key for {label}. Its skill activates in new sessions (/new)."
         ))
     }
 }
@@ -227,11 +220,6 @@ impl ClientAuthCommands for TerminalMcpAuth {
     fn api_key(&self, credential: &str, panel: pa_tui::auth_panel::AuthPanelHandle) -> AuthFuture {
         let (auth, credential) = (self.clone(), credential.to_string());
         Box::pin(async move { auth.api_key_inner(&credential, panel).await })
-    }
-
-    fn logout(&self, server: &str) -> AuthFuture {
-        let (auth, server) = (self.clone(), server.to_string());
-        Box::pin(async move { auth.logout_inner(&server) })
     }
 }
 
@@ -291,6 +279,45 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    fn cli_mcp_settings_stay_global_after_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(cwd.join(".prime/agent")).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let mut global: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pa-core/tests/fixtures/mcp/global-settings.json"
+        )))
+        .unwrap();
+        global["mcpCatalogSources"] = serde_json::json!([concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pa-core/tests/fixtures/mcp/global-services.json"
+        )]);
+        let mut project: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pa-core/tests/fixtures/mcp/project-settings.json"
+        )))
+        .unwrap();
+        project["mcpCatalogSources"] = serde_json::json!([concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../pa-core/tests/fixtures/mcp/project-services.json"
+        )]);
+        std::fs::write(agent_dir.join("settings.json"), global.to_string()).unwrap();
+        std::fs::write(cwd.join(".prime/agent/settings.json"), project.to_string()).unwrap();
+        let mut manager = cli_mcp_manager(&cwd, &agent_dir);
+        for _ in 0..2 {
+            assert_eq!(
+                manager.get_enabled_persistent_generic_servers(),
+                vec!["user-server"]
+            );
+            assert!(manager.service_descriptor("user-catalog").is_some());
+            assert!(manager.service_descriptor("project-catalog").is_none());
+            manager.refresh();
+        }
+    }
 
     /// A scripted transport (exact URL -> response): a plain origin-level
     /// authorization server.
@@ -446,47 +473,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_removes_the_credential_with_ts_wording() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let agent_dir = dir.path().join("agent");
-        std::fs::create_dir_all(&agent_dir)?;
-        let mut auth = AuthStorage::create(&agent_dir);
-        auth.set(
-            "mcp:linear",
-            pa_core::auth::AuthCredential::Oauth {
-                access: "linear-access".to_string(),
-                refresh: None,
-                expires: i64::MAX,
-                account_id: None,
-                endpoint: Some("https://mcp.linear.app/mcp".to_string()),
-                token_endpoint: None,
-                client_id: None,
-                resource: None,
-                issuer: None,
-                audience_mode: None,
-                enterprise_url: None,
-            },
-        );
-
-        let hook = TerminalMcpAuth::new(dir.path().to_path_buf(), agent_dir.clone());
-        let status = hook.logout_inner("linear")?;
-        assert_eq!(
-            status,
-            "Disconnected linear. Its skill deactivates in new sessions (/new)."
-        );
-        let stored: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(agent_dir.join("auth.json")).expect("auth.json"),
-        )?;
-        assert!(
-            stored.get("mcp:linear").is_none(),
-            "the credential was removed"
-        );
-        let status = hook.logout_inner("linear")?;
-        assert_eq!(status, "linear is not connected.");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn the_api_key_flow_stores_the_exact_runtime_contract() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let agent_dir = dir.path().join("agent");
@@ -515,7 +501,7 @@ mod tests {
             .expect("the reply lands");
         assert_eq!(
             flow.await.expect("the flow ran")?,
-            "Saved API key for Serper (web search). Web search is ready."
+            "Saved API key for Serper (web search). Its skill activates in new sessions (/new)."
         );
 
         // The stored credential is the EXACT contract the websearch runtime

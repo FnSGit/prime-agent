@@ -55,6 +55,7 @@ impl AgentView {
                     spacing,
                 )
             }
+            ChatEntry::InboxNotice(row) => self.count_inbox_notice_entry(index, row, width),
             ChatEntry::ShellCompletion(row) => {
                 crate::custom_message::geometry::shell_completion_row_count(
                     row, detail, width, spacing,
@@ -69,6 +70,7 @@ impl AgentView {
                         card,
                         self.pulse_frame,
                         detail,
+                        self.detail,
                         &self.theme,
                         width,
                         self.show_images,
@@ -243,12 +245,19 @@ mod tests {
             Just(serde_json::json!({"error": {"ename": "E", "evalue": "boom", "traceback": []}})),
             Just(serde_json::json!({"error": {"ename": "E", "evalue": "boom",
                 "traceback": ["Traceback", "E: boom"]}, "status": "error"})),
-            Just(
-                serde_json::json!({"diffs": [{"path": "x", "diff": "-x\n+y"}], "stdout": "Edited x"})
-            ),
+            Just(serde_json::json!({"diffs": [
+                {"path": "x.py", "diff": "-3 a\tb\n+3 a\n 4 c\n   ...\n+9 d 界"},
+                {"path": "x.py", "diff": "-1 e\n+1 f"}], "stdout": "Edited x.py"})),
             markdown_text().prop_map(|message| serde_json::json!({"sentAgentMessages": [
                 {"message": message, "deliveryStatus": "delivered", "receiverRole": "parent"},
                 {"id": "invalid"}]})),
+            markdown_text().prop_map(|text| serde_json::json!({"inboxMessages": [
+                {"class": "agent-message", "text": text, "meta": {"id": "m", "from": {}}},
+                {"class": "child-failed", "text": text, "meta": {}},
+                {"class": "bash-done", "text": text,
+                    "meta": {"pid": 3, "command": "ls", "exitCode": 1}},
+                {"class": "heartbeat", "text": text, "meta": {}},
+                {"class": "factory-progress", "text": text, "meta": {}}]})),
         ];
         let image = prop::option::of(prop::sample::select(vec![
             serde_json::json!({"type": "image"}),
@@ -337,6 +346,18 @@ mod tests {
                     message,
                 }))
             }),
+            1 => (
+                prop::sample::select(vec!["arrival", "reminder"]),
+                prop::option::of(any::<u64>()),
+                markdown_text()
+            )
+                .prop_map(|(class, count, text)| {
+                    ChatEntry::InboxNotice(Box::new(InboxNoticeRow {
+                        class: class.to_string(),
+                        count,
+                        text,
+                    }))
+                }),
             1 => markdown_text().prop_map(|content| {
                 ChatEntry::SkillInvocation(Box::new(SkillInvocationRow {
                     name: "skill 数据".to_string(),

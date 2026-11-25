@@ -9,7 +9,7 @@ use crate::snapshot::RetryStartReason;
 use crate::theme::{Theme, ThemeBg, ThemeColor};
 use crate::width::str_width;
 use crate::{Line, Span};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 
 /// How much detail the conversation shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +104,9 @@ pub enum ChatEntry {
     Tool(Box<ToolCallCard>),
     /// One agent-message summary row: the received transcript rows.
     AgentMessage(Box<crate::custom_message::AgentMessageRow>),
+    /// One inbox-notice row: the daemon's inbox system announcing waiting
+    /// machine messages (an attributed custom row, never user input).
+    InboxNotice(Box<crate::custom_message::InboxNoticeRow>),
     /// One skill-invocation card: the expandable `<skill>`-block card a
     /// user message carrying a skill invocation parses into.
     SkillInvocation(Box<crate::custom_message::SkillInvocationRow>),
@@ -118,6 +121,22 @@ pub enum ChatEntry {
     RefinementOutcome(Box<crate::custom_message::RefinementOutcomeRow>),
     /// One generic custom row.
     CustomPanel(Box<crate::custom_message::CustomPanelRow>),
+}
+
+impl ChatEntry {
+    /// The envelope rows (agent messages, inbox notices, shell
+    /// completions, tool cards): their leading blank follows the
+    /// conversation spacing of the rows before them.
+    #[must_use]
+    pub fn is_envelope_row(&self) -> bool {
+        matches!(
+            self,
+            ChatEntry::AgentMessage(_)
+                | ChatEntry::InboxNotice(_)
+                | ChatEntry::ShellCompletion(_)
+                | ChatEntry::Tool(_)
+        )
+    }
 }
 
 // The card types live in `tool_card`; re-exported here because the
@@ -311,11 +330,22 @@ pub fn render_user_block(
     code_block_indent: &str,
     width: usize,
 ) -> Vec<Line> {
-    let bg = theme.bg_style(ThemeBg::UserMessageBg);
-    let content_width = width.saturating_sub(4).max(1);
-    let body = theme.fg_style(ThemeColor::UserMessageText);
     let mut md = crate::markdown::MarkdownStyle::from_theme(theme);
     md.code_block_indent = code_block_indent.to_string();
+    render_user_block_with_style(text, theme, &md, width)
+}
+
+/// The view supplies its session cwd through Markdown style, keeping href resolution local.
+pub(crate) fn render_user_block_with_style(
+    text: &str,
+    theme: &Theme,
+    md: &crate::markdown::MarkdownStyle,
+    width: usize,
+) -> Vec<Line> {
+    let bg = theme.bg_style(ThemeBg::UserMessageBg);
+    let content_width = width.saturating_sub(4).max(1);
+    let mut md = md.clone();
+    md.body = theme.fg_style(ThemeColor::UserMessageText);
     let mask = geometry::user_mask(text);
     let rendered = crate::markdown::render_markdown(&mask.text, content_width, &md);
     let mut rows: Vec<Line> = Vec::new();
@@ -324,27 +354,15 @@ pub fn render_user_block(
     if rendered.is_empty() {
         let row = vec![
             Span::styled("  ".to_string(), bg),
-            Span::styled(String::new(), body),
+            Span::styled(String::new(), md.body),
         ];
         rows.push(pad_to(row, width, bg));
     }
     for line in rendered {
         let mut row: Line = vec![Span::styled("  ".to_string(), bg)];
-        // The user block colors everything `userMessageText` on the block background;
-        // markdown structure (wrapping) is kept, its own colors are not, and the link
-        // affordance survives the restyle.
         let restyled: Line = line
             .into_iter()
-            .map(|span| {
-                let mut style = bg.patch(body);
-                if span.style.add_modifier.contains(Modifier::UNDERLINED) {
-                    style = style.add_modifier(Modifier::UNDERLINED);
-                }
-                if span.style.fg == md.link_url.fg {
-                    style = style.patch(md.link_url);
-                }
-                Span::styled(span.content, style)
-            })
+            .map(|span| Span::styled(span.content, bg.patch(span.style)))
             .collect();
         row.extend(mask.restore_line(theme, &restyled));
         rows.push(pad_to(row, width, bg));
@@ -372,21 +390,42 @@ pub fn render_assistant(
     preceded_by_tool_activity: bool,
     cache: &mut crate::markdown::MarkdownBlockCache,
 ) -> Vec<Line> {
+    let mut md = crate::markdown::MarkdownStyle::from_theme(theme);
+    md.code_block_indent = code_block_indent.to_string();
+    render_assistant_with_style(
+        message,
+        detail,
+        theme,
+        &md,
+        width,
+        preceded_by_tool_activity,
+        cache,
+    )
+}
+
+/// Render with the owning view's session-local Markdown context.
+pub(crate) fn render_assistant_with_style(
+    message: &AssistantMessage,
+    detail: Detail,
+    theme: &Theme,
+    md: &crate::markdown::MarkdownStyle,
+    width: usize,
+    preceded_by_tool_activity: bool,
+    cache: &mut crate::markdown::MarkdownBlockCache,
+) -> Vec<Line> {
     let visible_blocks = geometry::visible_blocks(message, detail);
     let has_visible_content = !visible_blocks.is_empty();
     let mut out: Vec<Line> = Vec::new();
     if has_visible_content {
         out.push(spacer());
     }
-    let mut md = crate::markdown::MarkdownStyle::from_theme(theme);
-    md.code_block_indent = code_block_indent.to_string();
     for (index, block) in visible_blocks.iter().enumerate() {
         match block {
             MessageBlock::Text(text) => {
-                out.extend(render_markdown_block(text, &md, width, cache));
+                out.extend(render_markdown_block(text, md, width, cache));
             }
             MessageBlock::Thinking(text) => {
-                out.extend(render_thinking_block(text, theme, &md, width, cache));
+                out.extend(render_thinking_block(text, theme, md, width, cache));
                 // Thinking adds spacing only when another visible block follows.
                 if index + 1 < visible_blocks.len() {
                     out.push(spacer());

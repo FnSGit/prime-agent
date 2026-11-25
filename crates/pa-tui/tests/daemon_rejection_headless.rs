@@ -3,33 +3,21 @@
 //! `showError` row and keep running — a daemon refusal never exits the
 //! client; only transport failures stay fatal (TS `handleFollowUp`).
 #![cfg(unix)]
-// Casts: structurally bounded terminal-layout arithmetic; guarded conversions add panic paths.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)]
-// Render routes are flat tables (one arm per route); splitting adds indirection.
-#![allow(clippy::too_many_lines)]
-// Widget state structs carry independent flag bits.
-#![allow(clippy::struct_excessive_bools, clippy::fn_params_excessive_bools)]
-// Futures are bounded by the surface's lifetime; boxing adds a steady-state allocation.
-#![allow(clippy::large_futures)]
-// The wrappers preserve a uniform Result-returning API surface.
-#![allow(clippy::unnecessary_wraps)]
+#![warn(clippy::allow_attributes_without_reason)]
 
-use std::io::{BufRead, BufReader, Write};
+mod support;
+
+use std::io::{BufRead, BufReader};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pa_tui::interactive::{
-    run_interactive, HeadlessPlan, HeadlessStep, InteractiveOptions, ModelSelection,
-    SessionSelection, UiMode,
+    run_interactive, HeadlessPlan, HeadlessStep, InteractiveOptions, SessionSelection, UiMode,
 };
 use serde_json::{json, Value};
+
+use support::{attach_response, write_json, write_session_event};
 
 /// The real worker admission refusal (`QUEUED_INPUT_SUSPENDED`), the stand-in for every daemon-side
 /// "alive but refusing THIS request".
@@ -50,6 +38,8 @@ struct MockSupervisor {
     hold_turn_ms: u64,
     /// Drop the connection when the next prompt arrives (the dead-daemon transport case).
     close_on_prompt: bool,
+    /// Rebind to s2 before closing, so the pending prompt outcome outlives its active id.
+    rebind_before_close: bool,
     /// Reject the `create` command with this message (the saved-session open refusal: "session
     /// worker create failed: Session is already active in <id>: <file>").
     reject_create: Option<String>,
@@ -71,6 +61,8 @@ struct SharedAnswers {
     reject_prompt_index: Option<usize>,
     hold_turn_ms: u64,
     close_on_prompt: bool,
+    /// Rebind to s2 before closing, so the pending prompt outcome outlives its active id.
+    rebind_before_close: bool,
     reject_create: Option<String>,
 }
 
@@ -83,6 +75,7 @@ impl MockSupervisor {
             reject_prompt_index: None,
             hold_turn_ms: 0,
             close_on_prompt: false,
+            rebind_before_close: false,
             reject_create: None,
             create_answers: Vec::new(),
         }
@@ -103,6 +96,7 @@ impl MockSupervisor {
             reject_prompt_index: self.reject_prompt_index,
             hold_turn_ms: self.hold_turn_ms,
             close_on_prompt: self.close_on_prompt,
+            rebind_before_close: self.rebind_before_close,
             reject_create: self.reject_create,
         });
         let mut connections = Vec::new();
@@ -131,7 +125,13 @@ impl MockSupervisor {
 
 /// One client connection's read loop, over the shared answers.
 impl SharedAnswers {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "mock daemon request loop: one match arm per scripted request method"
+    )]
     fn serve_connection(self: std::sync::Arc<Self>, stream: UnixStream) {
+        // macOS inherits O_NONBLOCK from the listener on accept; the request loop blocks.
+        stream.set_nonblocking(false).expect("blocking mock stream");
         let mut writer = stream.try_clone().expect("clone mock socket");
         let mut reader = BufReader::new(stream);
 
@@ -243,7 +243,23 @@ impl SharedAnswers {
                     );
                 }
                 "attach" => {
-                    write_json(&mut writer, &attach_data(id));
+                    let mut data = attach_response(id, "rejection session");
+                    if self.rebind_before_close && !self.prompt_requests.lock().unwrap().is_empty()
+                    {
+                        data["data"]["activeSessionId"] = json!("s2");
+                        data["data"]["snapshot"]["activeSessionId"] = json!("s2");
+                        data["data"]["snapshot"]["summary"]["id"] = json!("s2");
+                        data["data"]["snapshot"]["state"]["activeSessionId"] = json!("s2");
+                    }
+                    write_json(&mut writer, &data);
+                }
+                "detach"
+                    if self.rebind_before_close
+                        && !self.prompt_requests.lock().unwrap().is_empty() =>
+                {
+                    // attach_session has adopted s2 before detaching s1. Resolve the pending
+                    // prompt only now, after the mounted id has observably changed.
+                    break;
                 }
                 "prompt" => {
                     let index = {
@@ -251,6 +267,17 @@ impl SharedAnswers {
                         requests.push(command.clone());
                         requests.len() - 1
                     };
+                    if self.close_on_prompt && self.rebind_before_close {
+                        write_json(
+                            &mut writer,
+                            &json!({
+                                "type": "session_binding",
+                                "previousActiveSessionId": "s1",
+                                "activeSessionId": "s2",
+                            }),
+                        );
+                        continue;
+                    }
                     if self.close_on_prompt {
                         // The dead-daemon case: dropping both halves fails the in-flight request
                         // with the transport error.
@@ -334,6 +361,7 @@ impl SharedAnswers {
                             }),
                         );
                         write_session_event(&mut writer, &json!({ "type": "turn_end" }));
+                        write_session_event(&mut writer, &json!({ "type": "agent_end" }));
                     } else {
                         let mut delayed = writer.try_clone().expect("clone delayed writer");
                         let delay = self.hold_turn_ms;
@@ -353,6 +381,7 @@ impl SharedAnswers {
                                 }),
                             );
                             write_session_event(&mut delayed, &json!({ "type": "turn_end" }));
+                            write_session_event(&mut delayed, &json!({ "type": "agent_end" }));
                         });
                     }
                 }
@@ -370,96 +399,6 @@ impl SharedAnswers {
                 }
             }
         }
-    }
-}
-
-fn write_session_event(writer: &mut UnixStream, event: &Value) {
-    write_json(
-        writer,
-        &json!({
-            "type": "session_event",
-            "activeSessionId": "s1",
-            "event": event,
-        }),
-    );
-}
-
-fn write_json(writer: &mut UnixStream, value: &Value) {
-    let mut line = serde_json::to_string(value).expect("serialize mock frame");
-    line.push('\n');
-    writer.write_all(line.as_bytes()).expect("write mock frame");
-    writer.flush().expect("flush mock frame");
-}
-
-/// The slim attach result with an empty transcript.
-fn attach_data(id: &str) -> Value {
-    json!({
-        "type": "response",
-        "id": id,
-        "command": "attach",
-        "success": true,
-        "data": {
-            "protocol": { "name": "prime-agent.daemon", "version": 7 },
-            "activeSessionId": "s1",
-            "snapshot": {
-                "activeSessionId": "s1",
-                "summary": { "id": "s1", "cwd": "/tmp" },
-                "state": {
-                    "activeSessionId": "s1",
-                    "cwd": "/tmp",
-                    "sessionId": "sess-1",
-                    "sessionName": "rejection session",
-                    "model": null,
-                    "isStreaming": false,
-                    "isCompacting": false,
-                    "sessionActions": { "queuedCount": 0, "steering": [], "followUps": [] },
-                },
-                "messages": [],
-                "lastEventSequence": 0,
-                "lastEventCursor": null,
-            },
-            "client": { "id": "mock", "capabilities": [] },
-            "lastEventSequence": 0,
-            "lastEventCursor": null,
-        },
-    })
-}
-
-fn options_with_session(socket: PathBuf, session: SessionSelection) -> InteractiveOptions {
-    InteractiveOptions {
-        models: None,
-        socket_path: socket,
-        cwd: PathBuf::from("/tmp"),
-        session_dir: None,
-        script_path: None,
-        model_selection: ModelSelection::default(),
-        model_catalog: Vec::new(),
-        model_configured_providers: std::collections::HashSet::default(),
-        model_recent_models: Vec::new(),
-        default_thinking_level: None,
-        no_session: false,
-        session,
-        initial_message: None,
-        show_images: true,
-        fullscreen_mouse: false,
-        theme: "prime".to_string(),
-        code_block_indent: "  ".to_string(),
-        tree_filter_mode: String::new(),
-        branch_summary_skip_prompt: false,
-        version: "0.0.0".to_string(),
-        onboarding: None,
-        telemetry_disabled: None,
-        client_auth: None,
-        traces: None,
-        provider_auth: None,
-        update_commands: None,
-        telemetry: None,
-        keybindings: pa_tui::keybindings::KeybindingsManager::new(),
-        session_rlm_depth: None,
-        prompt_stash: Arc::default(),
-        session_has_children: false,
-        restore_dock_focus: false,
-        client_settings: None,
     }
 }
 
@@ -533,13 +472,21 @@ fn run_plan(
         width: 100,
         height: 40,
     };
-    let options = options_with_session(socket, selection);
+    let options = InteractiveOptions {
+        session: selection,
+        fullscreen_mouse: false,
+        ..support::options(socket)
+    };
     let outcome = runtime.block_on(async {
         if agents_view_open {
-            pa_tui::interactive::run_interactive_agents_view_open(options, UiMode::Headless(plan))
-                .await
+            Box::pin(pa_tui::interactive::run_interactive_agents_view_open(
+                options,
+                UiMode::Headless(plan),
+                None,
+            ))
+            .await
         } else {
-            run_interactive(options, UiMode::Headless(plan)).await
+            Box::pin(run_interactive(options, UiMode::Headless(plan))).await
         }
     })?;
     let _ = handle.join();
@@ -627,11 +574,21 @@ fn rejected_mid_turn_submission_renders_the_error_row_and_keeps_running() {
 }
 
 /// Handled, not fatal (operator directive: the user never loses their TUI to a daemon hiccup);
-/// the loss is surfaced twice, never silently swallowed.
+/// the loss is surfaced twice, and the close-after-send draft stays consumed so the natural
+/// resubmit never runs the prompt twice.
 #[test]
-fn dead_connection_on_prompt_keeps_the_run_mounted_and_arms_the_reconnect() {
+fn dead_connection_on_prompt_keeps_the_draft_consumed_and_arms_the_reconnect() {
     let steps = vec![
         HeadlessStep::Type("hello".to_string()),
+        HeadlessStep::Key(enter()),
+        HeadlessStep::WaitRender {
+            needle: "the daemon connection closed — reconnecting".to_string(),
+            timeout_ms: 2000,
+        },
+        HeadlessStep::WaitRender {
+            needle: "Daemon reconnected".to_string(),
+            timeout_ms: 4000,
+        },
         HeadlessStep::Key(enter()),
         HeadlessStep::WaitMs(300),
     ];
@@ -639,10 +596,7 @@ fn dead_connection_on_prompt_keeps_the_run_mounted_and_arms_the_reconnect() {
         supervisor.close_on_prompt = true;
     })
     .expect("a dead connection keeps the run mounted");
-    let all = run.frames.join(
-        "
-",
-    );
+    let all = run.frames.join("\n");
     assert!(
         all.contains("\u{26a0} Error: the daemon connection closed"),
         "the dead connection surfaces as the error row:\n{all}"
@@ -651,14 +605,49 @@ fn dead_connection_on_prompt_keeps_the_run_mounted_and_arms_the_reconnect() {
         all.contains("the daemon connection closed — reconnecting"),
         "the reconnect driver is armed for the loss:\n{all}"
     );
+    assert_eq!(
+        run.prompt_requests.len(),
+        1,
+        "the close-after-send prompt never dispatches twice"
+    );
+    let last = run.frames.last().map(String::as_str).unwrap_or_default();
     assert!(
-        all.contains("hello"),
-        "the dead-connection draft returned to the editor:\n{all}"
+        !last.contains("hello"),
+        "the draft stays consumed after the close:\n{last}"
     );
 }
 
 /// TS `onSubmit` passes its captured `streamingBehavior` to the fallthrough prompt, so alt+enter
 /// on unknown slash text parks on the follow-up lane, not the steering lane.
+/// A queued prompt remains consumed even if a session-binding event wins the outcome race.
+#[test]
+fn close_after_rebind_keeps_the_outlived_prompt_consumed() {
+    let steps = vec![
+        HeadlessStep::Type("hello".to_string()),
+        HeadlessStep::Key(enter()),
+        HeadlessStep::WaitRender {
+            needle: "Daemon reconnected".to_string(),
+            timeout_ms: 4000,
+        },
+        HeadlessStep::Key(enter()),
+        HeadlessStep::WaitMs(300),
+    ];
+    let run = run_plan_with(steps, |supervisor| {
+        supervisor.close_on_prompt = true;
+        supervisor.rebind_before_close = true;
+    })
+    .expect("the rebind and connection loss keep the run mounted");
+    assert_eq!(
+        run.prompt_requests.len(),
+        1,
+        "the outlived draft never replays"
+    );
+    let all = run.frames.join("\n");
+    assert!(all.contains("Daemon reconnected"), "reconnected: {all}");
+    let last = run.frames.last().map(String::as_str).unwrap_or_default();
+    assert!(!last.contains("hello"), "the draft stays consumed: {last}");
+}
+
 #[test]
 fn slash_fallthrough_follow_up_keeps_the_follow_up_lane() {
     let steps = vec![

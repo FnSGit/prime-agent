@@ -133,6 +133,35 @@ pub fn get_harness_state_path(harness_state_dir: &Path) -> PathBuf {
     harness_state_dir.join("harness_state.json")
 }
 
+/// The file a harness-state writer must lock and write: the state file
+/// resolved through file symlinks. The kernel resolves the same way for
+/// both halves (`harness.py`'s `_locked` locks `realpath(state).lock`,
+/// its save replaces the real file and leaves aliases in place), so a
+/// file symlink at `harness_state.json` names the real file behind it —
+/// locking or renaming the alias would miss the kernel's lock entirely
+/// and replace the link itself. Every other spelling stays as given: a
+/// missing or regular file, or a symlinked parent directory (the OS
+/// resolves those on `mkdir` and rename).
+pub(crate) fn resolved_state_file(state_path: &Path) -> PathBuf {
+    let mut current = state_path.to_path_buf();
+    // Follow a chain of file links the way `realpath` does; the bound
+    // mirrors the OS's own ELOOP guard against cyclic links.
+    for _ in 0..40 {
+        let Ok(target) = std::fs::read_link(&current) else {
+            return current;
+        };
+        current = if target.is_absolute() {
+            target
+        } else {
+            current
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+    }
+    current
+}
+
 /// The settings file the factory opt-in gate reads: the agent dir's
 /// settings.json, the same document the kernel-side gate resolves through
 /// `PRIME_AGENT_CODING_AGENT_DIR` (the host exports the session's agent
@@ -281,7 +310,9 @@ pub fn save_harness_state(
     state: &HarnessState,
 ) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(harness_state_dir)?;
-    let state_path = get_harness_state_path(harness_state_dir);
+    // Replace the real file behind a state symlink, never the alias: the
+    // link survives and both writers keep naming one file.
+    let state_path = resolved_state_file(&get_harness_state_path(harness_state_dir));
     let content = format!("{}\n", serde_json::to_string_pretty(state)?);
     crate::settings::storage::atomic_write_with(
         &state_path,
@@ -302,8 +333,19 @@ pub fn update_harness_state<R>(
     scope: HarnessScope,
     update: impl FnOnce(&mut HarnessState) -> R,
 ) -> anyhow::Result<(R, PathBuf)> {
+    try_update_harness_state(harness_state_dir, scope, |state| Ok(update(state)))
+}
+
+/// A rejected update must exit before saving, including an apply-time setting gate.
+pub(crate) fn try_update_harness_state<R>(
+    harness_state_dir: &Path,
+    scope: HarnessScope,
+    update: impl FnOnce(&mut HarnessState) -> anyhow::Result<R>,
+) -> anyhow::Result<(R, PathBuf)> {
     std::fs::create_dir_all(harness_state_dir)?;
-    let state_path = get_harness_state_path(harness_state_dir);
+    // Lock the file the kernel locks: the real file behind a state
+    // symlink, so both writers contend on one lock directory.
+    let state_path = resolved_state_file(&get_harness_state_path(harness_state_dir));
     let lock = crate::platform::lock_dir::LockDir::acquire_owned_retrying(
         &state_path,
         std::time::Duration::from_secs(10),
@@ -311,7 +353,7 @@ pub fn update_harness_state<R>(
         std::time::Duration::from_millis(20),
     )?;
     let mut state = load_harness_state(harness_state_dir, scope);
-    let result = update(&mut state);
+    let result = update(&mut state)?;
     lock.ensure_owned()?;
     let written = save_harness_state(harness_state_dir, &state)?;
     Ok((result, written))
@@ -435,10 +477,10 @@ pub fn append_global_refinement(
     let history_path = get_refinement_history_path(harness_state_dir);
     let mut line = serde_json::to_string(result)?;
     line.push('\n');
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&history_path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    crate::platform::perms::set_private_mode(&mut options);
+    let mut file = options.open(&history_path)?;
     file.write_all(line.as_bytes())?;
     Ok(history_path)
 }
@@ -592,6 +634,21 @@ mod tests {
     }
 
     #[test]
+    fn rejected_harness_update_preserves_saved_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = empty_harness_state();
+        let path = save_harness_state(dir.path(), &state).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let result: anyhow::Result<((), PathBuf)> =
+            try_update_harness_state(dir.path(), HarnessScope::Global, |state| {
+                state.schema = 99;
+                anyhow::bail!("disabled before commit")
+            });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[test]
     fn factory_opt_in_reads_leniently_and_fails_closed() {
         let tmp = tempfile::tempdir().unwrap();
         // No settings file: the opt-in default is disabled.
@@ -698,12 +755,16 @@ mod tests {
     fn concurrent_update_harness_state_writes_all_land() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = get_global_harness_state_dir(tmp.path());
-        std::thread::scope(|scope| {
-            for worker in 0..8u32 {
-                let dir = &dir;
-                scope.spawn(move || {
-                    for i in 0..10u32 {
-                        let id = format!("m-{worker}-{i}");
+        // Each round, two fresh writers race one read-modify-write. The lock
+        // is unfair and its wait is bounded (~1s, shared with the kernel), so
+        // no writer loops back into it while the other polls: a waiter faces
+        // one foreign hold.
+        for round in 0..40u32 {
+            std::thread::scope(|scope| {
+                for worker in 0..2u32 {
+                    let dir = &dir;
+                    scope.spawn(move || {
+                        let id = format!("m-{worker}-{round}");
                         update_harness_state(dir, HarnessScope::Global, |state| {
                             let memories = state.entries.get_mut(&RefinementKind::Memory).unwrap();
                             memories.insert(
@@ -713,10 +774,10 @@ mod tests {
                             memories.len()
                         })
                         .unwrap();
-                    }
-                });
-            }
-        });
+                    });
+                }
+            });
+        }
         let loaded = load_harness_state(&dir, HarnessScope::Global);
         assert_eq!(loaded.entries[&RefinementKind::Memory].len(), 80);
     }

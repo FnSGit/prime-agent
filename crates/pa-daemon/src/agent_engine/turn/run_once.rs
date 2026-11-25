@@ -36,9 +36,8 @@ impl AgentSessionEngine {
             return Vec::new();
         }
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
-        let mut registry =
+        let registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
-        registry.load_private_authorization_from_cache();
         let available: Vec<pa_types::ai::Model> =
             registry.get_available().into_iter().cloned().collect();
         let candidates = pa_core::models::failover_candidates(model, &available);
@@ -63,26 +62,35 @@ impl AgentSessionEngine {
     /// parked turn. Returns the final assistant message, `None` when none
     /// was produced, or `Aborted` when the emit cancelled or the cancel flag
     /// raced the admission.
+    // The model-change queue preserves the separate engine and worker stores
+    // at this run boundary; keep it alongside the existing delivery arguments.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_turn_once(
         &self,
         agent: &std::sync::Arc<pa_agent::agent::Agent>,
         prompt: &TurnPrompt,
         first_attempt: bool,
         boundary_passed: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        pending_model_changes: &std::sync::Arc<
+            std::sync::Mutex<Vec<pa_types::session::ModelChangeEntry>>,
+        >,
         aborted: &dyn Fn() -> bool,
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) -> anyhow::Result<TurnOnce> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<EngineEvent>();
         // Goal usage accounting at the message_end hook: each settled non-error
         // assistant message records its token delta, from the engine mirror.
-        let goal_runtime = self.goal_runtime.lock().expect("goal runtime lock").clone();
+        let goal_runtime = self.live_handles().map(|live| live.goal.clone());
         let goal_budget_crossed = std::sync::Arc::clone(&self.goal_budget_crossed);
         // The run-opening boundary frames are the worker's own for the
         // item's first run; this subscription forwards them only once a
         // boundary frame already passed.
         let boundary_passed = std::sync::Arc::clone(boundary_passed);
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let subscription = {
+            let live = std::sync::Arc::clone(&live);
             let tx = tx.clone();
+            let pending_model_changes = pending_model_changes.clone();
             let boundary_passed = std::sync::Arc::clone(&boundary_passed);
             let autonomous_state = std::sync::Arc::clone(&self.autonomous);
             let autonomous_driver = std::sync::Arc::clone(
@@ -93,7 +101,9 @@ impl AgentSessionEngine {
             );
             agent
                 .subscribe(move |event, _signal| {
+                    let live = live.load(std::sync::atomic::Ordering::SeqCst);
                     let tx = tx.clone();
+                    let pending_model_changes = pending_model_changes.clone();
                     let boundary_passed = std::sync::Arc::clone(&boundary_passed);
                     let autonomous_state = std::sync::Arc::clone(&autonomous_state);
                     let autonomous_driver = std::sync::Arc::clone(&autonomous_driver);
@@ -101,6 +111,9 @@ impl AgentSessionEngine {
                     let goal_budget_crossed = goal_budget_crossed.clone();
                     Box::pin(async move {
                         use pa_agent::types::AgentEvent;
+                        if !live {
+                            return Ok(());
+                        }
                         if let AgentEvent::MessageEnd {
                             message:
                                 pa_agent::types::AgentMessage::Standard(
@@ -211,6 +224,11 @@ impl AgentSessionEngine {
                                                 EngineEvent::AssistantMessage(value)
                                             };
                                             let _ = tx.send(event);
+                                            for change in pending_model_changes.lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                                .drain(..) {
+                                                let _ = tx.send(EngineEvent::ModelChange(change));
+                                            }
                                         }
                                     }
                                     // An in-run continuation's user row: the
@@ -242,13 +260,16 @@ impl AgentSessionEngine {
                                     let _ = tx.send(EngineEvent::AgentStart);
                                 }
                             }
-                            AgentEvent::AgentEnd { messages } => {
+                            AgentEvent::AgentEnd { messages, aborted } => {
                                 let messages = messages
                                     .iter()
                                     .filter_map(session_wire_value)
                                     .collect::<Vec<Value>>();
                                 boundary_passed.store(true, std::sync::atomic::Ordering::SeqCst);
-                                let _ = tx.send(EngineEvent::AgentEnd { messages });
+                                let _ = tx.send(EngineEvent::AgentEnd {
+                                    messages,
+                                    aborted: *aborted,
+                                });
                             }
                             AgentEvent::TurnEnd {
                                 message,
@@ -282,6 +303,7 @@ impl AgentSessionEngine {
                                     args: args.clone(),
                                 });
                             }
+                            AgentEvent::ToolExecutionProgress { .. } => {}
                             AgentEvent::ToolExecutionUpdate {
                                 tool_call_id,
                                 partial_result,
@@ -310,6 +332,10 @@ impl AgentSessionEngine {
                 })
                 .await
         };
+        let subscription = TurnSubscription {
+            subscription: Some(subscription),
+            live,
+        };
         // Admit the turn without blocking the forwarding loop: the admission
         // future settles only when the whole turn settles, while the loop
         // hands each streamed event to `emit` the moment it arrives (buffering
@@ -330,6 +356,17 @@ impl AgentSessionEngine {
                 // dogfood failure); the Arc clone keeps reads free.
                 let session = self.session.lock().await.clone();
                 let engine = session.expect("session built");
+                if std::env::var_os("PA_COMPACTION_TRACE").is_some() {
+                    let state = engine.session.agent().state().await;
+                    pa_core::session_engine::compaction_trace::trace(
+                        "daemon.before_prompt_admission",
+                        &json!({
+                            "liveUserRows": state.messages.iter().filter(|message|
+                                matches!(message, pa_agent::types::AgentMessage::Standard(
+                                    pa_agent::types::Message::User(_)))).count(),
+                        }),
+                    );
+                }
                 match &prompt {
                     // A plain turn admits a user prompt; an injected turn admits the
                     // custom row itself — ONE representation.
@@ -421,6 +458,12 @@ impl AgentSessionEngine {
             return Ok(TurnOnce::Aborted);
         }
         if let Some(error) = admission_error {
+            // An abort that lands before the provider stream starts fails the
+            // run with the typed abort error, after the run's failure path
+            // already settled the aborted row: the turn was aborted.
+            if pa_agent::abort::is_abort_error(&error) {
+                return Ok(TurnOnce::Aborted);
+            }
             return Err(anyhow::anyhow!("{error:#}"));
         }
         let state = agent.state().await;
@@ -439,6 +482,35 @@ impl AgentSessionEngine {
             }
         }
         Ok(TurnOnce::None)
+    }
+}
+
+/// The turn's listener, inert on every exit path: an `emit` panic unwinds
+/// past the awaited unsubscribe, and a listener left behind would forward and
+/// account (`account_message`, goal usage) every later run's events again.
+/// Drop silences it at once; the removal it spawns is only cleanup.
+struct TurnSubscription {
+    subscription: Option<pa_agent::agent::Subscription>,
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TurnSubscription {
+    async fn unsubscribe(mut self) {
+        if let Some(subscription) = self.subscription.take() {
+            subscription.unsubscribe().await;
+        }
+    }
+}
+
+impl Drop for TurnSubscription {
+    fn drop(&mut self) {
+        self.live.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let (Some(subscription), Ok(runtime)) = (
+            self.subscription.take(),
+            tokio::runtime::Handle::try_current(),
+        ) {
+            runtime.spawn(subscription.unsubscribe());
+        }
     }
 }
 

@@ -248,6 +248,7 @@ async fn emits_aggregate_metrics_without_content() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -314,6 +315,7 @@ async fn post_run_compaction_counts_into_the_open_run() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -342,6 +344,7 @@ async fn compaction_between_runs_is_not_counted() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -355,6 +358,7 @@ async fn compaction_between_runs_is_not_counted() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -362,6 +366,7 @@ async fn compaction_between_runs_is_not_counted() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -382,6 +387,7 @@ async fn error_and_aborted_outcomes() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -392,6 +398,7 @@ async fn error_and_aborted_outcomes() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -476,6 +483,7 @@ async fn tool_calls_fold_into_run_aggregates() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -500,6 +508,43 @@ async fn tool_calls_fold_into_run_aggregates() {
     let all = serde_json::to_string(&fixture.mock.events()).unwrap();
     assert!(!all.contains("github"));
     assert!(!all.contains("private-extension-tool"));
+}
+
+/// Video blocks in tool results (the `attach_video` adoption) count into
+/// `agent session ended`; the payload, mime type, and path never ride an event.
+#[tokio::test]
+async fn video_attachments_count_into_session_ended() {
+    let fixture = fixture();
+    emit(&fixture, AgentEvent::AgentStart);
+    let (tool_start, mut tool_end) = tool_execution_event("python_repl", false);
+    if let AgentEvent::ToolExecutionEnd { result, .. } = &mut tool_end {
+        let video = ToolResultContent::Video(pa_agent::types::VideoContent {
+            data: "cHJpdmF0ZS12aWRlbw==".to_string(),
+            mime_type: "video/mp4".to_string(),
+        });
+        result.content.extend([video.clone(), video]);
+    }
+    emit(&fixture, tool_start);
+    emit(&fixture, tool_end);
+    emit(
+        &fixture,
+        AgentEvent::AgentEnd {
+            aborted: false,
+            messages: Vec::new(),
+        },
+    );
+    SessionTelemetry::detached(
+        fixture.client.clone(),
+        fixture.state.clone(),
+        "interactive".to_string(),
+    )
+    .end()
+    .await
+    .unwrap();
+    let ended = &event_properties(&fixture.mock, "agent session ended").await[0];
+    assert_eq!(ended["video_attachment_count"], serde_json::json!(2));
+    let all = serde_json::to_string(&fixture.mock.events()).unwrap();
+    assert!(!all.contains("cHJpdmF0ZS12aWRlbw") && !all.contains("video/mp4"));
 }
 
 /// Skills, RLM child usage, MCP connector use, kernel boots, and feature
@@ -542,7 +587,13 @@ async fn session_counters_ride_session_ended() {
 /// `telemetry.json` (one user across both products) and mirrors events to
 /// the local JSONL file under that id.
 #[tokio::test]
+// This test's delivery task reads the same process-wide env as the assertion.
+// The current-thread runtime's task never acquires this test-only mutex.
+#[allow(clippy::await_holding_lock)]
 async fn build_client_reuses_the_ts_installation_id_and_mirrors() {
+    let _env_lock = crate::packages::test_support::ENV_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path().join("agent");
     std::fs::create_dir_all(&agent_dir).unwrap();
@@ -590,6 +641,7 @@ async fn multiple_runs_merge_into_session_totals() {
         emit(
             &fixture,
             AgentEvent::AgentEnd {
+                aborted: false,
                 messages: Vec::new(),
             },
         );
@@ -622,6 +674,7 @@ async fn the_prompt_trigger_and_run_index_ride_the_completed_run() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -655,6 +708,7 @@ async fn continuation_run_reports_continuation_trigger() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -689,6 +743,7 @@ fn attempt(fixture: &Fixture, message: AssistantMessage) {
     emit(
         fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -721,6 +776,7 @@ async fn retries_fold_into_one_run_that_succeeds() {
     recovered.usage.cost.total = 0.012;
     attempt(&fixture, recovered);
     telemetry.note_auto_retry_event(&AutoRetryEvent::End {
+        aborted: false,
         success: true,
         attempt: 2,
         final_error: None,
@@ -777,6 +833,7 @@ async fn exhausted_retries_are_one_failed_run() {
     retry_start(&telemetry, 2, 500, false);
     attempt(&fixture, failed);
     telemetry.note_auto_retry_event(&AutoRetryEvent::End {
+        aborted: false,
         success: false,
         attempt: 2,
         final_error: Some("network".to_string()),
@@ -816,6 +873,7 @@ async fn a_cancelled_retry_never_absorbs_the_next_turn() {
     attempt(&fixture, assistant_with_error("network connection reset"));
     retry_start(&telemetry, 1, 500, false);
     telemetry.note_auto_retry_event(&AutoRetryEvent::End {
+        aborted: true,
         success: false,
         attempt: 1,
         final_error: Some("Retry cancelled".to_string()),
@@ -855,6 +913,7 @@ async fn run_completed_v2_enrichment() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -894,6 +953,7 @@ async fn stream_gap_tracks_the_largest_quiet_stretch() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -923,6 +983,7 @@ async fn bot_edges_the_trigger_lands_and_terminal_outcome_maps() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -992,9 +1053,10 @@ async fn legacy_events_reach_the_analytics_endpoint_in_the_ts_shape() {
     let install_id = "6f1c2b3a-4d5e-4f60-8a7b-9c0d1e2f3a4b";
     let mut config = TelemetryClientConfig::new(install_id);
     config.flush_interval = Duration::from_mins(10);
-    config.sinks = vec![
-        Arc::new(pa_telemetry::AnalyticsSink::new(url)) as Arc<dyn pa_telemetry::TelemetrySink>
-    ];
+    config.sinks = vec![Arc::new(pa_telemetry::AnalyticsSink::new(
+        url,
+        pa_ai::utils::tls::http_client_builder(),
+    )) as Arc<dyn pa_telemetry::TelemetrySink>];
     let client = TelemetryClient::spawn(config).unwrap();
     let mut fixture = fixture();
     fixture.client = client.clone();
@@ -1022,6 +1084,7 @@ async fn legacy_events_reach_the_analytics_endpoint_in_the_ts_shape() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -1276,6 +1339,7 @@ async fn off_period_run_facts_never_send() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -1292,6 +1356,7 @@ async fn off_period_run_facts_never_send() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -1422,6 +1487,7 @@ async fn a_run_active_when_telemetry_turns_off_is_severed_not_merged() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );
@@ -1440,6 +1506,7 @@ async fn a_run_active_when_telemetry_turns_off_is_severed_not_merged() {
     emit(
         &fixture,
         AgentEvent::AgentEnd {
+            aborted: false,
             messages: Vec::new(),
         },
     );

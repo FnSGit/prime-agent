@@ -15,16 +15,18 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Generator
+from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, NoReturn, cast
 
 from . import _winjob
+from .inbox_lifecycle import NoticeLifecycle
 
 _IS_POSIX = os.name == "posix"
 
@@ -46,6 +48,8 @@ _COMPLETION_SUFFIX = b"\x1f"
 _CANCEL_TERM_GRACE = 0.5
 _CANCEL_KILL_WAIT = 2.0
 _COMPLETION_NOTICE_COMMAND_CAP = 1000
+# The output tail a [bash-done] wake row shows (the daemon caps it further).
+_COMPLETION_NOTICE_TAIL_CAP = 400
 # Display MIME the host aggregates into a per-cell summary of the bash()
 # commands the cell ran (first capped command, count, line total).
 _BASH_COMMAND_MIME = "application/vnd.prime-agent.bash-command+json"
@@ -57,6 +61,79 @@ _ASYNCIO_WRAPPER_CALLBACKS = {
     ("asyncio.tasks", "_release_waiter"),
 }
 
+# Bounded awaits: in sessions whose host registers the bash.completed handler,
+# an await still running after _YIELD_AFTER_SECONDS degrades to returning the
+# live handle instead of blocking (the [bash-done] notice collects it). The
+# kernel bootstrap flips the flag from the host-handler registry — one source
+# of truth; the window stays here, never on the Rust side.
+_completion_notices_wired = False
+_YIELD_AFTER_SECONDS = 1.0
+
+
+def _set_completion_notices_wired(wired: bool) -> None:
+    """Record whether the host wires bash completion notices.
+
+    Called by the kernel bootstrap only when the `bash.completed` host handler
+    is registered. Sessions without the notice keep unbounded awaits: nothing
+    would wake a cell that ended its turn on a degraded command.
+    """
+    global _completion_notices_wired
+    _completion_notices_wired = wired
+
+
+# The machine-facing directive every degraded await carries: the command is
+# backgrounded, so this turn's work on it is done. Shared by the stderr note
+# and the snapshot repr so both tell the same story.
+_DEGRADE_DIRECTIVE = (
+    "The command runs in the background: do not await it again this turn; "
+    "end the turn and collect the final result on the completion notice."
+)
+
+
+def _note_degrade(snapshot: "BashSnapshot") -> None:
+    """Write the snapshot's directive to the awaiting cell's stderr.
+
+    One note per degrade of the cell's own await, never budgeted: for an
+    assignment-form await the note is the model's only feedback (no trailing
+    expression means no repr in the tool result), and a quiet repeat reads as
+    progress. The note is
+    what makes the re-await loop visible: every repeat shows the pid, the
+    growing elapsed, and the end-the-turn contract.
+    """
+    sys.stderr.write(f"{snapshot.directive()}\n")
+
+
+async def _bounded_wait(
+    wait: Awaitable[BashResult], bound: float | None
+) -> BashResult | None:
+    """Await a command wait, abandoning it after `bound` seconds.
+
+    Returns None only on the degrade: the wait task keeps running (cancelling
+    an owned wait would kill the command — the degrade must not), and its
+    late result is consumed silently by the done callback.
+    """
+    if bound is None:
+        return await wait
+    wait_task = asyncio.ensure_future(wait)
+    try:
+        done, _pending = await asyncio.wait({wait_task}, timeout=bound)
+    except asyncio.CancelledError:
+        # An interrupt inside the window: the wait must observe the cancel
+        # (an owned await runs its kill dance in _wait_owned) before the
+        # CancelledError propagates.
+        wait_task.cancel()
+        while not wait_task.done():
+            try:
+                await asyncio.shield(wait_task)
+            except asyncio.CancelledError:
+                continue
+        raise
+    if wait_task in done:
+        return wait_task.result()
+    wait_task.add_done_callback(_consume_notice_task)
+    return None
+
+
 _live_handles: set["BashHandle"] = set()
 # Kernel-owned opaque IDs: retained results are bounded, never resolved by PID.
 _activity_handles: dict[str, "BashHandle"] = {}
@@ -65,6 +142,22 @@ _ACTIVITY_HISTORY_CAP = 64
 _live_lock = threading.Lock()
 _hook_installed = False
 _hook_lock = threading.Lock()
+
+# bash(persistent=True): every session's persistent shells live in one home
+# under the agent dir (the cross-language contract pa-daemon reads): per shell
+# a <id>.json record assigned to its session (RLM_SESSION_ID, the durable
+# session id the host exports), plus <id>.out and <id>.rc.
+_PERSISTENT_DIR = "persistent-shells"
+_PERSISTENT_POLL = 1.0
+# Gate on stdin, then run the command in its own shell so exit/exec/set -e
+# cannot skip the atomic status write.
+_PERSISTENT_WRAPPER = (
+    "read -r _prime_agent_gate || exit 127\n"
+    "exec 0</dev/null\n"
+    '"$1" -c "$2"\n'
+    "__prime_status=$?\n"
+    "printf '%s\\n' \"$__prime_status\" > \"$3.tmp\" && mv -f \"$3.tmp\" \"$3\"\n"
+)
 
 
 def _current_cell_completion_context() -> tuple[asyncio.Event, asyncio.Task[Any] | None] | None:
@@ -89,6 +182,8 @@ def _capped(command: str) -> str:
     if len(command) > _COMPLETION_NOTICE_COMMAND_CAP:
         return command[:_COMPLETION_NOTICE_COMMAND_CAP] + "\n... [command truncated]"
     return command
+
+
 
 
 def _completion_reaches(
@@ -190,6 +285,51 @@ class BashResult:
     output: str
     duration: float
 
+    @property
+    def running(self) -> bool:
+        # The discriminator the prompt teaches: a finished result is never
+        # running (BashSnapshot.running is True). A property, not a field, so
+        # repr, equality, and positional construction stay unchanged.
+        return False
+
+
+@dataclass(frozen=True)
+class BashSnapshot:
+    """A degraded await's still-running snapshot (`BashHandle.__await__`).
+
+    `r.output`/`r.exit_code` read like a BashResult's — output so far and
+    None while running — and `r.running` is True. `r.duration` is the
+    command's elapsed running time at `r.result_time` (UTC), the wall-clock
+    moment the snapshot was taken, so repeated snapshots show the elapsed
+    growing. `r.handle` is the live handle: collect the final result on the
+    completion notice. The snapshot itself is not awaitable (that was
+    #3076's rejected wrapper shape), and its repr carries the background
+    directive so a bare-expression await states it in the tool result.
+    """
+
+    output: str
+    exit_code: None
+    running: bool
+    duration: float
+    result_time: datetime
+    handle: "BashHandle"
+
+    def directive(self) -> str:
+        """The model-facing note for this snapshot: elapsed, result time,
+        and the end-the-turn directive, in the stderr note's exact wording."""
+        return (
+            f"bash: still running after {self.duration:g}s "
+            f"(pid {self.handle._pid}, snapshot at "
+            f"{self.result_time.strftime('%Y-%m-%dT%H:%M:%SZ')}). {_DEGRADE_DIRECTIVE}"
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BashSnapshot running pid={self.handle._pid} "
+            f"after {self.duration:g}s at "
+            f"{self.result_time.strftime('%Y-%m-%dT%H:%M:%SZ')}: {_DEGRADE_DIRECTIVE}>"
+        )
+
 
 class _BoundedBuffer:
     """First _HEAD_CAP bytes plus a rolling _TAIL_CAP-byte tail; the middle is dropped."""
@@ -269,7 +409,7 @@ class BashHandle:
         self._result: BashResult | None = None
         self._callbacks: list[Callable[[], None]] = []
         self._reap_callback: Callable[[], None] | None = None
-        self._result_consumed = False
+        self._notice_state = NoticeLifecycle.QUEUED
         self._consumed_notice: Callable[[], None] | None = None
         self._callback_lock = threading.Lock()
         # Serializes kill/reap so a pid fallback can never outlive the process handle.
@@ -670,25 +810,34 @@ class BashHandle:
                 return
         callback()
 
-    def _note_result_consumed(self, awaiter: asyncio.Task[Any] | None = None) -> None:
-        """Record a result read that reaches the model: only reads during a live
-        cell count (a detached reader between turns must keep the notice — it is
-        the idle session's only wake-up), and an awaiting reader must be one the
-        live cell waits for."""
+    def _note_result_consumed(self) -> None:
+        """Record a read of the finished result from any cell or task while a
+        cell is live: a read before completion does not count, and neither does
+        a read with no live cell (it reaches nobody, and the notice is the idle
+        session's only wake-up). Read before the notice left the kernel, the
+        notice is never sent; read after, the host is asked to withdraw it."""
         if not self._done.is_set():
             return
-        owner = _live_cell_owner()
-        if owner is None:
-            return
-        if awaiter is not None and not _creating_cell_waits_for(owner, awaiter):
+        if _live_cell_owner() is None:
             return
         with self._callback_lock:
-            if self._result_consumed:
+            if self._notice_state is NoticeLifecycle.QUEUED:
+                self._notice_state = NoticeLifecycle.CONSUMED
+            elif self._notice_state is NoticeLifecycle.SENT:
+                self._notice_state = NoticeLifecycle.WITHDRAWN
+            else:
                 return
-            self._result_consumed = True
             notice, self._consumed_notice = self._consumed_notice, None
         if notice is not None:
             notice()
+
+    def _claim_notice(self) -> bool:
+        """Mark the notice as sent unless a read already consumed it."""
+        with self._callback_lock:
+            if self._notice_state is not NoticeLifecycle.QUEUED:
+                return False
+            self._notice_state = NoticeLifecycle.SENT
+            return True
 
     def _schedule_background_completion_notice(self) -> None:
         cell_finished = self._creating_cell_finished
@@ -724,7 +873,13 @@ class BashHandle:
             # The cell may do other work before awaiting this handle. Do not classify
             # it as detached until that whole cell has crossed its completion barrier.
             await cell_finished.wait()
-            if self._awaited_by_creating_cell or self._result_consumed or not repl.is_active():
+            # An await of THIS handle that is still in flight owns the
+            # completion: let it resolve and count the result as consumed
+            # before deciding whether anything must be announced. A notice
+            # fired between the exit and the await would interrupt the
+            # awaiting cell and lose the result.
+            await self._awaiters_free_event().wait()
+            if self._awaited_by_creating_cell or not repl.is_active() or not self._claim_notice():
                 return
             command = _capped(self.command)
             reply = await repl.host_request(
@@ -733,6 +888,7 @@ class BashHandle:
                     "pid": self._pid,
                     "command": command,
                     "exitCode": result.exit_code,
+                    "outputTail": result.output[-_COMPLETION_NOTICE_TAIL_CAP:],
                 }
             )
             if isinstance(reply, dict) and reply.get("status") == "ok":
@@ -756,7 +912,7 @@ class BashHandle:
         dispatch = functools.partial(self._notify_result_consumed, command)
 
         with self._callback_lock:
-            if not self._result_consumed:
+            if self._notice_state is NoticeLifecycle.SENT:
                 self._consumed_notice = dispatch
                 return
         dispatch()
@@ -927,31 +1083,90 @@ class BashHandle:
         if delivered:
             _record_journal(self._pid, active=False)
 
-    def __await__(self) -> Generator[Any, None, BashResult]:
+    # Awaiters of THIS handle, anywhere in the session: a later cell can
+    # await a handle an earlier cell created, and the completion notice must
+    # not fire between the process exit and the await that is resolving it —
+    # that arrival would interrupt the awaiting cell and lose the result the
+    # await was about to return. The event is set while no await is in
+    # flight, so the notice waits for every awaiter to clear.
+    def _awaiters_free_event(self) -> asyncio.Event:
+        event = getattr(self, "_awaiter_free", None)
+        if event is None:
+            event = asyncio.Event()
+            event.set()
+            self._awaiter_free = event
+        return event
+
+    def _begin_await(self) -> None:
+        self._awaiters = getattr(self, "_awaiters", 0) + 1
+        self._awaiters_free_event().clear()
+
+    def _end_await(self) -> None:
+        self._awaiters = max(0, getattr(self, "_awaiters", 1) - 1)
+        if self._awaiters == 0:
+            self._awaiters_free_event().set()
+
+    def __await__(self) -> Generator[Any, None, BashResult | BashSnapshot]:
         # A handle awaited before any other API use is a one-shot command tied
         # to the await (kill-on-cancel); touching the handle API first marks it
-        # as a deliberate background handle whose awaits only wait.
+        # as a deliberate background handle whose awaits only wait. Both paths
+        # wait at most the yield window, then degrade to this live handle.
         try:
             current_task = asyncio.current_task()
         except RuntimeError:
             current_task = None
         creating_cell_waited = _creating_cell_waits_for(self._creating_cell_task, current_task)
+        bound = _YIELD_AFTER_SECONDS if _completion_notices_wired else None
         owned = not self._released
         wait = self._wait_owned() if owned else self._wait()
         self._released = True
         completed = False
+        degraded = False
+        self._begin_await()
         try:
-            result = yield from wait.__await__()
-            completed = True
-            return result
+            result = yield from _bounded_wait(wait, bound).__await__()
+            if result is None:
+                degraded = True
+            else:
+                completed = True
         finally:
-            if (completed or owned) and (
-                creating_cell_waited
-                or _creating_cell_waits_for(self._creating_cell_task, current_task)
+            # A degraded await never completed: the [bash-done] notice must
+            # still fire, so it counts as neither awaited nor consumed.
+            if (
+                not degraded
+                and (completed or owned)
+                and (
+                    creating_cell_waited
+                    or _creating_cell_waits_for(self._creating_cell_task, current_task)
+                )
             ):
                 self._awaited_by_creating_cell = True
             if completed:
-                self._note_result_consumed(current_task)
+                self._note_result_consumed()
+            self._end_await()
+        if degraded:
+            snapshot = self._degrade_snapshot()
+            # Only the calling cell's own await gets the note, while that cell
+            # runs (beside a newer cell too): a background task's note would
+            # land in a later, unrelated cell's output.
+            context = _current_cell_completion_context()
+            if context is not None and _creating_cell_waits_for(context[1], current_task):
+                _note_degrade(snapshot)
+            return snapshot
+        return cast("BashResult", result)
+
+    def _degrade_snapshot(self) -> BashSnapshot:
+        """Read the internal buffer directly: the public readers count as a
+        result read, which would withdraw the [bash-done] notice the degrade
+        must keep alive."""
+        return BashSnapshot(
+            output=self._buffer.text(),
+            exit_code=None,
+            running=True,
+            duration=time.monotonic() - self._started,
+            result_time=datetime.now(timezone.utc),
+            handle=self,
+        )
 
     def __reduce__(self) -> NoReturn:
         # Reviving a handle would resurrect a stale pid and raw fd numbers: dill
@@ -964,13 +1179,215 @@ class BashHandle:
         return f"<BashHandle pid={self._pid} {state} command={self.command!r}>"
 
 
-def bash(command: str) -> BashHandle:
+class _OutputFile:
+    """Bounded view of a persistent shell's output file: first _HEAD_CAP plus last _TAIL_CAP bytes.
+
+    keep() holds the final text in memory, so the file can be removed.
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path = path
+        self._kept: str | None = None
+
+    def keep(self) -> None:
+        self._kept = self.text()
+
+    def text(self) -> str:
+        if self._kept is not None:
+            return self._kept
+        try:
+            f = open(self._path, "rb")
+        except FileNotFoundError:
+            return ""
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            if size <= _HEAD_CAP + _TAIL_CAP:
+                return f.read(size).decode("utf-8", errors="replace")
+            head = f.read(_HEAD_CAP)
+            f.seek(size - _TAIL_CAP)
+            tail = f.read(_TAIL_CAP)
+        marker = f"\n... [{size - _HEAD_CAP - _TAIL_CAP} bytes dropped] ...\n"
+        return head.decode("utf-8", errors="replace") + marker + tail.decode("utf-8", errors="replace")
+
+
+class PersistentBashHandle(BashHandle):
+    """bash(..., persistent=True); see bash() for its lifecycle.
+
+    Its record (assigned to the session), output, and exit status are files in
+    the agent dir's persistent-shells home instead of an orphan journal entry.
+    Awaits never own it: cancelling an await leaves it running. Finished
+    output is kept in memory. Files remain recoverable on read errors or when
+    a leaderless group cannot be verified because no watcher saw its leader
+    exit; such a group is never signalled using only its old numeric
+    process-group id.
+    """
+
+    def __init__(
+        self,
+        command: str,
+        shell_id: str,
+        pid: int,
+        start_id: str,
+        started_at: str,
+        home: str,
+        proc: subprocess.Popen[bytes] | None,
+        running: bool = True,
+    ) -> None:
+        self.command = command
+        self._activity_id = shell_id
+        completion_context = _current_cell_completion_context()
+        self._creating_cell_finished = completion_context[0] if completion_context else None
+        self._creating_cell_task = completion_context[1] if completion_context else None
+        self._awaited_by_creating_cell = False
+        self._home = home
+        self._buffer = _OutputFile(_persistent_file(home, shell_id, "out"))  # type: ignore[assignment]
+        self._rc_path = _persistent_file(home, shell_id, "rc")
+        self._done = threading.Event()
+        self._result: BashResult | None = None
+        self._completion_error: OSError | ValueError | None = None
+        self._callbacks: list[Callable[[], None]] = []
+        self._reap_callback: Callable[[], None] | None = None
+        self._notice_state = NoticeLifecycle.QUEUED
+        self._consumed_notice: Callable[[], None] | None = None
+        self._callback_lock = threading.Lock()
+        self._reaped = False
+        self._kill_lock = threading.Lock()
+        self._started_at = started_at
+        self._started = time.monotonic() - max(
+            0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(started_at)).total_seconds()
+        )
+        self._pid = pid
+        self._start_id = start_id
+        self._proc = proc  # type: ignore[assignment]
+        self._released = True
+        with _live_lock:
+            _activity_handles[shell_id] = self
+        threading.Thread(target=self._watch, args=(running,), daemon=True).start()
+        self._schedule_background_completion_notice()
+
+    def kill(self, sig: int = signal.SIGTERM, grace: float = 5.0) -> None:
+        # Even a fresh Popen may have been reaped by the watcher before it
+        # commits _reaped. Every persistent signal must check its identity.
+        with self._kill_lock:
+            if self._reaped or _shell_identity(self._pid, self._start_id) is not True:
+                return
+            super().kill(sig, grace)
+
+    def _force_kill(self) -> None:
+        with self._kill_lock:
+            if not self._reaped:
+                _reap_persistent_group(self._pid, self._start_id)
+
+    def _watch(self, running: bool) -> None:
+        # running=False: the shell finished while no kernel ran; its pid may
+        # since name another process, so it is never polled or signalled.
+        exit_code = -1
+        if self._proc is not None:
+            exit_code = self._proc.wait()
+        elif running:
+            # Not our child, so nothing to wait() on: poll the rc file and the
+            # pid identity (completion lags by up to _PERSISTENT_POLL seconds).
+            while not os.path.exists(self._rc_path) and _shell_identity(self._pid, self._start_id) is not False:
+                time.sleep(_PERSISTENT_POLL)
+        try:
+            with open(self._rc_path) as f:
+                exit_code = int(f.read())
+        except FileNotFoundError:
+            pass  # killed before the wrapper recorded a status
+        except (OSError, ValueError) as error:
+            self._completion_error = error
+        # A dead leader's group can still contain the shell's children. A live
+        # recycled pid instead names a stranger's group and must not be signalled.
+        with self._kill_lock:
+            reaped = _reap_persistent_group(
+                self._pid, self._start_id, leader_exit_witnessed=self._proc is not None or running
+            )
+            self._reaped = True
+        try:
+            cast("_OutputFile", self._buffer).keep()
+        except OSError as error:
+            self._completion_error = error
+        if self._completion_error is None and reaped:
+            _remove_shell_files(self._home, self._activity_id)
+        # Failed I/O must settle waiters too, without losing the recoverable files.
+        self._finalize(exit_code, "" if self._completion_error is not None else None)
+        with self._callback_lock:
+            callback, self._reap_callback = self._reap_callback, None
+        if callback is not None:
+            callback()
+        with _live_lock:
+            _activity_order.append(self._activity_id)
+            while len(_activity_order) > _ACTIVITY_HISTORY_CAP:
+                _activity_handles.pop(_activity_order.popleft(), None)
+
+    async def _wait(self) -> BashResult:
+        result = await super()._wait()
+        if self._completion_error is not None:
+            raise self._completion_error
+        return result
+
+    def poll(self) -> BashResult | None:
+        result = super().poll()
+        if result is not None and self._completion_error is not None:
+            raise self._completion_error
+        return result
+
+    def _schedule_background_completion_notice(self) -> None:
+        # No bash-activity residency hold: the shell survives kernel release.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._notify_completion()).add_done_callback(_consume_notice_task)
+
+    async def _notify_completion(self) -> None:
+        from . import repl
+
+        try:
+            result = await self._wait()
+            if self._creating_cell_finished is not None:
+                await self._creating_cell_finished.wait()
+            # Same gate as a background command: an in-flight await owns the completion.
+            await self._awaiters_free_event().wait()
+            if self._awaited_by_creating_cell or not repl.is_active() or not self._claim_notice():
+                return
+            command = _capped(self.command)
+            reply = await repl.host_request(
+                {
+                    "type": "bash.completed",
+                    "pid": self._pid,
+                    "command": command,
+                    "exitCode": result.exit_code,
+                    "outputTail": result.output[-_COMPLETION_NOTICE_TAIL_CAP:],
+                }
+            )
+            if isinstance(reply, dict) and reply.get("status") == "ok":
+                self._arm_consumed_notice(command)
+        except (OSError, RuntimeError):
+            return
+
+    def __repr__(self) -> str:
+        state = f"exit_code={self._result.exit_code}" if self._result else "running"
+        return f"<BashHandle persistent pid={self._pid} {state} command={self.command!r}>"
+
+
+def bash(
+    command: str,
+    persistent: bool = False,
+    **unknown: Any,
+) -> BashHandle:
     """Start a shell command immediately; await the handle for the result.
 
     `await bash(cmd)` is a one-shot: cancelling the await (e.g. an interrupt)
-    kills the command's process group. `h = bash(cmd)` used as a background
-    handle (any .pid/.running/.output()/.tail()/.poll()/.kill() access before
-    the first await) survives cancellation; awaiting it only waits. Leak
+    kills the command's process group. In sessions whose host wires completion
+    notices (the kernel bootstrap turns the bound on), an await that is still
+    running after 1 second instead DEGRADES: it returns a BashSnapshot
+    (r.running True, r.output the output so far, r.handle the live handle)
+    while the command keeps running, and its completion notice arrives when
+    it finishes. In sessions without completion notices every await stays
+    unbounded. `h = bash(cmd)` used as a background handle (any
+    .pid/.running/.output()/.tail()/.poll()/.kill() access before the first
+    await) survives cancellation; awaiting it only waits. Leak
     containment is per-platform: process groups plus the orphan journal on
     POSIX; a kill-on-close job object on Windows entered while the child is
     still suspended, so no descendant can escape it and kill()/crash cleanup
@@ -978,11 +1395,49 @@ def bash(command: str) -> BashHandle:
     Output written after the completion fence (e.g. by an EXIT trap or a
     background job) is not in BashResult.output but stays visible via
     handle.output()/tail().
+
+    persistent=True (POSIX, saved sessions only; use only when really
+    required, e.g. a server or long job that must outlive a restart): the
+    shell survives kernel, worker, and daemon restarts and its session's
+    delete or archive (a deleted session's shells keep running as orphans);
+    only its own exit or an explicit kill() ends it. Its output and exit
+    status live in files under the agent dir, and awaits never own it: a
+    bounded await degrades as for any handle and the shell runs on. After a
+    restart, get the handles back with `from rlm import persistent_shells;
+    persistent_shells()`; a shell that finished while no
+    kernel ran is listed once, finished. Completion of a re-attached shell is
+    polled, so its result and completion notice lag by up to a second; its
+    exit_code is -1 when it was killed before recording a status.
     """
+    if unknown:
+        # Invented wait parameters (`timeout=`) are the recurring failure the
+        # eval traces show: the model reaches for a common API shape, loses the
+        # cell to a bare TypeError, and flails. Decline with the real
+        # signature and the route this session can deliver: the parked-turn
+        # notice exists only where the host wires it, and a notice-less await
+        # waits for the command to finish.
+        route = (
+            "launch the command (bash() returns immediately and "
+            "auto-backgrounds it) and end the turn; a [bash-done] "
+            "notification resumes you. An await always yields after 1 second."
+            if _completion_notices_wired
+            else "launch the command (bash() returns immediately) and read "
+            "the handle in a later cell; this session has no [bash-done] "
+            "notice, so an await waits until the command finishes."
+        )
+        raise TypeError(
+            "bash() takes command, persistent — not "
+            + ", ".join(f"{name!r}" for name in sorted(unknown))
+            + ". There is no wait or timeout parameter: "
+            + route
+        )
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
-    _install_shutdown_hook()
-    handle = BashHandle(command)
+    if persistent:
+        handle: BashHandle = _spawn_persistent(command)
+    else:
+        _install_shutdown_hook()
+        handle = BashHandle(command)
     from . import repl
 
     repl.emit(
@@ -1104,6 +1559,185 @@ def _system32(*parts: str) -> str:
 
 def _helper_env() -> dict[str, str]:
     return {**os.environ, "NoDefaultCurrentDirectoryInExePath": "1"}
+
+
+def _persistent_home() -> str:
+    return os.path.join(os.environ["PRIME_AGENT_CODING_AGENT_DIR"], _PERSISTENT_DIR)
+
+
+def _persistent_file(home: str, shell_id: str, kind: str) -> str:
+    return os.path.join(home, f"{shell_id}.{kind}")
+
+
+def _remove_shell_files(home: str, shell_id: str) -> None:
+    # The record goes last: until then, the next boot still finds and removes the rest.
+    for kind in ("rc", "out", "json"):
+        try:
+            os.remove(_persistent_file(home, shell_id, kind))
+        except OSError:
+            pass
+
+
+def _session_records(home: str, session_id: str) -> list[dict[str, Any]]:
+    """The records assigned to session_id, oldest first."""
+    try:
+        names = os.listdir(home)
+    except FileNotFoundError:
+        return []
+    records = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(home, name)) as f:
+                record = json.load(f)
+        except FileNotFoundError:
+            continue  # its kernel removed the finished shell meanwhile
+        if record["sessionId"] == session_id:
+            records.append(record)
+    return sorted(records, key=lambda record: record["startedAt"])
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    # kill(0) also accepts zombies. Match the host's liveness policy so a
+    # reattached shell can finish without waiting for another process to reap it.
+    try:
+        if sys.platform.startswith("linux"):
+            with open(f"/proc/{pid}/stat") as stat_file:
+                stat = stat_file.read()
+            return stat[stat.rindex(")") + 2:].split()[0] != "Z"
+        if sys.platform == "darwin":
+            state = subprocess.run(
+                ["/bin/ps", "-p", str(pid), "-o", "stat="],
+                capture_output=True, text=True, timeout=5,
+                env={**os.environ, "LC_ALL": "C", "LANG": "C"},
+            )
+            return state.returncode != 0 or not state.stdout.lstrip().startswith("Z")
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        pass  # unknown state stays alive; never claim a recycled group
+    return True
+
+
+def _shell_identity(pid: int, start_id: str) -> bool | None:
+    """True while pid still names the recorded shell, False once it is provably
+    gone (dead, or recycled under a new start identity), None when unprovable."""
+    if not _pid_alive(pid):
+        return False
+    current = _process_start_id(pid)
+    return None if current is None else current == start_id
+
+
+def _spawn_persistent(command: str) -> PersistentBashHandle:
+    if not _IS_POSIX:
+        raise RuntimeError("bash(persistent=True) is only supported on POSIX")
+    session_id = os.environ.get("RLM_SESSION_ID")
+    if not session_id:
+        raise RuntimeError(
+            "bash(persistent=True) needs a saved session (RLM_SESSION_ID is unset): "
+            "the shell is assigned to the session that started it"
+        )
+    home = _persistent_home()
+    shell_id = secrets.token_hex(16)
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    shell = _shell()
+    script = f'{{\n{_with_prefix(command)}\n}}\n__prime_status=$?\nwait\nexit "$__prime_status"\n'
+    out_fd = os.open(_persistent_file(home, shell_id, "out"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with open(out_fd, "wb") as out:
+        proc = subprocess.Popen(
+            [shell, "-c", _PERSISTENT_WRAPPER, "prime-agent-persistent", shell, script,
+             _persistent_file(home, shell_id, "rc")],
+            cwd=os.getcwd(),
+            env=_child_env(),
+            stdin=subprocess.PIPE,
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    gate = cast("Any", proc.stdin)
+    try:
+        # The wrapper runs nothing until the shell is registered: a failure
+        # (or a kernel death) before the gate byte closes the pipe instead.
+        start_id = _process_start_id(proc.pid)
+        if start_id is None:
+            raise RuntimeError("bash(persistent=True): the shell's start identity is unreadable")
+        started_at = datetime.now(timezone.utc).isoformat()
+        record = {
+            "id": shell_id, "pid": proc.pid, "startId": start_id, "command": command,
+            "startedAt": started_at, "sessionId": session_id,
+        }
+        path = _persistent_file(home, shell_id, "json")
+        fd, temp = tempfile.mkstemp(dir=home, suffix=".tmp")
+        with open(fd, "w") as f:
+            json.dump(record, f)
+        os.replace(temp, path)
+        gate.write(b"\n")
+    finally:
+        gate.close()
+    return PersistentBashHandle(command, shell_id, proc.pid, start_id, started_at, home, proc)
+
+
+def persistent_shells() -> list[BashHandle]:
+    """This kernel's persistent bash() handles, including the ones re-attached at boot.
+
+    After a kernel restart (or a worker/daemon restart), call this to get the
+    session's persistent shells back. A shell that finished while no kernel ran
+    is listed once, finished, in the first kernel after it ended.
+    """
+    with _live_lock:
+        return [h for h in _activity_handles.values() if isinstance(h, PersistentBashHandle)]
+
+
+def _rehydrate_persistent_shells() -> None:
+    """Kernel boot: re-attach this session's live shells, surface the ones that
+    finished while no kernel ran, and remove its dead ones. Records with an
+    unprovable identity and other sessions' records stay untouched."""
+    session_id = os.environ.get("RLM_SESSION_ID")
+    if not session_id or not _IS_POSIX:
+        return
+    home = _persistent_home()
+    for record in _session_records(home, session_id):
+        identity = _shell_identity(record["pid"], record["startId"])
+        if identity is None:
+            continue
+        if identity or os.path.exists(_persistent_file(home, record["id"], "rc")):
+            PersistentBashHandle(
+                record["command"], record["id"], record["pid"], record["startId"], record["startedAt"],
+                home, None, identity,
+            )
+        elif _reap_persistent_group(record["pid"], record["startId"]):
+            _remove_shell_files(home, record["id"])
+
+
+def _reap_persistent_group(pid: int, start_id: str, leader_exit_witnessed: bool = False) -> bool:
+    """Reap stragglers without ever signalling a live recycled or unverified pid."""
+    # Existence is distinct from liveness: a recycled zombie can still own an
+    # unrelated group. It must pass the same start-identity check as a live pid.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        if leader_exit_witnessed:
+            return _signal_group(pid, signal.SIGKILL)
+        # A durable record can outlive its original group. An extant group
+        # without the recorded leader may be a reused PGID: retain it, do not kill.
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+    except PermissionError:
+        pass
+    current = _process_start_id(pid)
+    if current == start_id:
+        return _signal_group(pid, signal.SIGKILL)
+    return current is not None
 
 
 def _taskkill_tree(pid: int) -> bool:
@@ -1271,6 +1905,7 @@ def activity_request(action: str, activity_id: str | None = None, lines: int = 5
                 "durationMs": int((handle._result.duration if handle._result else time.monotonic() - handle._started) * 1000),
                 "status": "finished" if handle._reaped else "running",
                 "exitCode": handle._result.exit_code if handle._result else None,
+                "persistent": isinstance(handle, PersistentBashHandle),
             }
             for key, handle in handles
         ]

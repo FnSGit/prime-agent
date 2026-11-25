@@ -9,6 +9,7 @@ use pa_agent::agent::Agent;
 use pa_agent::types::{AgentEvent, AgentMessage, Message};
 use pa_core::session_engine::engine::SessionEngine;
 use pa_core::session_engine::goal_boundary::custom_message_to_loop_row;
+use pa_core::session_engine::goal_continuation::{ContinuationTrigger, GoalContinuationDecision};
 use pa_core::session_engine::goal_driver::UsageOutcome;
 use pa_core::session_engine::provider_adapter::json_round_trip;
 use pa_types::session::CustomMessage;
@@ -52,6 +53,10 @@ pub(crate) enum NaturalContinuation {
     /// A threshold compaction is due: the loop stops (any owed mint is held for the post-compaction
     /// admission), the boundary compacts.
     ThresholdDue,
+    /// Unsettled inline-subagent work holds the mint (TS quiescence): the
+    /// deferral is armed on the goal driver, and the quiescence drive
+    /// delivers it after the descendants settle.
+    HeldForRlmWork,
     /// The goal minted its next continuation row.
     GoalRow(Box<pa_agent::types::AgentMessage>),
     /// No goal work owns the boundary: the autonomous arm may consult.
@@ -453,14 +458,17 @@ impl PrintGoalSurface {
             .await
     }
 
-    /// The goal arm of the natural-turn-end consult: queued input (the armed
-    /// steer) and a compaction due gate the mint — the threshold arm mints
-    /// ahead of the compaction and holds it — and an active goal mints its
-    /// next continuation turn inside the same agent run.
+    /// The goal arm of the natural-turn-end consult: queued input (the
+    /// armed steer) and a compaction due gate the mint; an owning goal
+    /// defers behind unsettled descendant work, an ownerless boundary
+    /// drops its deferral; the threshold arm mints ahead of the
+    /// compaction and holds it; an active goal mints its next
+    /// continuation turn inside the same agent run.
     pub(crate) async fn natural_continuation(
         &self,
         engine: &Arc<SessionEngine>,
         model: &pa_types::ai::Model,
+        unsettled_rlm_work: bool,
     ) -> NaturalContinuation {
         // Queued session input owns the boundary before any goal work — the armed budget steer ends
         // the run so the queue drains it.
@@ -470,32 +478,46 @@ impl PrintGoalSurface {
         if engine.turn_boundary.compaction_scheduled().await {
             return NaturalContinuation::RequestedCompaction;
         }
-        // The threshold arm: the crossing turn mints BEFORE the loop stops; the
-        // boundary compacts, and the driver runs the held turn post-compaction.
-        if engine.session.auto_compaction_due(model).await {
-            if let Some(message) = engine.mint_goal_continuation().await {
+        // The threshold arm reads the crossing before the consult: a crossing turn
+        // mints BEFORE the loop stops; the boundary compacts, and the driver runs
+        // the held turn post-compaction.
+        let threshold_due = engine.session.auto_compaction_due(model).await;
+        match engine
+            .consult_goal_continuation(ContinuationTrigger::TurnEnd, unsettled_rlm_work)
+            .await
+        {
+            GoalContinuationDecision::Owed => NaturalContinuation::HeldForRlmWork,
+            GoalContinuationDecision::Minted { message, .. } => {
                 self.publish_goal_update(engine).await;
-                self.hold_threshold_continuation(message).await;
+                if threshold_due {
+                    self.hold_threshold_continuation(*message).await;
+                    return NaturalContinuation::ThresholdDue;
+                }
+                // The natural continuation: the goal's context turn runs as the next
+                // turn of the same run; a row that cannot convert drops the mint.
+                engine.clear_pending_goal_continuation().await;
+                match custom_message_to_loop_row(&message) {
+                    Some(row) => NaturalContinuation::GoalRow(Box::new(row)),
+                    None => NaturalContinuation::FallThrough,
+                }
             }
-            return NaturalContinuation::ThresholdDue;
+            GoalContinuationDecision::NotOwned
+            | GoalContinuationDecision::NothingOwed
+            | GoalContinuationDecision::NotMinted { .. } => {
+                if threshold_due {
+                    NaturalContinuation::ThresholdDue
+                } else {
+                    NaturalContinuation::FallThrough
+                }
+            }
         }
-        // The natural continuation mint: the goal's context turn runs as the next
-        // turn of the same run; a row that cannot convert drops the mint.
-        if let Some(message) = engine.mint_goal_continuation().await {
-            self.publish_goal_update(engine).await;
-            engine.clear_pending_goal_continuation().await;
-            return match custom_message_to_loop_row(&message) {
-                Some(row) => NaturalContinuation::GoalRow(Box::new(row)),
-                None => NaturalContinuation::FallThrough,
-            };
-        }
-        NaturalContinuation::FallThrough
     }
 
     /// The settled boundary's goal drain: the held continuation and the armed
     /// budget steer run as this invocation's follow-up turns; a turn that
-    /// still ends in a terminal error fails an active goal. Returns whether
-    /// an active goal still owns the boundary.
+    /// still ends in a terminal error fails an active goal. Returns
+    /// whether any turn ran (the drive loop re-enters quiescence for
+    /// whatever the turns left behind).
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn drive_boundary(
         &self,
@@ -503,34 +525,22 @@ impl PrintGoalSurface {
         boundary: &mut crate::print_boundary::TurnBoundary,
         model: &pa_types::ai::Model,
         api_key: Option<String>,
-        global_harness_dir: std::path::PathBuf,
     ) -> Result<bool, String> {
+        let mut ran = false;
         loop {
             if let Some(message) = self.take_threshold_continuation().await {
                 // A goal that went inactive mid-turn drops its queued continuation.
                 if engine.goal_state().await.status == pa_types::goal::GoalStatus::Active {
-                    self.run_queued_turn(
-                        engine,
-                        boundary,
-                        model,
-                        api_key.clone(),
-                        global_harness_dir.clone(),
-                        &message,
-                    )
-                    .await?;
+                    self.run_queued_turn(engine, boundary, model, api_key.clone(), &message)
+                        .await?;
+                    ran = true;
                     continue;
                 }
             }
             if let Some(steer) = self.take_budget_steer().await {
-                self.run_queued_turn(
-                    engine,
-                    boundary,
-                    model,
-                    api_key.clone(),
-                    global_harness_dir.clone(),
-                    &steer,
-                )
-                .await?;
+                self.run_queued_turn(engine, boundary, model, api_key.clone(), &steer)
+                    .await?;
+                ran = true;
                 continue;
             }
             if let Some(message) = crate::headless_autonomous::latest_assistant_error(engine).await
@@ -541,7 +551,23 @@ impl PrintGoalSurface {
                     .map_err(|error| format!("{error:#}"))?;
                 self.publish_goal_update(engine).await;
             }
-            return Ok(engine.goal_state().await.status == pa_types::goal::GoalStatus::Active);
+            if let Some(wake_at) = engine.take_goal_backoff_wake_at().await {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    wake_at.saturating_sub(pa_core::autonomous::now_millis()),
+                ))
+                .await;
+                boundary
+                    .admit_continuation(
+                        engine,
+                        model,
+                        api_key.clone(),
+                        pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_MARKER_TEXT,
+                    )
+                    .await?;
+                ran = true;
+                continue;
+            }
+            return Ok(ran);
         }
     }
 
@@ -554,7 +580,6 @@ impl PrintGoalSurface {
         boundary: &mut crate::print_boundary::TurnBoundary,
         model: &pa_types::ai::Model,
         api_key: Option<String>,
-        global_harness_dir: std::path::PathBuf,
         message: &CustomMessage,
     ) -> Result<(), String> {
         let label = compact_rlm_text(&custom_message_text(message), 160);
@@ -571,7 +596,7 @@ impl PrintGoalSurface {
             .map_err(|error| format!("{error:#}"))?;
         engine.session.agent().wait_for_idle().await;
         boundary
-            .run_at_settled_turn(engine, model, api_key.clone(), global_harness_dir)
+            .run_at_settled_turn(engine, model, api_key.clone())
             .await?;
         if let Some(error_message) =
             crate::headless_autonomous::latest_assistant_error(engine).await
@@ -595,7 +620,6 @@ impl PrintGoalSurface {
         boundary: &mut crate::print_boundary::TurnBoundary,
         model: &pa_types::ai::Model,
         api_key: Option<String>,
-        global_harness_dir: std::path::PathBuf,
         message: &CustomMessage,
     ) -> Result<(), String> {
         // The queued goal turn's run completes its admission: the held continuation
@@ -614,22 +638,16 @@ impl PrintGoalSurface {
             .map_err(|error| format!("{error:#}"))?;
         engine.session.agent().wait_for_idle().await;
         self.emit_action_drained().await;
-        boundary
-            .run_at_settled_turn(engine, model, api_key, global_harness_dir)
-            .await?;
+        boundary.run_at_settled_turn(engine, model, api_key).await?;
         Ok(())
     }
 }
 
 #[cfg(test)]
-// The faux provider registry is process-global: one std lock serializes every test that drives it.
 mod tests {
     use super::*;
     use pa_core::session_engine::provider_adapter::json_round_trip;
     use serde_json::json;
-
-    /// One test at a time over the global faux registry.
-    static FAUX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// One captured event line (the sink's frames, in order).
     type Frames = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
@@ -688,6 +706,27 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The wake-marker user rows the goal arm's backoff wake admitted, in any turn.
+    async fn wake_marker_rows(engine: &SessionEngine) -> usize {
+        engine
+            .session
+            .entries()
+            .await
+            .into_iter()
+            .filter(|entry| {
+                let pa_types::session::FileEntry::Message {
+                    message: pa_types::session::AgentMessage::User(user),
+                    ..
+                } = entry
+                else {
+                    return false;
+                };
+                user.content.text()
+                    == pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_MARKER_TEXT
+            })
+            .count()
     }
 
     /// The transcript's assistant turn texts in order.
@@ -767,6 +806,8 @@ mod tests {
         let engine = Arc::new(
             pa_core::session_engine::engine::create_session(
                 pa_core::session_engine::engine::SessionEngineConfig {
+                    cell_wake: None,
+                    on_background_cell: None,
                     on_late_sent_agent_message: None,
                     semantic_edges: None,
                     cron_store: None,
@@ -780,8 +821,6 @@ mod tests {
                     tools: Vec::new(),
                     custom_system_prompt: None,
                     prompt_guidelines: Vec::new(),
-                    generic_mcp_servers: Vec::new(),
-                    allow_recursion: None,
                     session_manager: Some(session_manager),
                     extra_host_handlers: None,
                     conversation_log_path: None,
@@ -789,12 +828,21 @@ mod tests {
                     additional_prompt_paths: Vec::new(),
                     extra_builtin_skill_overrides: Vec::new(),
                     rlm_subagent_host: None,
+                    rlm_usage_store: None,
+
+                    inbox: None,
+                    progress_note_emit: None,
+                    factory_child: false,
+                    daemonless: true,
                     rlm_depth: None,
                     model_info: Some(model.clone()),
+                    kernel_ready_gate: None,
                     prewarm_ipython_kernel: None,
                     on_background_work_settled: None,
+                    bash_notice_wake: None,
                     queued_goal_context_purge: None,
                     queued_steering_probe: None,
+                    should_stop_after_turn: None,
                     image_model_router: None,
                     steering_mode: None,
                     follow_up_mode: None,
@@ -824,14 +872,13 @@ mod tests {
             &model,
             &surface,
             &autonomous_run,
+            /*root_node*/ None,
         );
-        let harness_dir = dir.path().join("harness");
         GoalBed {
             engine,
             model,
             surface,
             frames,
-            harness_dir,
             _accounting: accounting,
             _autonomous_run: autonomous_run,
             _dir: dir,
@@ -843,7 +890,6 @@ mod tests {
         model: pa_types::ai::Model,
         surface: Arc<PrintGoalSurface>,
         frames: Frames,
-        harness_dir: std::path::PathBuf,
         _accounting: pa_agent::agent::Subscription,
         /// Keeps the composed hook's autonomous arm alive for the bed's lifetime (the hook holds it
         /// weakly).
@@ -867,19 +913,14 @@ mod tests {
                 .unwrap();
             self.engine.session.agent().wait_for_idle().await;
             boundary
-                .run_at_settled_turn(&self.engine, &self.model, None, self.harness_dir.clone())
+                .run_at_settled_turn(&self.engine, &self.model, None)
                 .await
                 .unwrap();
             self.surface
-                .drive_boundary(
-                    &self.engine,
-                    &mut boundary,
-                    &self.model,
-                    None,
-                    self.harness_dir.clone(),
-                )
+                .drive_boundary(&self.engine, &mut boundary, &self.model, None)
                 .await
-                .unwrap()
+                .unwrap();
+            self.engine.goal_owns_continuation_wakeup().await
         }
     }
 
@@ -902,7 +943,6 @@ mod tests {
     /// seed never announces.
     #[tokio::test]
     async fn seed_rides_the_first_turn_and_stays_silent() {
-        let _guard = FAUX_TEST_LOCK.lock().await;
         let bed = goal_bed(
             script(&json!(["first reply"]), 128_000),
             no_compaction(),
@@ -982,7 +1022,6 @@ mod tests {
     /// An unseeded branch reports no seed; a branched (already-seeded) session does not reseed.
     #[tokio::test]
     async fn seeding_respects_the_branch() {
-        let _guard = FAUX_TEST_LOCK.lock().await;
         let bed = goal_bed(
             script(&json!(["first reply", "second reply"]), 128_000),
             no_compaction(),
@@ -1008,7 +1047,6 @@ mod tests {
     /// the one agent run.
     #[tokio::test]
     async fn natural_loop_mints_continuations_inside_one_run() {
-        let _guard = FAUX_TEST_LOCK.lock().await;
         let bed = goal_bed(
             script(&json!(["turn one reply", "turn two reply"]), 128_000),
             no_compaction(),
@@ -1054,11 +1092,91 @@ mod tests {
         );
     }
 
+    /// An empty goal turn arms the backoff window: the wake marker runs as the next turn at
+    /// the deadline, the recovered reply lands, and the in-loop continuation resumes inside
+    /// the wake run.
+    #[tokio::test(start_paused = true)]
+    async fn backoff_wake_runs_the_marker_turn_and_recovers_the_reply() {
+        let bed = goal_bed(
+            script(&json!([{}, "recovered reply"]), 128_000),
+            no_compaction(),
+            Some(("finish the work", None)),
+        )
+        .await;
+        let (counter, subscription) = agent_run_counter(&bed.engine).await;
+        let owns = bed.prompt("work").await;
+        subscription.unsubscribe().await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "the initial run plus the wake turn's run"
+        );
+        assert!(!owns, "the exhausted faux queue fails the resumed goal");
+        assert_eq!(
+            wake_marker_rows(&bed.engine).await,
+            1,
+            "exactly one wake marker turn ran"
+        );
+        assert_eq!(
+            assistant_texts(&bed.engine).await,
+            [String::new(), "recovered reply".to_string()],
+            "the empty turn, then the wake turn's recovered reply"
+        );
+        assert_eq!(
+            bed.engine.goal_state().await.status,
+            pa_types::goal::GoalStatus::Error
+        );
+    }
+
+    /// Three consecutive empty turns end the goal at the cap after exactly three model
+    /// calls — the third wake never runs.
+    #[tokio::test(start_paused = true)]
+    async fn three_empty_turns_hit_the_cap_with_exactly_three_model_calls() {
+        let bed = goal_bed(
+            script(&json!([{}, {}, {}]), 128_000),
+            no_compaction(),
+            Some(("finish the work", None)),
+        )
+        .await;
+        let (counter, subscription) = agent_run_counter(&bed.engine).await;
+        let owns = bed.prompt("work").await;
+        subscription.unsubscribe().await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "the prompt turn plus the two wake turns"
+        );
+        assert!(!owns, "the capped goal no longer owns the boundary");
+        assert_eq!(wake_marker_rows(&bed.engine).await, 2);
+        let goal = bed.engine.goal_state().await;
+        assert_eq!(goal.status, pa_types::goal::GoalStatus::Error);
+        assert_eq!(
+            goal.last_error.as_deref(),
+            Some(pa_core::session_engine::goal_driver::CONTINUATION_NO_PROGRESS_CAP_REASON)
+        );
+        assert_eq!(goal.no_progress_streak, Some(3));
+    }
+
+    /// A non-goal empty turn never wakes: no marker turn, the boundary returns at once.
+    #[tokio::test(start_paused = true)]
+    async fn non_goal_empty_turn_returns_without_a_wake() {
+        let bed = goal_bed(script(&json!([{}]), 128_000), no_compaction(), None).await;
+        let (counter, subscription) = agent_run_counter(&bed.engine).await;
+        let owns = bed.prompt("work").await;
+        subscription.unsubscribe().await;
+        assert!(!owns, "no goal owns the boundary");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "no wake turn ran");
+        assert_eq!(wake_marker_rows(&bed.engine).await, 0);
+        assert_eq!(
+            bed.engine.goal_state().await.status,
+            pa_types::goal::GoalStatus::Idle
+        );
+    }
+
     /// The crossing turn's usage flips the goal to `budget_limited`, the run ends, and the
     /// steer drains as its own run.
     #[tokio::test]
     async fn budget_steer_drains_as_its_own_run() {
-        let _guard = FAUX_TEST_LOCK.lock().await;
         let bed = goal_bed(
             script(&json!(["goal turn reply", "wrap-up reply"]), 128_000),
             no_compaction(),
@@ -1108,17 +1226,16 @@ mod tests {
     /// run stops, the boundary compacts, and the held turn runs as the post-compaction turn.
     #[tokio::test]
     async fn threshold_hold_mints_before_the_compaction_and_runs_after() {
-        let _guard = FAUX_TEST_LOCK.lock().await;
-        // A small output budget keeps the 20k window's combined input+output
-        // ceiling satisfiable (threshold 13_904 = window - 2_000 budget - 4_096
-        // estimate floor).
+        // Include faux cache-write usage in the threshold: the resumed history
+        // crosses the 25_904 ceiling (32k - 2_000 output - 4_096 headroom),
+        // while the compacted continuation stays below it.
         let mut model_script = script(
             &json!([
                 "crossing reply",
                 "the compaction summary",
                 "continuation reply",
             ]),
-            20_000,
+            32_000,
         );
         model_script["maxTokens"] = json!(2_000);
         let bed = goal_bed_with_resumed_goal(
@@ -1294,6 +1411,8 @@ mod tests {
         let engine = Arc::new(
             pa_core::session_engine::engine::create_session(
                 pa_core::session_engine::engine::SessionEngineConfig {
+                    cell_wake: None,
+                    on_background_cell: None,
                     on_late_sent_agent_message: None,
                     semantic_edges: None,
                     cron_store: None,
@@ -1307,8 +1426,6 @@ mod tests {
                     tools: Vec::new(),
                     custom_system_prompt: None,
                     prompt_guidelines: Vec::new(),
-                    generic_mcp_servers: Vec::new(),
-                    allow_recursion: None,
                     session_manager: Some(session_manager),
                     extra_host_handlers: None,
                     conversation_log_path: None,
@@ -1316,12 +1433,21 @@ mod tests {
                     additional_prompt_paths: Vec::new(),
                     extra_builtin_skill_overrides: Vec::new(),
                     rlm_subagent_host: None,
+                    rlm_usage_store: None,
+
+                    inbox: None,
+                    progress_note_emit: None,
+                    factory_child: false,
+                    daemonless: true,
                     rlm_depth: None,
                     model_info: Some(model.clone()),
+                    kernel_ready_gate: None,
                     prewarm_ipython_kernel: None,
                     on_background_work_settled: None,
+                    bash_notice_wake: None,
                     queued_goal_context_purge: None,
                     queued_steering_probe: None,
+                    should_stop_after_turn: None,
                     image_model_router: None,
                     steering_mode: None,
                     follow_up_mode: None,
@@ -1350,13 +1476,13 @@ mod tests {
             &model,
             &surface,
             &autonomous_run,
+            /*root_node*/ None,
         );
         GoalBed {
             engine,
             model,
             surface,
             frames,
-            harness_dir: dir.path().join("harness"),
             _accounting: accounting,
             _autonomous_run: autonomous_run,
             _dir: dir,

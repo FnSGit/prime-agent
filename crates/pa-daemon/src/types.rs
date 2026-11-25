@@ -96,6 +96,15 @@ pub struct SessionSummary {
     pub modified: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_message: Option<String>,
+    /// The run's latest accepted `rlm.progress.note`, cleared at the run
+    /// boundaries so an idle row never carries one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_note: Option<String>,
+    /// The session's tool calls so far (TS `toolUseCount`, omitted when
+    /// zero): bumped per `tool_execution_start`, re-seeded from the session
+    /// file when a worker opens it so a revived child never resets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_path: Option<String>,
     /// The parent's live active-session id (subagent summaries).
@@ -131,6 +140,11 @@ pub struct SessionSummary {
     pub model_fallback_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_kind: Option<String>,
+    /// The Decision API child flag (`decisionChild`): the agents view
+    /// hides these System 1 children from the user (their spend still
+    /// rolls into the parent). Absent on every ordinary session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_child: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unfinished_action_count: Option<u32>,
     /// Whether this session has already drawn the Anthropic subscription
@@ -160,12 +174,18 @@ pub struct SessionActionSnapshot {
     /// never render as individual rows).
     #[serde(default, skip_serializing_if = "QueueLaneIndices::is_empty")]
     pub injected_prompts: QueueLaneIndices,
+    /// Rust-native typed provenance: which parked lane items are daemon
+    /// inbox notices (the arrival/reminder rows), by index — the strip
+    /// folds them into the condensed count and never offers them in the
+    /// user-typed browse.
+    #[serde(default, skip_serializing_if = "QueueLaneIndices::is_empty")]
+    pub inbox_notice: QueueLaneIndices,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active: Option<SessionActionActive>,
 }
 
 /// The lane-indices rider shape the typed-provenance marks share: parked lane items, by index, of
-/// one internal class — a user-typed lookalike never carries either mark.
+/// one internal class — a user-typed lookalike never carries any mark.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueueLaneIndices {

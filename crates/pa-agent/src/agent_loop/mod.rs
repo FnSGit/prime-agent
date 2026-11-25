@@ -96,6 +96,8 @@ pub struct AgentLoopConfig {
     pub max_tokens: Option<u64>,
     pub reasoning: ThinkingLevel,
     pub session_id: Option<String>,
+    /// The requested provider transport; `None` leaves it to the provider.
+    pub transport: Option<crate::types::Transport>,
     /// The requested service tier rides the loop config into every stream
     /// request; `None` until a host supplies one.
     pub service_tier: Option<crate::types::ServiceTier>,
@@ -109,6 +111,9 @@ pub struct AgentLoopConfig {
     pub get_follow_up_messages: Option<PollMessagesFn>,
     pub get_continuation_messages: Option<GetContinuationMessagesFn>,
     pub tool_execution: ToolExecutionMode,
+    /// Heartbeat cadence for in-flight tool calls (start-side trace
+    /// visibility for long calls); defaults to a 60s tick.
+    pub tool_progress: crate::types::ToolProgressCadence,
     pub before_tool_call: Option<BeforeToolCallFn>,
     pub after_tool_call: Option<AfterToolCallFn>,
 }
@@ -124,6 +129,7 @@ impl AgentLoopConfig {
             max_tokens: None,
             reasoning: ThinkingLevel::Off,
             session_id: None,
+            transport: None,
             service_tier: None,
             convert_to_llm,
             transform_context: None,
@@ -135,6 +141,7 @@ impl AgentLoopConfig {
             get_follow_up_messages: None,
             get_continuation_messages: None,
             tool_execution: ToolExecutionMode::Parallel,
+            tool_progress: crate::types::ToolProgressCadence::default(),
             before_tool_call: None,
             after_tool_call: None,
         }

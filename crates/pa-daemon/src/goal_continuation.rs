@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::agent_engine::AgentSessionEngine;
+use crate::agent_engine::{AgentSessionEngine, GoalWakeKind};
 use crate::engine::{GoalContinuation, GoalTurnEndWork, PromptRequest};
 
 /// The outcome of the natural-boundary goal consult.
@@ -78,7 +78,7 @@ impl AgentSessionEngine {
     /// An error assistant message fails an active goal (an abort keeps
     /// it); the state change surfaces through the run's tracking wrapper.
     pub(crate) fn finish_goal_for_terminal_error(&self, error: &str) {
-        let Some(handles) = self.goal_runtime.lock().expect("goal runtime lock").clone() else {
+        let Some(handles) = self.live_handles().map(|live| live.goal.clone()) else {
             return;
         };
         self.runtime.block_on(async {
@@ -122,21 +122,19 @@ impl AgentSessionEngine {
 
     /// The settle-site body: exactly-once delivery under the driver lock,
     /// deferral kept while descendants or queued input own the boundary.
-    async fn goal_children_settled(&self) {
-        // A closed session (killed/stopped) drops the retry.
-        if self.session_is_closed() {
-            return;
-        }
-        let Some(handles) = self.goal_runtime.lock().expect("goal runtime lock").clone() else {
+    pub(crate) async fn goal_children_settled(&self) {
+        // A closed session (killed/stopped) has no live handles: the retry drops.
+        let Some(live) = self.live_handles() else {
             return;
         };
+        let handles = &live.goal;
         {
             let driver = handles.driver.lock().await;
             if !driver.owes_continuation() {
                 return;
             }
         }
-        if self.has_unsettled_rlm_work().await || self.has_live_background_bash_handles() {
+        if self.has_unsettled_rlm_work().await || self.background_work_count() > 0 {
             return;
         }
         // Queued input or the post-abort suspension owns the boundary.
@@ -167,9 +165,10 @@ impl AgentSessionEngine {
                 let state = driver.state_with_creation_elapsed();
                 let wake_at = driver.backoff_wake_at();
                 drop(driver);
-                self.publish_goal_state(&state);
+                live.publish_goal(&state);
                 if let Some(wake_at) = wake_at {
-                    self.schedule_goal_backoff_wake(wake_at).await;
+                    self.schedule_goal_wake(GoalWakeKind::Backoff, wake_at)
+                        .await;
                 }
                 return;
             }
@@ -181,7 +180,7 @@ impl AgentSessionEngine {
         };
         // The mint succeeded: retire the pending wake instead of firing
         // one more marker turn.
-        self.cancel_goal_backoff_wake();
+        self.cancel_goal_wake();
         // This mint's own guard handle: later releases clear exactly this
         // handle, never the mutable mirror (a core rebuild may have
         // re-swapped it meanwhile).
@@ -198,7 +197,7 @@ impl AgentSessionEngine {
             }
             return;
         }
-        let goal_update = self.publish_goal_state(&driver.state_with_creation_elapsed());
+        let goal_update = live.publish_goal(&driver.state_with_creation_elapsed());
         drop(driver);
         // A close that lands while the awaits above ran: the mint is
         // consumed (the owed flag was already taken) and the unconsumed
@@ -224,26 +223,49 @@ impl AgentSessionEngine {
         children.any_running().await
     }
 
-    /// Whether a live background `bash()` handle holds the boundary: its
-    /// completion notice is the wake-up a held continuation waits for. The
-    /// probe reads the kernel manager without the session mutex (the
-    /// consult can run inside a compaction turn, which holds it).
-    pub(crate) fn has_live_background_bash_handles(&self) -> bool {
-        self.background_bash_probe
-            .lock()
-            .expect("background bash probe lock")
-            .clone()
-            .is_some_and(|probe| probe())
+    /// The count of live background work: detached cells awaiting their
+    /// terminal admission plus live `bash()` handles in the kernel
+    /// registry. The one answer to "is background work running": the goal
+    /// and autonomous continuation gates, the fallback wake's arming, the
+    /// passivation gates, the supervisor-lost gate, and ACP's
+    /// `outstandingBackgroundJobs` read it. The probe reads the session
+    /// provisioner without the session mutex (the consult can run inside a
+    /// compaction turn, which holds it). An unbuilt session answers `0`.
+    pub(crate) fn background_work_count(&self) -> usize {
+        self.live_handles()
+            .map_or(0, |live| (live.background_work_probe)())
+    }
+
+    /// The built session's kernel manager, when a session is built and its
+    /// kernel provisioner still lives. `KernelProvisioner::manager` never
+    /// boots a kernel, so the abort paths stay nonblocking.
+    pub(crate) fn kernel_manager(&self) -> Option<pa_core::kernel::manager::ReplKernelManager> {
+        self.built_handles()
+            .and_then(|handles| handles.kernel_provisioner.upgrade())
+            .and_then(|provisioner| provisioner.manager())
+    }
+
+    /// Stop the session's current USER kernel execution out-of-band
+    /// (attached or detached): the session abort path's kernel arm. No
+    /// kernel (daemonless, unbuilt) is a no-op.
+    pub(crate) fn abort_kernel_user_execution(&self) {
+        if let Some(manager) = self.kernel_manager() {
+            // The bool (a live execution was found) is the scoped cancel's
+            // answer, not the full abort arm's: this path stops whatever it
+            // finds.
+            let _ = manager.abort_user_execution();
+        }
     }
 
     /// The settled passivation gates (the kernel release and the whole-worker idle
-    /// passivation share them): no unsettled RLM work, no live background `bash()`
-    /// handle (a snapshot cannot resurrect a live process), no active-or-paused
-    /// scheduled job (crons AND armed heartbeats). Deliberate divergence: no
-    /// relaunch-on-fire, so the port BLOCKS while any job is armed. An unwired jobs
-    /// probe passes.
+    /// passivation share them): no unsettled RLM work, no live background work — a
+    /// `bash()` handle in the kernel-manager registry (a snapshot cannot resurrect a
+    /// live process) or a detached cell awaiting its terminal admission — no
+    /// active-or-paused scheduled job (crons AND armed heartbeats). Deliberate
+    /// divergence: no relaunch-on-fire, so the port BLOCKS while any job is armed.
+    /// An unwired jobs probe passes.
     pub(crate) async fn settled_passivation_gates_pass(&self) -> bool {
-        if self.has_unsettled_rlm_work().await || self.has_live_background_bash_handles() {
+        if self.has_unsettled_rlm_work().await || self.background_work_count() > 0 {
             return false;
         }
         let probe = self
@@ -269,14 +291,12 @@ impl AgentSessionEngine {
     /// continuation turn, deferred (owed, not consumed) behind unsettled
     /// descendant work or a background bash handle.
     fn mint_goal_continuation(&self) -> GoalBoundary {
-        // A closed session never continues: no mint, no owed-continuation
+        // A closed session has no live handles: no mint, no owed-continuation
         // consumption.
-        if self.session_is_closed() {
-            return GoalBoundary::Proceed;
-        }
-        let Some(handles) = self.goal_runtime.lock().expect("goal runtime lock").clone() else {
+        let Some(live) = self.live_handles() else {
             return GoalBoundary::Proceed;
         };
+        let handles = &live.goal;
         // Read the just-settled turn BEFORE the driver lock (the session
         // mutex never nests under it). The failed pair's drop happens
         // inside, once the consult examines the corpse — an early drop
@@ -297,9 +317,17 @@ impl AgentSessionEngine {
                 return GoalBoundary::End;
             }
             // The quiescence gate: the continuation waits (not consumed)
-            // until the descendants settle or the bash handles finish.
-            if self.has_unsettled_rlm_work().await || self.has_live_background_bash_handles() {
+            // until the descendants settle or the background work finishes.
+            // Live background work also arms the fallback wake (once per
+            // deferral): its completion notice is the normal retry, and work
+            // that never completes gets one marker turn after one window.
+            let background_work = self.background_work_count() > 0;
+            if self.has_unsettled_rlm_work().await || background_work {
                 driver.mark_continuation_owed();
+                if background_work {
+                    drop(driver);
+                    self.arm_background_skip_wake().await;
+                }
                 return GoalBoundary::End;
             }
             // Now the trailing failed continuation pair can leave the
@@ -339,15 +367,16 @@ impl AgentSessionEngine {
                 let state = driver.state_with_creation_elapsed();
                 let wake_at = driver.backoff_wake_at();
                 drop(driver);
-                self.publish_goal_state(&state);
+                live.publish_goal(&state);
                 if let Some(wake_at) = wake_at {
-                    self.schedule_goal_backoff_wake(wake_at).await;
+                    self.schedule_goal_wake(GoalWakeKind::Backoff, wake_at)
+                        .await;
                 }
                 return GoalBoundary::End;
             }
             // The mint succeeded: retire any stale wake instead of firing
             // one more marker turn.
-            self.cancel_goal_backoff_wake();
+            self.cancel_goal_wake();
             // This mint's own guard handle.
             let pending_handle = Some(driver.pending_continuation_handle());
             // Input that arrived while the mint ran rolls the slot back
@@ -363,7 +392,7 @@ impl AgentSessionEngine {
                 }
                 return GoalBoundary::End;
             }
-            let goal_update = self.publish_goal_state(&driver.state_with_creation_elapsed());
+            let goal_update = live.publish_goal(&driver.state_with_creation_elapsed());
             let message = message.expect("the mint produced a message");
             drop(driver);
             self.deliver_goal_work(GoalTurnEndWork::Continuation(GoalContinuation {
@@ -379,14 +408,7 @@ impl AgentSessionEngine {
     /// steer); carries no `goal_update` — the budget transition already
     /// surfaced through the crossing turn's tracking wrapper.
     fn mint_budget_limit_steer(&self) -> Option<GoalTurnEndWork> {
-        if self.session_is_closed() {
-            return None;
-        }
-        let handles = self
-            .goal_runtime
-            .lock()
-            .expect("goal runtime lock")
-            .clone()?;
+        let handles = self.live_handles()?.goal.clone();
         let message = self.runtime.block_on(async {
             let driver = handles.driver.lock().await;
             let state = driver.state_with_creation_elapsed();
@@ -396,6 +418,7 @@ impl AgentSessionEngine {
             pa_core::goals::create_goal_context_message(
                 &state,
                 pa_core::goals::GoalContextKind::BudgetLimit,
+                &[],
             )
             .ok()
         })?;
@@ -405,26 +428,6 @@ impl AgentSessionEngine {
             // The budget steer mints no continuation slot: no pending guard.
             pending_handle: None,
         }))
-    }
-
-    /// Publish a minted state change as the `goal_update` payload; the
-    /// dedupe contract keeps an unchanged state silent.
-    pub(crate) fn publish_goal_state(
-        &self,
-        goal: &pa_core::goals::GoalState,
-    ) -> Option<serde_json::Value> {
-        let mut published = self.published_goal.lock().expect("published goal lock");
-        // The dedupe is age-invariant: the creation-based timer's age ticks
-        // with the wall clock (a second boundary between reads must not
-        // re-emit an unchanged goal).
-        if published.as_ref().is_some_and(|last| {
-            pa_core::goals::goal_update_dedupe_projection(last)
-                == pa_core::goals::goal_update_dedupe_projection(goal)
-        }) {
-            return None;
-        }
-        *published = Some(goal.clone());
-        Some(serde_json::to_value(goal).unwrap_or(serde_json::Value::Null))
     }
 
     /// Hand one minted follow-up to the worker's admission sink. An
@@ -476,20 +479,18 @@ mod tests {
     };
     use crate::engine::EngineEvent;
 
-    /// Inject the engine's background-bash liveness probe (a `true`
-    /// probe = a live background `bash()` handle).
-    fn set_background_bash_probe(
+    /// Inject the engine's background-work probe (a `1` probe
+    /// = a detached cell awaiting its completion, or a live background
+    /// `bash()` handle): the count the continuation gates read.
+    fn set_background_work_probe(
         engine: &Arc<AgentSessionEngine>,
-        probe: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+        probe: std::sync::Arc<dyn Fn() -> usize + Send + Sync>,
     ) {
-        *engine
-            .background_bash_probe
-            .lock()
-            .expect("background bash probe lock") = Some(probe);
+        engine.set_test_probes(Some(probe), None);
     }
 
     #[test]
-    fn live_background_bash_holds_the_goal_continuation_until_it_settles() {
+    fn live_background_work_holds_the_goal_continuation_until_it_settles() {
         let _faux = FAUX_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -503,7 +504,7 @@ mod tests {
         // The first prompt builds the session; the probe then stands in
         // for a kernel running a background bash handle.
         admit(&engine, "warm".to_string(), &mut events);
-        set_background_bash_probe(&engine, Arc::new(|| true));
+        set_background_work_probe(&engine, Arc::new(|| 1));
         admit(
             &engine,
             "/goal ship behind the bash handle".to_string(),
@@ -516,12 +517,7 @@ mod tests {
                 "work minted behind a live handle: {work:?}"
             );
         }
-        let handles = engine
-            .goal_runtime
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("goal runtime");
+        let handles = engine.live_handles().expect("goal runtime").goal.clone();
         assert!(
             engine
                 .runtime
@@ -544,7 +540,7 @@ mod tests {
                 .block_on(async { handles.driver.lock().await.owes_continuation() }),
             "a live handle must keep the deferral owed"
         );
-        set_background_bash_probe(&engine, Arc::new(|| false));
+        set_background_work_probe(&engine, Arc::new(|| 0));
         engine
             .runtime
             .block_on(async { engine.goal_children_settled().await });

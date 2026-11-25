@@ -308,11 +308,11 @@ fn write_parent_script(dir: &Path, first_cell: &str, probe_cell: &str) -> PathBu
             "engine": "faux",
             "responses": [
                 { "content": [
-                    { "type": "toolCall", "name": "ipython", "arguments": { "code": first_cell } },
+                    { "type": "toolCall", "name": "python_repl", "arguments": { "code": first_cell } },
                 ] },
                 { "text": "spawn turn done" },
                 { "content": [
-                    { "type": "toolCall", "name": "ipython", "arguments": { "code": probe_cell } },
+                    { "type": "toolCall", "name": "python_repl", "arguments": { "code": probe_cell } },
                 ] },
                 { "text": "probe turn done" },
             ],
@@ -582,6 +582,15 @@ fn restart_relists_child(delay_ms: u64, display_status: &str) {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let agent_dir = dir.path().join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    // The wake oracle reads the delivered message's text in the child's
+    // session file; the default inbox route delivers a short notice with
+    // the message in the durable inbox instead, so this suite pins the
+    // direct route (the inbox route is covered by `agent_inbox_e2e`).
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({ "agentInbox": { "enabled": false } }).to_string(),
+    )
+    .expect("write settings");
     let socket = dir.path().join("supervisor.sock");
     let receipts = dir.path().join("receipts");
     std::fs::create_dir_all(&receipts).expect("receipts dir");
@@ -675,6 +684,25 @@ fn restart_relists_child(delay_ms: u64, display_status: &str) {
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    if delay_ms == 0 {
+        // The completed display precedes the child's terminal-notice
+        // follow-up. Drain that notice and its parent turn before closing
+        // the idle fixture; otherwise restart correctly revives owed work.
+        client.send_command(
+            "completed-child-quiescent",
+            &json!({
+                "type": "wait_for_idle",
+                "activeSessionId": parent_id,
+                "waitForRlmQuiescence": true,
+            }),
+        );
+        let quiescent = client.read_response("completed-child-quiescent");
+        assert_eq!(
+            quiescent["success"], true,
+            "completed child and parent notice did not settle: {quiescent}"
+        );
+    }
+
     client.send_command("bye", &json!({ "type": "shutdown" }));
     let deadline = Instant::now() + Duration::from_secs(30);
     while daemon
@@ -740,19 +768,19 @@ fn restart_relists_child(delay_ms: u64, display_status: &str) {
     // (b) send receipt
     let _send: Value =
         serde_json::from_str(&await_receipt(&send_receipt)).expect("send receipt json");
-    // (c) wake oracle
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let content = std::fs::read_to_string(&child_file).unwrap_or_default();
-        if content.contains("boot-ping") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the send never woke the child into its session file: {content}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    // (c) wake oracle: a restarted child may first finish its recovered
+    // turn, so the message lands by the time the child drains to idle.
+    client.send_command(
+        "child-idle",
+        &json!({ "type": "wait_for_idle", "activeSessionId": child_session_id }),
+    );
+    let idle = client.read_response("child-idle");
+    assert_eq!(idle["success"], true, "child wait_for_idle failed: {idle}");
+    let content = std::fs::read_to_string(&child_file).unwrap_or_default();
+    assert!(
+        content.contains("boot-ping"),
+        "the send never woke the child into its session file: {content}"
+    );
     // (d) child runtime
     client.send_command(
         "gs",

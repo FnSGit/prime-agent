@@ -24,6 +24,7 @@
 )]
 pub mod acp;
 pub mod agent_engine;
+pub mod agent_inbox;
 pub mod agent_message_broadcast;
 pub mod agent_message_ingest;
 pub mod agent_messaging;
@@ -43,6 +44,7 @@ pub(crate) mod compaction_supervision;
 pub(crate) mod context_tree_cache;
 pub(crate) mod context_tree_children;
 pub(crate) mod create_reuse;
+pub mod decision_engine;
 pub mod descriptor;
 pub mod engine;
 pub(crate) mod factory_activity;
@@ -67,6 +69,7 @@ pub mod paths;
 pub(crate) mod peer;
 pub(crate) mod peer_client;
 pub(crate) mod peer_tickets;
+pub(crate) mod persistent_shells;
 pub mod platform;
 pub mod prompt_admission;
 pub mod protocol;
@@ -86,10 +89,10 @@ pub mod rpc;
 pub(crate) mod saved_session_commands;
 pub(crate) mod scheduled_jobs;
 pub(crate) mod scheduling_catalog;
-pub(crate) mod session_archive;
 pub(crate) mod session_bindings;
 pub(crate) mod session_catalog;
 pub(crate) mod session_commands;
+pub(crate) mod session_content_search;
 pub(crate) mod session_custom;
 pub mod session_export;
 pub mod session_input_pause;
@@ -107,12 +110,14 @@ pub mod socket;
 pub(crate) mod state_getters;
 mod stop_cleanup;
 pub(crate) mod streaming;
+pub(crate) mod streaming_utf8;
 pub mod supervisor;
 pub mod supervisor_link;
 pub(crate) mod supervisor_lost;
 pub(crate) mod supervisor_parent_death;
 pub(crate) mod supervisor_roster;
 pub(crate) mod supervisor_roster_seed;
+pub(crate) mod ts_era;
 pub mod types;
 pub(crate) mod update_prepare;
 pub(crate) mod update_restore;
@@ -125,3 +130,5 @@ pub(crate) mod worker_stderr;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(test)]
+pub(crate) mod trace_test_env;

@@ -1,14 +1,16 @@
 //! The engine's lifecycle surface: the constructor and the session
 //! build/adopt/retire cycle, the closed-state markers, the skill
 //! expansion and session-command funnels, and the kernel host wiring.
+use std::sync::atomic::Ordering;
+
 use super::{
     execute_session_command, json_round_trip, map_thinking_level,
     register_agent_message_host_handlers, register_agent_observe_host_handlers,
-    switchable_stream_fn, AgentEngineConfig, AgentSessionEngine, Arc, CoreSessionEngine,
-    EngineModelSelection, HostRequestHandlers, LinkAgentMessageController,
-    LinkAgentObserveController, Model, OverflowRecovery, ProducerUsageSink, ProviderTarget,
-    QuotaParkState, SessionCommandExecution, SessionCommandParams, SessionEngineConfig,
-    SupervisorChildSessions, Value,
+    switchable_stream_fn_with_live_auth, AgentEngineConfig, AgentSessionEngine, Arc,
+    CoreSessionEngine, EngineModelSelection, HostRequestHandlers, LinkAgentMessageController,
+    LinkAgentObserveController, Model, OverflowRecovery, ProducerUsageSink, PromptContextBoundary,
+    ProviderTarget, QuotaParkState, SessionCommandExecution, SessionCommandParams,
+    SessionEngineConfig, SupervisorChildSessions, Value,
 };
 
 /// The instruction the floor appends to a bare skill invocation: ask what
@@ -54,6 +56,7 @@ impl AgentSessionEngine {
                 config.agent_dir.clone(),
                 link_config.active_session_id.clone(),
                 std::sync::Arc::clone(&model_refusal_telemetry),
+                link_config.worker_token.clone(),
             ))
         });
         let autonomous_driver = std::sync::RwLock::new(std::sync::Arc::new(
@@ -63,40 +66,39 @@ impl AgentSessionEngine {
         let cwd = std::sync::Arc::new(std::sync::RwLock::new(config.cwd.clone()));
         // The ACP MCP store (auth storage construction is blocking, off the hot async paths).
         let agent_dir = config.agent_dir.clone();
-        // Settings-declared user servers; re-read per resolve so `mcp.refresh` sees settings
-        // changes.
+        // Executable MCP settings and catalog sources are user/global only.
+        // Re-read per resolve so refresh sees user changes without project overrides.
         let mcp_cwd = std::sync::Arc::clone(&cwd);
         let mcp_agent_dir = agent_dir.clone();
         let catalog_cwd = std::sync::Arc::clone(&cwd);
         let catalog_agent_dir = agent_dir.clone();
+        let user_servers: pa_core::mcp::UserServersFn = std::sync::Arc::new(move || {
+            // The live cwd slot, not the construction-time cwd: the rebind must reach the MCP
+            // settings discovery.
+            let mcp_cwd = mcp_cwd.read().expect("engine cwd lock").clone();
+            let settings = pa_core::settings::SettingsManager::create(&mcp_cwd, &mcp_agent_dir);
+            Some(
+                settings
+                    .global_settings()
+                    .mcp_servers
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|(server, server_config)| {
+                        serde_json::from_value(server_config)
+                            .ok()
+                            .map(|parsed| (server, parsed))
+                    })
+                    .collect::<std::collections::HashMap<String, pa_core::mcp::McpServerConfig>>(),
+            )
+        });
+        let oauth_user_servers = std::sync::Arc::clone(&user_servers);
         let mcp = pa_core::mcp::McpManager::new(pa_core::mcp::McpManagerOptions {
             auth_storage: pa_core::auth::AuthStorage::create_with_oauth(
                 &agent_dir,
-                std::sync::Arc::new(pa_core::mcp::McpOAuth::new()),
+                std::sync::Arc::new(pa_core::mcp::McpOAuth::new(oauth_user_servers)),
             ),
-            get_user_servers: Box::new(move || {
-                // The live cwd slot, not the construction-time cwd: the rebind must reach the MCP
-                // settings discovery.
-                let mcp_cwd = mcp_cwd.read().expect("engine cwd lock").clone();
-                let settings = pa_core::settings::SettingsManager::create(&mcp_cwd, &mcp_agent_dir);
-                Some(
-                    settings
-                        .settings()
-                        .mcp_servers
-                        .clone()
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter_map(|(server, server_config)| {
-                            serde_json::from_value(server_config)
-                                .ok()
-                                .map(|parsed| (server, parsed))
-                        })
-                        .collect::<std::collections::HashMap<
-                            String,
-                            pa_core::mcp::McpServerConfig,
-                        >>(),
-                )
-            }),
+            get_user_servers: Box::new(move || user_servers()),
             begin_login: None,
             agent_dir: Some(agent_dir),
             get_catalog_sources: Some(Box::new(move || {
@@ -105,7 +107,7 @@ impl AgentSessionEngine {
                 let settings =
                     pa_core::settings::SettingsManager::create(&catalog_cwd, &catalog_agent_dir);
                 settings
-                    .settings()
+                    .global_settings()
                     .mcp_catalog_sources
                     .clone()
                     .unwrap_or_default()
@@ -128,36 +130,43 @@ impl AgentSessionEngine {
             runtime,
             config,
             mcp,
-            published_goal: std::sync::Mutex::new(None),
+            refinement_completion_sink: std::sync::Mutex::new(None),
             late_agent_message_sink: std::sync::Mutex::new(None),
-            goal_runtime: std::sync::Mutex::new(None),
-            pending_goal_continuation: std::sync::Mutex::new(None),
             goal_budget_crossed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             goal_input_probe: std::sync::Mutex::new(None),
             goal_admission_sink: std::sync::Mutex::new(None),
-            bash_completion_sink: std::sync::Mutex::new(None),
+            kernel_notice_sink: std::sync::Mutex::new(None),
+            cell_wake: std::sync::Arc::new(pa_core::kernel::cell_wake::CellWake::new()),
             bash_consumed_sink: std::sync::Mutex::new(None),
+            inbox: std::sync::Mutex::new(None),
+            inbox_read_hook: std::sync::Mutex::new(None),
             goal_queue_purge: std::sync::Mutex::new(None),
-            goal_backoff_wake_job_id: std::sync::Mutex::new(None),
+            background_skip_wake_armed: std::sync::atomic::AtomicBool::new(false),
             stale_goal_terminal_pending: std::sync::Mutex::new(None),
-            turn_agent: std::sync::Mutex::new(None),
             queue_modes,
-            autonomous_boundary: std::sync::Mutex::new(None),
-            background_bash_probe: std::sync::Mutex::new(None),
-            kernel_release_probe: std::sync::Mutex::new(None),
             registered_jobs_probe: std::sync::Mutex::new(None),
             session_file,
             selection: std::sync::RwLock::new(selection.clone()),
             restored_model: std::sync::Mutex::new(None),
+            model_resolution_warning: std::sync::Mutex::default(),
             startup_scope: std::sync::Mutex::new(None),
             initial_selection: std::sync::RwLock::new(selection),
             effective_thinking: std::sync::RwLock::new(None),
             service_tier: std::sync::RwLock::new(None),
-            session: tokio::sync::Mutex::new(None),
+            session: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            core_state: std::sync::Mutex::new(super::core_state::CoreSessionState::Unbuilt),
+            threshold_yielded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            threshold_checks_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             session_build: tokio::sync::Mutex::new(()),
             pending_branch: std::sync::Mutex::new(None),
+            prompt_context_boundary: std::sync::Mutex::new(None),
             provider_target: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            request_auth_oauth: std::sync::Arc::new(pa_core::auth::ProviderOAuth::new()),
+            request_auth_registry: std::sync::Mutex::new(None),
             image_route: std::sync::Mutex::new(None),
+            reload_lock: std::sync::Mutex::new(()),
             own_summary: std::sync::Arc::new(std::sync::Mutex::new(None)),
             create_resources: std::sync::RwLock::default(),
             autonomous: std::sync::Arc::new(tokio::sync::Mutex::new(
@@ -166,6 +175,7 @@ impl AgentSessionEngine {
             link,
             children,
             usage_producer: std::sync::Mutex::new(None),
+            rlm_usage_store: std::sync::Mutex::new(None),
             quota_park: std::sync::Arc::new(std::sync::Mutex::new(None)),
             quota_parked_this_run: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             autonomous_driver,
@@ -173,11 +183,11 @@ impl AgentSessionEngine {
             held_autonomous_continuation: std::sync::Mutex::new(None),
             autonomous_admission: std::sync::Mutex::new(None),
             autonomous_awaits_rlm_work: std::sync::atomic::AtomicBool::new(false),
-            session_closed: std::sync::atomic::AtomicBool::new(false),
             self_weak: std::sync::Mutex::new(None),
             autonomous_queue_purge: std::sync::Mutex::new(None),
             cwd,
             rlm_depth: std::sync::atomic::AtomicU32::new(0),
+            factory_child: std::sync::atomic::AtomicBool::new(false),
             rlm_max_depth_source: std::sync::Mutex::new("default"),
             pending_max_depth: std::sync::Mutex::new(None),
             reloaded_goal_update: std::sync::Mutex::new(None),
@@ -185,9 +195,22 @@ impl AgentSessionEngine {
             overflow_recovery: std::sync::Mutex::new(OverflowRecovery::default()),
             auto_compaction_abort: std::sync::Mutex::new(None),
             compaction_summary_sink: std::sync::Mutex::new(None),
+            progress_note_emit: std::sync::Mutex::new(None),
             model_refusal_telemetry,
             semantic_identity: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Install the worker's queue-backed cell wake (the pending predicate
+    /// reads the live steering lane, so an arrival that predates a cell's
+    /// subscription still ends its wait). Runs once at construction, before
+    /// the engine is shared and before the first session build hands the
+    /// wake to a kernel provisioner.
+    pub fn set_worker_cell_wake(
+        &mut self,
+        wake: std::sync::Arc<pa_core::kernel::cell_wake::CellWake>,
+    ) {
+        self.cell_wake = wake;
     }
 
     /// Replace the autonomous continuation policy. Call before the first admitted turn.
@@ -250,9 +273,12 @@ impl AgentSessionEngine {
                 return Ok(());
             }
         }
-        let built = self.build_session(model).await?;
-        self.adopt_built_session(&built).await?;
-        self.session.lock().await.replace(Arc::new(built));
+        let built = Arc::new(self.build_session(model).await?);
+        if let Err(error) = self.adopt_built_session(&built).await {
+            self.retire_handles();
+            return Err(error);
+        }
+        self.session.lock().await.replace(built);
         Ok(())
     }
 
@@ -271,6 +297,29 @@ impl AgentSessionEngine {
             .expect("compaction summary sink lock") = Some(sink);
     }
 
+    pub(crate) fn set_rlm_usage_store(
+        &self,
+        store: std::sync::Arc<dyn pa_core::session_engine::rlm_usage::RlmChildUsageStore>,
+    ) {
+        *self.rlm_usage_store.lock().expect("rlm usage store lock") = Some(store);
+    }
+
+    /// Installs the worker's accepted-note announcer, threaded into every
+    /// session build.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the announcer slot's mutex is poisoned.
+    pub fn set_progress_note_emit(
+        &self,
+        emit: pa_core::session_engine::rlm_host::RlmProgressNoteEmit,
+    ) {
+        *self
+            .progress_note_emit
+            .lock()
+            .expect("progress note emit lock") = Some(emit);
+    }
+
     /// The stale-row guard's deferred durable write: the terminal row
     /// lands AFTER the context adoption, so the active row stops being
     /// rediscovered.
@@ -283,10 +332,10 @@ impl AgentSessionEngine {
         let Some(terminal) = terminal else {
             return;
         };
-        let Some(handles) = self.goal_runtime.lock().expect("goal runtime lock").clone() else {
+        let Some(handles) = self.built_handles() else {
             return;
         };
-        let mut session = handles.session.lock().await;
+        let mut session = handles.goal.session.lock().await;
         let normalized = pa_core::goals::normalize_goal_state(terminal);
         match serde_json::to_value(&normalized) {
             Ok(value) => {
@@ -304,8 +353,8 @@ impl AgentSessionEngine {
         }
     }
 
-    async fn adopt_built_session(&self, built: &CoreSessionEngine) -> anyhow::Result<()> {
-        self.mirror_goal_runtime(built).await;
+    async fn adopt_built_session(&self, built: &Arc<CoreSessionEngine>) -> anyhow::Result<()> {
+        self.adopt_handles(Arc::new(super::core_state::BuiltHandles::of(built).await));
         if let Some(sink) = self
             .compaction_summary_sink
             .lock()
@@ -314,49 +363,6 @@ impl AgentSessionEngine {
         {
             built.session.set_compaction_summary_sink(sink);
         }
-        // The in-run consult's mirror: the session mutex is held across
-        // compaction turns, and the consult runs inside one.
-        *self
-            .autonomous_boundary
-            .lock()
-            .expect("autonomous boundary lock") =
-            Some(crate::autonomous_continuation::AutonomousBoundaryMirror {
-                turn_boundary: std::sync::Arc::clone(&built.turn_boundary),
-                agent: std::sync::Arc::clone(built.session.agent()),
-                compaction: built.session.compaction_settings(),
-            });
-        // The background-bash liveness probe: a deadlock-free read over the
-        // build's provisioner.
-        let provisioner = built.kernel_provisioner_weak();
-        *self
-            .background_bash_probe
-            .lock()
-            .expect("background bash probe lock") = Some(std::sync::Arc::new(move || {
-            provisioner
-                .upgrade()
-                .and_then(|provisioner| provisioner.manager())
-                .is_some_and(|manager| manager.has_background_work())
-        }));
-        // The settled-child kernel release handle: the park arm stops the
-        // kernel without taking the session mutex (a dead weak reference
-        // releases nothing).
-        let release_provisioner = built.kernel_provisioner_weak();
-        *self
-            .kernel_release_probe
-            .lock()
-            .expect("kernel release probe lock") = Some(std::sync::Arc::new(move || {
-            let provisioner = release_provisioner.clone();
-            Box::pin(async move {
-                if let Some(provisioner) = provisioner.upgrade() {
-                    provisioner
-                        .stop_kernel(Some(pa_core::kernel::shared::KernelShutdownOptions {
-                            snapshot: true,
-                            drain_host_requests: true,
-                        }))
-                        .await;
-                }
-            })
-        }));
         // The in-run autonomous continuation hook (the goal seam keeps its own boundary mint).
         self.install_autonomous_continuation_hook_on(built.session.agent());
         // Live children outlive the rebuild and registered their spawns on the old producer:
@@ -381,14 +387,9 @@ impl AgentSessionEngine {
             // request into this recorder.
             children.set_semantic_edges(built.session.semantic_edges());
         }
-        *self.turn_agent.lock().expect("turn agent lock") =
-            Some(std::sync::Arc::clone(built.session.agent()));
-        {
-            let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
-            if let Some(handles) = handles {
-                let mut manager = handles.session.lock().await;
-                self.flush_pending_max_depth(&mut manager);
-            }
+        if let Some(handles) = self.built_handles() {
+            let mut manager = handles.goal.session.lock().await;
+            self.flush_pending_max_depth(&mut manager);
         }
         let pending_branch = self
             .pending_branch
@@ -436,6 +437,92 @@ impl AgentSessionEngine {
                 shared_branch = branch;
             }
         }
+        // The worker persisted accepted rows while this lazy session built.
+        // Keep its whole durable window, but seed the loop only through the
+        // stable pre-admission leaf. Content/timestamps are never deduplicated.
+        let prompt_context_boundary = self
+            .prompt_context_boundary
+            .lock()
+            .expect("prompt context boundary lock")
+            .clone();
+        let entries = pending_branch
+            .as_deref()
+            .or_else(|| {
+                shared_window
+                    .as_ref()
+                    .map(pa_core::session::window::WindowedSessionStore::entries)
+            })
+            .or(shared_branch.as_deref());
+        let mut admitted_user_ids = Vec::new();
+        if std::env::var_os("PA_COMPACTION_TRACE").is_some() {
+            pa_core::session_engine::compaction_trace::trace(
+                "daemon.lazy_restore_boundary",
+                &serde_json::json!({
+                    "kind": match &prompt_context_boundary {
+                        Some(PromptContextBoundary::Empty) => "empty",
+                        Some(PromptContextBoundary::Leaf(_)) => "leaf",
+                        None => "unset",
+                    },
+                    "retainedUserRows": entries.map_or(0, |entries| entries.iter().filter(|entry|
+                        matches!(entry, pa_types::session::FileEntry::Message {
+                            message: pa_types::session::AgentMessage::User(_), ..
+                        })).count()),
+                }),
+            );
+        }
+        let prompt_context = match prompt_context_boundary.as_ref() {
+            Some(boundary) => {
+                let mut after_boundary = matches!(boundary, PromptContextBoundary::Empty);
+                if let Some(entries) = entries {
+                    for entry in entries {
+                        if after_boundary {
+                            if let Some(id) = entry.id().filter(|_| {
+                                matches!(
+                                    entry,
+                                    pa_types::session::FileEntry::Message {
+                                        message: pa_types::session::AgentMessage::User(_),
+                                        ..
+                                    }
+                                )
+                            }) {
+                                admitted_user_ids.push(id.to_string());
+                            }
+                        } else if matches!(boundary, PromptContextBoundary::Leaf(leaf)
+                            if entry.id() == Some(leaf.as_str()))
+                        {
+                            after_boundary = true;
+                        }
+                    }
+                }
+                match boundary {
+                    PromptContextBoundary::Leaf(leaf) => {
+                        anyhow::ensure!(
+                            after_boundary,
+                            "prompt context boundary {leaf} is absent from the retained transcript"
+                        );
+                        Some(
+                            pa_core::session::build_session_context(
+                                entries.expect("a found boundary has entries"),
+                                Some(leaf),
+                            )
+                            .messages,
+                        )
+                    }
+                    PromptContextBoundary::Empty => Some(Vec::new()),
+                }
+            }
+            None => None,
+        };
+        if std::env::var_os("PA_COMPACTION_TRACE").is_some() {
+            pa_core::session_engine::compaction_trace::trace(
+                "daemon.lazy_restore_context",
+                &serde_json::json!({
+                    "priorUserRows": prompt_context.as_ref().map(|messages| messages.iter().filter(|message|
+                        matches!(message, pa_types::session::AgentMessage::User(_))).count()),
+                    "replayedUserRows": admitted_user_ids.len(),
+                }),
+            );
+        }
         if let Some(state) = seed {
             // The restore-resurrection guard: an active seed whose
             // trailing turn settled as a terminal provider failure adopts
@@ -467,36 +554,46 @@ impl AgentSessionEngine {
                     last_error: Some(error),
                     ..state.clone()
                 };
-                let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
-                if let Some(handles) = handles {
-                    let mut driver = handles.driver.lock().await;
+                if let Some(handles) = self.built_handles() {
+                    let mut driver = handles.goal.driver.lock().await;
                     driver.restore_from_persisted(terminal.clone());
                     drop(driver);
+                    // The published baseline keeps the RAW row: the first
+                    // `goal_update_if_changed` EMITS — the worker's durable
+                    // mirror is the ONE path the terminal row reaches the file.
+                    *handles.published_goal.lock().expect("published goal lock") = Some(state);
                 }
                 *self
                     .stale_goal_terminal_pending
                     .lock()
                     .expect("stale terminal pending lock") = Some(terminal);
-                // The published baseline keeps the RAW row: the first
-                // `goal_update_if_changed` EMITS — the worker's durable
-                // mirror is the ONE path the terminal row reaches the file.
-                *self.published_goal.lock().expect("published goal lock") = Some(state);
-            } else {
-                let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
-                if let Some(handles) = handles {
-                    let mut driver = handles.driver.lock().await;
-                    driver.restore_from_persisted(state.clone());
-                    drop(driver);
-                }
-                *self.published_goal.lock().expect("published goal lock") = Some(state);
+            } else if let Some(handles) = self.built_handles() {
+                let mut driver = handles.goal.driver.lock().await;
+                driver.restore_from_persisted(state.clone());
+                drop(driver);
+                *handles.published_goal.lock().expect("published goal lock") = Some(state);
             }
         }
         if let Some(entries) = pending_branch {
             built.session.rebuild_branch_context(entries).await?;
+            built
+                .session
+                .shared_persistence()
+                .lock()
+                .await
+                .replay_admitted_user_rows(admitted_user_ids)?;
+            if let Some(messages) = prompt_context {
+                built
+                    .session
+                    .agent()
+                    .set_messages(messages.iter().filter_map(json_round_trip).collect())
+                    .await;
+            }
             // A moved branch restores its own park (the early return would leave the previous
             // branch's park armed).
             self.restore_quota_park(built).await;
             self.flush_pending_stale_goal_terminal().await;
+            self.finish_prompt_context_adoption(prompt_context_boundary.as_ref());
             return Ok(());
         }
         // Restore the retained context and certified metadata without loading discarded bodies.
@@ -516,11 +613,37 @@ impl AgentSessionEngine {
             built.session.rebuild_branch_context(entries).await?;
             self.flush_pending_stale_goal_terminal().await;
         }
+        built
+            .session
+            .shared_persistence()
+            .lock()
+            .await
+            .replay_admitted_user_rows(admitted_user_ids)?;
+        if let Some(messages) = prompt_context {
+            built
+                .session
+                .agent()
+                .set_messages(messages.iter().filter_map(json_round_trip).collect())
+                .await;
+        }
         self.restore_quota_park(built).await;
         // The walk and replay allocated transient trees several times the
         // retained size: release the freed heap.
         pa_types::memory_release::trim_freed_heap();
+        self.finish_prompt_context_adoption(prompt_context_boundary.as_ref());
         Ok(())
+    }
+
+    /// Clear only the boundary this completed adoption observed. A failed
+    /// build keeps it for the demand retry, and a newer captured leaf survives.
+    fn finish_prompt_context_adoption(&self, adopted: Option<&PromptContextBoundary>) {
+        let mut current = self
+            .prompt_context_boundary
+            .lock()
+            .expect("prompt context boundary lock");
+        if current.as_ref() == adopted {
+            *current = None;
+        }
     }
 
     /// Scan the branch entries for the park this branch ended on and re-arm the live park state.
@@ -589,25 +712,19 @@ impl AgentSessionEngine {
     pub(crate) async fn retire_session_runtime(&self) {
         let _build = self.session_build.lock().await;
         let built = self.session.lock().await.take();
+        self.retire_handles();
+        *self
+            .prompt_context_boundary
+            .lock()
+            .expect("prompt context boundary lock") = None;
         *self
             .quota_park
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *self.goal_runtime.lock().expect("goal runtime lock") = None;
-        *self.turn_agent.lock().expect("turn agent lock") = None;
-        *self
-            .autonomous_boundary
-            .lock()
-            .expect("autonomous boundary lock") = None;
-        *self
-            .background_bash_probe
-            .lock()
-            .expect("background bash probe lock") = None;
-        *self
-            .kernel_release_probe
-            .lock()
-            .expect("kernel release probe lock") = None;
-        *self.published_goal.lock().expect("published goal lock") = None;
+        // The retired session's inbox goes with it: a replacement's
+        // build installs the next session's store, so a retired store
+        // can never serve reads or take appends across the swap.
+        self.clear_inbox();
         // The retired session's provider target goes with it: a pre-build demand seam resolves the
         // CURRENT model.
         *self.provider_target.write().expect("provider target lock") = None;
@@ -631,41 +748,6 @@ impl AgentSessionEngine {
         if let Some(engine) = guard.as_deref() {
             engine.dispose_kernel().await;
         }
-    }
-
-    /// Mark the session closed and retire the closed runtime's continuation
-    /// mirrors — a stopped session never continues.
-    ///
-    /// # Panics
-    ///
-    /// Panics when an internal mutex is poisoned.
-    pub fn mark_session_closed(&self) {
-        self.session_closed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        *self.goal_runtime.lock().expect("goal runtime lock") = None;
-        *self
-            .autonomous_boundary
-            .lock()
-            .expect("autonomous boundary lock") = None;
-        *self
-            .background_bash_probe
-            .lock()
-            .expect("background bash probe lock") = None;
-        *self
-            .kernel_release_probe
-            .lock()
-            .expect("kernel release probe lock") = None;
-    }
-
-    /// The create path's live reset: a fresh (or replaced) session starts live.
-    pub fn clear_session_closed(&self) {
-        self.session_closed
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    pub fn session_is_closed(&self) -> bool {
-        self.session_closed
-            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Session-scoped kernel shell activity; never builds a new session/kernel.
@@ -728,15 +810,17 @@ impl AgentSessionEngine {
     pub(crate) fn execute_session_command(
         &self,
         command: &pa_core::session_engine::slash_commands::SessionSlashCommand,
+        images: &[pa_agent::types::ImageContent],
+        compaction_abort: Option<&pa_agent::abort::AbortSignal>,
     ) -> anyhow::Result<SessionCommandExecution> {
         let model = self.session_model()?;
         self.ensure_core_session(&model)?;
-        let api_key = self.resolve_request_api_key(&model);
+        let (model, api_key) = self.resolve_request_target(model);
         let mut autonomous = self.autonomous.blocking_lock();
         let mut params = SessionCommandParams {
             model: &model,
+            compaction_abort,
             api_key,
-            global_harness_dir: self.config.agent_dir.clone(),
             autonomous: &mut autonomous,
         };
         // The lock covers the clone only: the command below can run a summarizer call, so the
@@ -748,7 +832,7 @@ impl AgentSessionEngine {
             .expect("session built by ensure_core_session");
         Ok(self
             .runtime
-            .block_on(async { execute_session_command(&core, &mut params, command).await }))
+            .block_on(async { execute_session_command(&core, &mut params, command, images).await }))
     }
 
     /// The current explicit selection (create-config flags over the
@@ -778,7 +862,7 @@ impl AgentSessionEngine {
         let mut handlers = HostRequestHandlers::default();
         register_agent_message_host_handlers(sender, &mut handlers);
         register_agent_observe_host_handlers(observer, &mut handlers);
-        self.register_bash_notice_host_handlers(&mut handlers);
+        self.register_kernel_notice_host_handlers(&mut handlers);
         Some(handlers)
     }
 
@@ -834,16 +918,63 @@ impl AgentSessionEngine {
 
         // The session's stream reads its target from the live slot:
         // `set_model` swaps it so the built session follows without a
-        // rebuild.
-        let stream_fn = switchable_stream_fn(std::sync::Arc::clone(&self.provider_target));
+        // rebuild, and the live-auth resolver overlays fresh request auth
+        // from the credential store on every provider call (the TS
+        // streamFn's per-call `getApiKeyAndHeaders`): a `/login` from
+        // another process or an OAuth refresh at expiry serves the next
+        // request without a restart. A resolution for a dead engine (the
+        // session torn down) fails the call with the resolution error —
+        // no stale captured pair ever streams.
+        self.rebuild_request_auth_registry();
+        let live_auth = {
+            let weak = self
+                .self_weak
+                .lock()
+                .expect("engine self-weak lock")
+                .clone();
+            std::sync::Arc::new(move |model: &Model| {
+                let Some(engine) = weak.as_ref().and_then(std::sync::Weak::upgrade) else {
+                    return pa_core::models::ResolvedRequestAuth::default();
+                };
+                engine.resolve_request_auth(model)
+            })
+        };
+        let stream_fn = switchable_stream_fn_with_live_auth(
+            std::sync::Arc::clone(&self.provider_target),
+            live_auth,
+        );
         {
-            let (api_key, headers) = self.resolve_request_key_and_headers(model);
+            // The build's slot install serializes with the other slot
+            // writers' fence (`set_model`, the failover switch and
+            // restore, the image-route apply/clear): the lock is
+            // acquired by yielding, never by blocking this worker: the
+            // holders run synchronous store I/O, so a blocking acquire
+            // on an async path would stall the executor for that span.
+            let _reload_serialized = loop {
+                match self.reload_lock.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::WouldBlock) => {}
+                    // The poisoned error CARRIES the acquired guard (the
+                    // panicking holder is gone, the lock is free): recover
+                    // it — a fresh .lock() here would wait on the guard
+                    // this match's scrutinee still holds.
+                    Err(std::sync::TryLockError::Poisoned(poison)) => break poison.into_inner(),
+                }
+                // Park, never hot-spin: the lock's holders run
+                // synchronous store I/O, and yield_now would leave this
+                // task immediately runnable through all of it.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
             let mut target = self.provider_target.write().expect("provider target lock");
+            // The daemon's only stream is the live-auth seam, which
+            // re-resolves request auth on every provider call; the
+            // slot's auth half is write-only here, so the build
+            // installs the model and the service tier only.
             *target = Some(ProviderTarget {
                 service_tier: *self.service_tier.read().expect("service tier lock"),
-                api_key,
+                api_key: None,
                 model: model.clone(),
-                headers,
+                headers: None,
             });
         }
         if let Some(session_dir) = &self.config.session_dir {
@@ -855,10 +986,29 @@ impl AgentSessionEngine {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // The session's agent inbox (the worker's notice sink routes
+        // `bash.completed`/`factory.progress` into it; the kernel reads
+        // it through `rlm.inbox.*`): the journal lives in the session's
+        // own artifact dir — the same per-session dir the kernel state
+        // and the harness state use — so a restart replays.
+        let inbox_dir = session_file
+            .as_deref()
+            .and_then(pa_core::session_engine::harness_digest::session_artifact_dir_for_log);
+        // A failed build leaves its published store behind: the next
+        // attempt over the same journal reuses it instead of racing a
+        // fresh open's compaction against its appends.
+        let inbox = pa_core::session_engine::inbox::SessionInbox::open_or_reuse(
+            self.inbox().as_ref(),
+            inbox_dir.as_deref(),
+        );
+        if let Some(hook) = self.inbox_read_hook() {
+            inbox.set_read_hook(hook);
+        }
+        self.set_inbox(std::sync::Arc::clone(&inbox));
         // The engine session stays non-persisted (the worker owns the
         // durable file); the configured session dir leads, the file's
         // parent is the fallback.
-        let session_manager = match self
+        let mut session_manager = match self
             .config
             .session_dir
             .as_deref()
@@ -872,6 +1022,19 @@ impl AgentSessionEngine {
             }
             None => pa_core::session::manager::SessionManager::in_memory(&cwd),
         };
+        // The in-memory manager takes the durable file's header id, as TS's engine opened the
+        // durable file: provider requests key prompt caching, Codex socket reuse, and session
+        // headers on it, so it must survive a resume in a new worker, a replacement build, and
+        // a daemon restart. A pathless session keeps the manager's own id.
+        if let Some(header) = session_file
+            .as_deref()
+            .and_then(pa_core::session::manager::read_session_header)
+        {
+            session_manager.new_session(&pa_core::session::manager::NewSessionOptions {
+                id: Some(header.id),
+                ..Default::default()
+            });
+        }
         if let Some(children) = &self.children {
             children.set_model(format!("{}/{}", model.provider, model.id));
         }
@@ -903,6 +1066,16 @@ impl AgentSessionEngine {
             .lock()
             .expect("goal queue purge lock")
             .clone();
+        let rlm_usage_store = self
+            .rlm_usage_store
+            .lock()
+            .expect("rlm usage store lock")
+            .clone();
+        let progress_note_emit = self
+            .progress_note_emit
+            .lock()
+            .expect("progress note emit lock")
+            .clone();
         // The kernel's last live background `bash()` handle settling
         // (or a mid-run teardown) retries the owed continuations. No
         // registered arc wires nothing.
@@ -933,6 +1106,23 @@ impl AgentSessionEngine {
             .expect("late agent message sink lock")
             .clone();
         pa_core::session_engine::engine::create_session(SessionEngineConfig {
+            cell_wake: Some(std::sync::Arc::clone(&self.cell_wake)),
+            on_background_cell: {
+                let weak = self
+                    .self_weak
+                    .lock()
+                    .expect("engine self weak lock")
+                    .clone();
+                weak.map(|weak| {
+                    std::sync::Arc::new(
+                        move |outcome: pa_core::kernel::shared::BackgroundCellOutcome| {
+                            if let Some(engine) = weak.upgrade() {
+                                engine.admit_background_cell_outcome(&outcome);
+                            }
+                        },
+                    ) as pa_core::kernel::shared::BackgroundCellCallback
+                })
+            },
             on_late_sent_agent_message,
             semantic_edges,
             telemetry,
@@ -945,12 +1135,10 @@ impl AgentSessionEngine {
             model: Some(agent_model),
             thinking_level: Some(map_thinking_level(self.effective_thinking())),
             stream_fn: Some(stream_fn),
-            // Model tools: `ipython` only; the engine adds the kernel-backed `ipython` tool itself.
+            // Model tools: `python_repl` only; the engine adds the kernel-backed `python_repl` tool itself.
             tools: vec![],
             custom_system_prompt: create_resources.system_prompt,
             prompt_guidelines: create_resources.append_system_prompt,
-            generic_mcp_servers: vec![],
-            allow_recursion: None,
             session_manager: Some(session_manager),
             extra_host_handlers: self.extra_host_handlers(),
             conversation_log_path: session_file,
@@ -960,15 +1148,83 @@ impl AgentSessionEngine {
             rlm_subagent_host: self.children.clone().map(|children| {
                 children as Arc<dyn pa_core::session_engine::rlm_host::RlmSubagentHost>
             }),
+            inbox: Some(inbox),
+            rlm_usage_store,
+            progress_note_emit,
             rlm_depth: Some(self.rlm_depth.load(std::sync::atomic::Ordering::Relaxed)),
+            factory_child: self
+                .factory_child
+                .load(std::sync::atomic::Ordering::Relaxed),
+            // The worker session runs under the daemon scheduler and its wake-ups.
+            daemonless: false,
             model_info: Some(model.clone()),
             // Prewarm; the depth gate keeps subagent workers lazy.
+            kernel_ready_gate: None,
             prewarm_ipython_kernel: Some(true),
             on_background_work_settled,
+            bash_notice_wake: None,
             // The worker-installed purge withdraws queued minted continuations.
             queued_goal_context_purge,
             // The steering lane owns the stop hooks (a queued steer cuts the next turn).
             queued_steering_probe: self.config.queued_steering_probe.clone(),
+            should_stop_after_turn: Some({
+                let session = Arc::downgrade(&self.session);
+                let target = Arc::clone(&self.provider_target);
+                let yielded = Arc::clone(&self.threshold_yielded);
+                let enabled = Arc::clone(&self.threshold_checks_enabled);
+                Arc::new(move |context| {
+                    let session = session.clone();
+                    let target = Arc::clone(&target);
+                    let yielded = Arc::clone(&yielded);
+                    let enabled = Arc::clone(&enabled);
+                    Box::pin(async move {
+                        if context.tool_results.is_empty() || !enabled.load(Ordering::SeqCst) {
+                            return Ok(false);
+                        }
+                        let Some(session) = session.upgrade() else {
+                            return Ok(false);
+                        };
+                        let engine = session.lock().await.clone();
+                        let Some(engine) = engine else {
+                            return Ok(false);
+                        };
+                        // Capture the actual serving model before AgentEnd clears a routed override.
+                        let model = target
+                            .read()
+                            .expect("provider target lock")
+                            .as_ref()
+                            .map(|target| target.model.clone());
+                        let Some(model) = model else { return Ok(false) };
+                        let agent = engine.session.agent();
+                        let thinking = match agent.model_override() {
+                            Some(route) => route.thinking_level,
+                            None => agent.state().await.thinking_level,
+                        };
+                        let messages = context
+                            .context
+                            .messages
+                            .iter()
+                            .filter_map(|message| serde_json::to_value(message).ok())
+                            .filter_map(|value| serde_json::from_value(value).ok())
+                            .collect::<Vec<_>>();
+                        let due = pa_core::session_engine::compaction::threshold_compaction_due(
+                            &messages,
+                            model.context_window,
+                            pa_core::session_engine::compaction::request_output_budget(
+                                &model,
+                                pa_core::session_engine::provider_adapter::model_thinking_level(
+                                    thinking,
+                                ),
+                            ),
+                            &engine.session.compaction_settings(),
+                        );
+                        if due {
+                            yielded.store(true, Ordering::SeqCst);
+                        }
+                        Ok(due)
+                    })
+                })
+            }),
             // Seeded from settings at create; the live switch updates the slot ahead of any later
             // build.
             steering_mode,

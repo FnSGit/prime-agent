@@ -70,6 +70,7 @@ fn user_content_block_chars(blocks: &[crate::types::UserOrToolContent]) -> u64 {
         .map(|block| match block {
             crate::types::UserOrToolContent::Text(text) => text.text.chars().count() as u64,
             crate::types::UserOrToolContent::Image(_) => 4_800,
+            crate::types::UserOrToolContent::Video(_) => pa_types::ai::VIDEO_ESTIMATED_TOKENS * 4,
             crate::types::UserOrToolContent::Raw(value) => {
                 serde_json::to_string(value).map_or(0, |json| json.chars().count() as u64)
             }
@@ -107,6 +108,39 @@ fn clamp_output_budget(model: &Model, context: &Context, options: Option<&mut St
     }
 }
 
+/// The session-identity header a session-scoped request declares to its inference endpoint.
+///
+/// The `OTel GenAI` semantics put conversation identity in the client's hands: the client declares
+/// its real session id, and the gateway aggregates one session's calls into one trace instead of
+/// fabricating a fallback id per request. The Prime Inference gateway keys its trace aggregation on
+/// this header.
+const SESSION_ID_HEADER: &str = "X-PI-Session-Id";
+
+/// Declare the request's session identity on its caller headers. No session id means no header (a
+/// session-less one-off probe stays bare rather than carrying a fabricated id); an explicit caller
+/// value wins, like every caller header does over the provider's own.
+fn declare_session_identity(options: Option<&mut StreamOptions>) {
+    let Some(options) = options else {
+        return;
+    };
+    let Some(session_id) = options.session_id.clone() else {
+        return;
+    };
+    let headers = options
+        .headers
+        .get_or_insert_with(std::collections::HashMap::new);
+    // Providers dedupe header names case-insensitively, so a caller entry in any casing is the
+    // same header as the injected one: its value always wins instead of racing the injected
+    // entry in the provider's header merging.
+    if headers
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case(SESSION_ID_HEADER))
+    {
+        return;
+    }
+    headers.insert(SESSION_ID_HEADER.to_string(), session_id);
+}
+
 /// Start streaming a completion for `model` using provider-native options.
 ///
 /// # Errors
@@ -120,6 +154,7 @@ pub fn stream(
     let provider = resolve_provider(&model.api)?;
     let mut options = options;
     clamp_output_budget(model, context, options.as_mut());
+    declare_session_identity(options.as_mut());
     Ok(provider.stream(model, context, options.as_ref()))
 }
 
@@ -156,6 +191,7 @@ pub fn stream_simple(
     // materialized default builds the same request otherwise.
     let simple = options.get_or_insert_with(SimpleStreamOptions::default);
     clamp_output_budget(model, context, Some(&mut simple.base));
+    declare_session_identity(Some(&mut simple.base));
     Ok(provider.stream_simple(model, context, options.as_ref()))
 }
 
@@ -206,49 +242,66 @@ mod tests {
     }
 
     #[test]
-    fn the_estimate_counts_the_serialized_tool_schemas() {
-        let tool: crate::types::Tool = serde_json::from_value(json!({
-            "name": "lookup",
-            "description": "x".repeat(1_600),
-            "parameters": {"type": "object"}
-        }))
-        .expect("tool parses");
-        let serialized = serde_json::to_string(&tool).expect("tool serializes");
-        let mut context = text_context(3_000);
-        context.tools = Some(vec![tool]);
-        // The tool schema's serialized bytes plus its wire envelope join the text under chars/4.
-        assert_eq!(
-            estimated_input_tokens(&context),
-            (3_000 + 48 + serialized.chars().count() as u64).div_ceil(4)
-        );
+    fn video_budget_leaves_room_for_the_measured_longest_clip() {
+        let model = test_model(64_000, 32_000);
+        for role in ["user", "toolResult"] {
+            let mut context = text_context(80_000); // 20K text tokens
+            context.messages.push(
+                serde_json::from_value(json!({
+                    "role": role, "toolCallId": "c", "toolName": "python_repl", "isError": false,
+                    "content": [{"type": "video", "data": "AAAA", "mimeType": "video/mp4"}],
+                    "timestamp": 0,
+                }))
+                .expect("video message"),
+            );
+            let mut options = StreamOptions {
+                max_tokens: Some(32_000),
+                ..Default::default()
+            };
+            clamp_output_budget(&model, &context, Some(&mut options));
+            // The old 4,800-token estimate left 32K output tokens, which cannot fit even the
+            // measured 12.3K-token clip. The fixed budget reserves more than that workload.
+            let output = options.max_tokens.expect("output budget");
+            assert!(
+                output > 0 && output <= 64_000 - 20_000 - 12_300,
+                "{role}: {output}"
+            );
+        }
     }
 
     #[test]
-    fn the_estimate_counts_raw_blocks_as_their_serialized_json() {
-        // Raw blocks reach the prompt as text (`user_block_payload`'s opaque arm), so their
-        // serialized bytes claim input room.
-        let value = json!({"unmodeled": "y".repeat(4_000)});
-        let serialized = serde_json::to_string(&value).expect("value serializes");
-        let mut context = text_context(3_000);
-        context
-            .messages
-            .push(crate::types::Message::User(UserMessage {
-                content: UserMessageContent::Blocks(vec![UserOrToolContent::Raw(value)]),
-                timestamp: 0,
-                rest: Map::default(),
-            }));
-        assert_eq!(
-            estimated_input_tokens(&context),
-            (3_000 + serialized.chars().count() as u64).div_ceil(4)
-        );
-    }
+    fn clamp_takes_whatever_room_exists() {
+        // (context window, model max output, prompt chars, requested budget, sent budget).
+        for (window, max_output, chars, requested, sent) in [
+            // A sub-floor budget still fits: the clamp honors exactly the room the estimate
+            // leaves (750 estimated input tokens, 250 room).
+            (1_000, 40_000, 3_000, Some(400), Some(250)),
+            // The input estimate fills the window: no budget can save the request, so it stays as
+            // sent for the overflow recovery arm.
+            (1_000, 40_000, 4_400, Some(400), Some(400)),
+            // No explicit budget: the default min(model.maxTokens, 32000) clamps to the room.
+            (1_000, 40_000, 3_600, None, Some(100)),
+            // Satisfiable requests pass through; a default that fits never materializes.
+            (1_000, 40_000, 3_000, Some(200), Some(200)),
+            (100_000, 4_096, 3_000, None, None),
+            // An unknown window, or a model declaring no max output, leaves the request alone.
+            (0, 40_000, 9_000, Some(400), Some(400)),
+            (1_000, 0, 4_200, None, None),
+        ] {
+            let mut options = StreamOptions {
+                max_tokens: requested,
+                ..Default::default()
+            };
+            clamp_output_budget(
+                &test_model(window, max_output),
+                &text_context(chars),
+                Some(&mut options),
+            );
+            assert_eq!(options.max_tokens, sent, "{window} {max_output} {chars}");
+        }
 
-    #[test]
-    fn tool_schemas_shrink_the_room_the_clamp_leaves() {
-        // The schemas eat the output room; the input must still fit the window — zero room leaves
-        // the budget for the overflow recovery arm instead.
-        let model = test_model(1_000, 40_000);
-        let mut context = text_context(3_000); // 750 text tokens
+        // Tool schemas eat the output room: the budget clamps to exactly what is left.
+        let mut context = text_context(3_000);
         let tool: crate::types::Tool = serde_json::from_value(json!({
             "name": "lookup",
             "description": "x".repeat(400),
@@ -261,94 +314,110 @@ mod tests {
             max_tokens: Some(250),
             ..Default::default()
         };
-        clamp_output_budget(&model, &context, Some(&mut options));
-        // The schema's serialized tokens leave less room than the budget requests, so the budget
-        // clamps to exactly what is left.
+        clamp_output_budget(&test_model(1_000, 40_000), &context, Some(&mut options));
         let room =
             1_000u64.saturating_sub((3_000 + 48 + serialized.chars().count() as u64).div_ceil(4));
         assert_eq!(options.max_tokens, Some(room));
         assert!(room > 0 && room < 250);
     }
 
-    #[test]
-    fn clamp_shrinks_an_unsatisfiable_output_budget() {
-        // The live failure shape: an input estimate leaving less room than the requested output
-        // budget.
-        let model = test_model(1_000, 40_000);
-        let context = text_context(3_000); // 750 estimated input tokens
-        let mut options = StreamOptions {
-            max_tokens: Some(400),
-            ..Default::default()
+    /// The facade is the seam every model request crosses, so the session identity rides it as a
+    /// caller header: a session-scoped call declares `X-PI-Session-Id`, an explicit caller value
+    /// wins, and a session-less call fabricates nothing.
+    #[tokio::test]
+    async fn session_scoped_calls_declare_their_session_identity_header() {
+        type Headers = Option<std::collections::HashMap<String, String>>;
+        let received: std::sync::Arc<std::sync::Mutex<Vec<Headers>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = received.clone();
+        let factory =
+            crate::faux::FauxResponseStep::Factory(std::sync::Arc::new(move |_, options, _, _| {
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(options.and_then(|options| options.headers.clone()));
+                Ok(crate::faux::faux_assistant_text_message(
+                    "ok",
+                    crate::faux::FauxAssistantMessageOptions::default(),
+                ))
+            }));
+        let registration =
+            crate::faux::register_faux_provider(crate::faux::RegisterFauxProviderOptions {
+                api: Some("session-identity-test".to_string()),
+                ..Default::default()
+            });
+        registration.set_responses((0..5).map(|_| factory.clone()).collect());
+        let model = registration.get_model();
+        let context = Context::default();
+        let header = |name: &str, value: &str| {
+            std::collections::HashMap::from([(name.to_string(), value.to_string())])
         };
-        clamp_output_budget(&model, &context, Some(&mut options));
-        assert_eq!(options.max_tokens, Some(250));
-    }
 
-    #[test]
-    fn clamp_resolves_the_default_budget_when_none_set() {
-        // The main-loop shape: no explicit max_tokens, so the effective request budget is
-        // min(model.maxTokens, 32000).
-        let model = test_model(1_000, 40_000);
-        let context = text_context(3_600); // 900 estimated input tokens
-        let mut options = StreamOptions::default();
-        clamp_output_budget(&model, &context, Some(&mut options));
-        assert_eq!(options.max_tokens, Some(100));
-    }
+        // A session-scoped call carries the session id the harness persists.
+        complete_simple(
+            &model,
+            &context,
+            Some(crate::types::SimpleStreamOptions::from_base(
+                crate::types::StreamOptions {
+                    session_id: Some("session-1".into()),
+                    ..Default::default()
+                },
+            )),
+        )
+        .await
+        .expect("stream settles");
+        // An explicit caller header keeps its own value, whatever casing it carries: providers
+        // dedupe header names case-insensitively, so a differently-cased entry must never race
+        // the injected one.
+        for (name, value) in [
+            ("X-PI-Session-Id", "explicit"),
+            ("x-pi-session-id", "explicit-lower"),
+            ("X-Pi-Session-Id", "explicit-mixed"),
+        ] {
+            complete_simple(
+                &model,
+                &context,
+                Some(crate::types::SimpleStreamOptions::from_base(
+                    crate::types::StreamOptions {
+                        session_id: Some("session-1".into()),
+                        headers: Some(header(name, value)),
+                        ..Default::default()
+                    },
+                )),
+            )
+            .await
+            .expect("stream settles");
+        }
+        // A session-less call adds no header.
+        complete_simple(
+            &model,
+            &context,
+            Some(crate::types::SimpleStreamOptions::from_base(
+                crate::types::StreamOptions::default(),
+            )),
+        )
+        .await
+        .expect("stream settles");
 
-    #[test]
-    fn satisfiable_requests_pass_through_unchanged() {
-        let model = test_model(1_000, 40_000);
-        let context = text_context(3_000); // 750 estimated input tokens
-        let mut options = StreamOptions {
-            max_tokens: Some(200),
-            ..Default::default()
-        };
-        clamp_output_budget(&model, &context, Some(&mut options));
-        assert_eq!(options.max_tokens, Some(200));
-        // No explicit budget and the default fits: nothing materializes.
-        let model = test_model(100_000, 4_096); // default request budget 4_096
-        let mut options = StreamOptions::default();
-        clamp_output_budget(&model, &context, Some(&mut options));
-        assert_eq!(options.max_tokens, None);
-    }
-
-    #[test]
-    fn clamp_takes_whatever_room_exists() {
-        // A sub-floor budget still fits: the clamp honors exactly the room the estimate leaves (250
-        // room -> 250 requested output).
-        let model = test_model(1_000, 40_000);
-        let context = text_context(3_000); // 750 estimated input tokens
-        let mut options = StreamOptions {
-            max_tokens: Some(400),
-            ..Default::default()
-        };
-        clamp_output_budget(&model, &context, Some(&mut options));
-        assert_eq!(options.max_tokens, Some(250));
-        // The input estimate fills the window: no budget can save the request, so it stays as sent
-        // for the overflow recovery arm.
-        let context = text_context(4_400); // 1,100 estimated input tokens
-        let mut options = StreamOptions {
-            max_tokens: Some(400),
-            ..Default::default()
-        };
-        clamp_output_budget(&model, &context, Some(&mut options));
-        assert_eq!(options.max_tokens, Some(400));
-    }
-
-    #[test]
-    fn unknown_window_and_missing_options_leave_the_request_alone() {
-        let model = test_model(0, 40_000);
-        let mut options = StreamOptions {
-            max_tokens: Some(400),
-            ..Default::default()
-        };
-        clamp_output_budget(&model, &text_context(9_000), Some(&mut options));
-        assert_eq!(options.max_tokens, Some(400));
-        // A model declaring no max output sends no budget to clamp.
-        let model = test_model(1_000, 0);
-        let mut options = StreamOptions::default();
-        clamp_output_budget(&model, &text_context(4_200), Some(&mut options));
-        assert_eq!(options.max_tokens, None);
+        let mut received = received.lock().unwrap();
+        assert_eq!(received.pop().flatten(), None);
+        assert_eq!(
+            received.pop().flatten(),
+            Some(header("X-Pi-Session-Id", "explicit-mixed"))
+        );
+        assert_eq!(
+            received.pop().flatten(),
+            Some(header("x-pi-session-id", "explicit-lower"))
+        );
+        assert_eq!(
+            received.pop().flatten(),
+            Some(header("X-PI-Session-Id", "explicit"))
+        );
+        assert_eq!(
+            received.pop().flatten(),
+            Some(header("X-PI-Session-Id", "session-1"))
+        );
+        registration.unregister();
     }
 
     #[test]

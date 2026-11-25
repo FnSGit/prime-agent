@@ -9,6 +9,7 @@ use pa_agent::types::{
     AgentTool, AgentToolResult, AgentToolUpdateCallback,
     ToolExecutionMode as LoopToolExecutionMode, ToolResultContent,
 };
+use pa_types::ai::{is_python_tool_name, PYTHON_TOOL_NAME};
 
 use crate::tools::tool_definition::{ExecutionMode, ToolDefinition, ToolExecutionResult};
 
@@ -40,6 +41,9 @@ fn convert_content_blocks(
             crate::tools::tool_definition::ToolContentBlock::Image { data, mime_type } => {
                 ToolResultContent::Image(pa_agent::types::ImageContent { data, mime_type })
             }
+            crate::tools::tool_definition::ToolContentBlock::Video { data, mime_type } => {
+                ToolResultContent::Video(pa_agent::types::VideoContent { data, mime_type })
+            }
         })
         .collect()
 }
@@ -66,6 +70,10 @@ impl AgentTool for ToolDefinitionBridge {
             .prepare_arguments
             .as_ref()
             .map(|prepare| prepare(args.clone()))
+    }
+
+    fn accepts_alias(&self, name: &str) -> bool {
+        self.definition.name == PYTHON_TOOL_NAME && is_python_tool_name(name)
     }
 
     fn execute(
@@ -105,11 +113,12 @@ impl AgentTool for ToolDefinitionBridge {
                 f(&tool_call_id, params, Some(abort), tool_on_update).await?;
             let details = result.details.clone().unwrap_or(serde_json::Value::Null);
             let is_error = result.is_error;
+            let terminate = result.terminate;
             let _ = is_error;
             Ok(AgentToolResult {
                 content: convert_content(result),
                 details,
-                terminate: None,
+                terminate,
             })
         })
     }

@@ -15,6 +15,8 @@
 // fn-length gate is style, not correctness).
 #![allow(clippy::too_many_lines)]
 #![cfg(unix)]
+// Two of the three tests are Linux-only; their imports and helpers idle elsewhere.
+#![cfg_attr(not(target_os = "linux"), allow(unused_imports, dead_code))]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -27,7 +29,7 @@ use serde_json::{json, Value};
 
 use pa_core::kernel::shared::{HostRequestHandlers, HostRequestPayload};
 use pa_core::session_engine::agent_messaging::register_agent_message_host_handlers;
-use pa_core::session_engine::rlm_host::{RlmSpawnRequest, RlmSubagentHost};
+use pa_core::session_engine::rlm_host::{RlmSpawnKind, RlmSpawnRequest, RlmSubagentHost};
 use pa_daemon::agent_messaging::LinkAgentMessageController;
 use pa_daemon::rlm_children::{ParentIdentity, SupervisorChildSessions};
 use pa_daemon::supervisor_link::SupervisorLink;
@@ -204,6 +206,8 @@ fn write_faux_script(dir: &Path, name: &str, responses: &Value) -> PathBuf {
 /// the parent's roster row (done — the POSITIVE verdict), the parent's
 /// `agent_message.send` WAKES a fresh worker over the child's session
 /// file and delivers.
+// Worker liveness and identity are read from /proc: Linux only.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message() {
     let Some(kernel_python) = kernel_python() else {
@@ -216,9 +220,13 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
     std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
     // The idle-eviction threshold both sides read (the worker's park arm and the
     // supervisor's fence): the settings-driven shape the VM census measures.
+    // The revival's wake oracle reads the delivered message's row in the
+    // child's session file, and the default inbox route delivers a short
+    // notice with the message in the durable inbox instead, so this suite
+    // pins the direct route; the inbox route is covered by `agent_inbox_e2e`.
     std::fs::write(
         agent_dir.join("settings.json"),
-        json!({ "idleEvictionMinutes": 1 }).to_string(),
+        json!({ "idleEvictionMinutes": 1, "agentInbox": { "enabled": false } }).to_string(),
     )
     .expect("write settings");
 
@@ -276,6 +284,7 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
             agent_dir.clone(),
             /*telemetry_disabled*/ true,
         )),
+        String::new(),
     );
     children.set_identity(ParentIdentity {
         rlm_depth: 0,
@@ -293,8 +302,10 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
             name: Some("parked-kid".to_string()),
             model: None,
             thinking: None,
-            cell_source_code: None,
+            cwd: None,
+            kind: RlmSpawnKind::Subagent,
             spawned_by_request_id: None,
+            factory: None,
         })
         .await
         .expect("spawn the child");
@@ -443,7 +454,6 @@ async fn a_settled_child_passivates_stays_listable_and_revives_by_agent_message(
             "receiver_role": "child",
             "receiver_name": "parked-kid",
         }),
-        cell_source_code: None,
     })
     .await
     .expect("the send must wake the passivated child and deliver");
@@ -594,6 +604,7 @@ async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_chil
             agent_dir.clone(),
             /*telemetry_disabled*/ true,
         )),
+        String::new(),
     );
     children.set_identity(ParentIdentity {
         rlm_depth: 0,
@@ -611,8 +622,10 @@ async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_chil
             name: Some("parked-kid".to_string()),
             model: None,
             thinking: None,
-            cell_source_code: None,
+            cwd: None,
+            kind: RlmSpawnKind::Subagent,
             spawned_by_request_id: None,
+            factory: None,
         })
         .await
         .expect("spawn the child");
@@ -782,6 +795,8 @@ async fn a_parent_rename_after_a_revival_and_second_passivation_reaches_the_chil
 /// (TS `canEvictWorker` reaches roots and children alike) and resumes
 /// by its durable session id: the attach wakes a fresh worker over the
 /// saved file and the snapshot carries the pre-passivation transcript.
+// Worker liveness and identity are read from /proc: Linux only.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn an_idle_root_passivates_and_resumes_by_its_durable_id_with_its_transcript() {
     let Some(kernel_python) = kernel_python() else {

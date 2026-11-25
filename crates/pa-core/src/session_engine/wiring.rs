@@ -1,6 +1,6 @@
 use super::{
-    auxiliary_model, compaction, compaction_exec, image_model_routing, ipython_state,
-    provider_adapter, refine, semantic_edges, telemetry, AgentSession, PromptBatchRow,
+    auxiliary_model, compaction, compaction_exec, image_model_routing, ipython_state, model_usage,
+    provider_adapter, refine, rlm_usage, semantic_edges, telemetry, AgentSession, PromptBatchRow,
 };
 
 impl AgentSession {
@@ -102,6 +102,36 @@ impl AgentSession {
         self.skill_telemetry = Some(telemetry);
     }
 
+    /// Bind the durable store the session's `model_usage` rows append to.
+    pub fn set_usage_store(&mut self, store: std::sync::Arc<dyn rlm_usage::RlmChildUsageStore>) {
+        self.usage_store = store;
+    }
+
+    /// Record one billed model call made outside the agent loop. A failed
+    /// append is logged; the call's result stands either way. Once handed
+    /// off, the append survives cancellation of this caller, and it lands
+    /// only in this session.
+    pub async fn record_model_usage(&self, usage: Option<model_usage::ModelUsage>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        let session = std::sync::Arc::clone(&self.session);
+        let store = std::sync::Arc::clone(&self.usage_store);
+        // The task owns the resolved bill before the first await. Dropping
+        // its JoinHandle detaches the append instead of dropping the bill.
+        // This session's manager never moves to another session, so the id
+        // read inside the task is still the one the bill was made in.
+        let recording = tokio::spawn(async move {
+            let session_id = session.lock().await.get_session_id().to_string();
+            if let Err(error) = store.append_model_usage(session_id, usage).await {
+                eprintln!("pa-core: model usage row not persisted: {error}");
+            }
+        });
+        if let Err(error) = recording.await {
+            eprintln!("pa-core: model usage recording task failed: {error}");
+        }
+    }
+
     /// Bind the auto-refine surface for this session: whether the session may
     /// auto-refine (TS `_autoRefineAllowedForSession`: depth 0 with a local
     /// harness state dir) and the resolved gates.
@@ -147,7 +177,7 @@ impl AgentSession {
 
     /// Whether the session may run auto-refinement.
     pub fn auto_refine_allowed(&self) -> bool {
-        self.auto_refine_allowed
+        self.auto_refine_allowed && self.harness_refinements_enabled()
     }
 
     /// The resolved auto-refine gates.
@@ -167,10 +197,19 @@ impl AgentSession {
     /// The resolved compaction settings: the in-run continuation consult reads the threshold
     /// headroom without owning the session (a compaction in flight owns it across its model turn).
     pub fn compaction_settings(&self) -> compaction::CompactionSettings {
-        *self
+        let mut resolved = *self
             .compaction
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Read only the percentage at decision boundaries, off the paint path.
+        // Like auxiliary-model routing, another client's settings save applies
+        // to an already-running session without changing manual summary budgets.
+        if let Some(context) = &self.auxiliary_model {
+            resolved.threshold_percent =
+                crate::settings::SettingsManager::create(&context.cwd, &context.agent_dir)
+                    .get_compaction_threshold_percent();
+        }
+        resolved
     }
 
     /// Install the session's semantic-edge recorder (the engine build's

@@ -1,10 +1,11 @@
 //! The agent-session engine's model concern: the startup/restore
 //! model-resolution cluster (the TS `createAgentSession` chain), the
-//! session's live-model and thinking-level surfaces, the request API-key
-//! seam, and the persisted max-depth read.
+//! session's live-model and thinking-level surfaces, and the request
+//! API-key seam.
 
 use super::{
-    AgentSessionEngine, EngineModelSelection, Model, RestoredSessionModel, SessionEngine, Value,
+    AgentSessionEngine, EngineModelSelection, Model, RestoredSessionModel, SessionEngine,
+    StartupScope,
 };
 
 impl AgentSessionEngine {
@@ -15,28 +16,84 @@ impl AgentSessionEngine {
         let all: Vec<Model> = registry.get_all().to_vec();
         let settings =
             pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
+        let default = settings
+            .get_default_provider()
+            .zip(settings.get_default_model())
+            .map(|(provider, model)| (provider.to_string(), model.to_string()));
         // The create-time `--models` scope: a fresh session starts on the
         // saved default when in scope, else the first scoped model.
-        let (scoped_models, is_continuing) = match self
+        let scope = self
             .startup_scope
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-        {
-            Some(scope) => (scope.scoped_models, scope.is_continuing),
-            None => (Vec::new(), false),
-        };
-        pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
+            .unwrap_or_default();
+        let resolved = pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
             cli_provider: None,
             cli_model: None,
-            scoped_models: &scoped_models,
-            is_continuing,
-            default_provider: settings.get_default_provider(),
-            default_model_id: settings.get_default_model(),
+            scoped_models: &scope.scoped_models,
+            is_continuing: scope.is_continuing,
+            default_provider: default.as_ref().map(|(provider, _)| provider.as_str()),
+            default_model_id: default.as_ref().map(|(_, model)| model.as_str()),
             all_models: &all,
             available_models: &available,
         })
-        .or_else(|| all.first().cloned())
+        .or_else(|| all.first().cloned());
+        if let (Some(model), Some(default)) = (&resolved, &default) {
+            self.record_startup_default_fallback(model, default, &scope, &available, &all);
+        }
+        resolved
+    }
+
+    fn record_startup_default_fallback(
+        &self,
+        model: &Model,
+        default: &(String, String),
+        scope: &StartupScope,
+        available_models: &[Model],
+        all_models: &[Model],
+    ) {
+        let (provider, model_id) = default;
+        if scope.is_continuing || (model.provider == *provider && model.id == *model_id) {
+            return;
+        }
+        let session_file = self
+            .session_file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_default();
+        let mut decision = self
+            .restored_model
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if decision
+            .as_ref()
+            .is_some_and(|decision| decision.session_file == session_file)
+        {
+            return;
+        }
+        let wanted = scope.patterns.is_empty()
+            || pa_core::models::scope_patterns_select_reference(
+                &scope.patterns,
+                provider,
+                model_id,
+                available_models,
+                all_models,
+            );
+        if !wanted {
+            return;
+        }
+        let message = format!(
+            "Default model {provider}/{model_id} is not available. Using {}/{}",
+            model.provider, model.id
+        );
+        eprintln!("{message}");
+        *decision = Some(RestoredSessionModel {
+            session_file,
+            model: None,
+            fallback_message: Some(message),
+        });
     }
 
     /// The runtime-config reset at every session restore: the create's own
@@ -121,7 +178,6 @@ impl AgentSessionEngine {
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
         let mut registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
-        registry.load_private_authorization_from_cache();
         let restored = pa_core::models::find_session_model_with_readiness_wait(
             &mut registry,
             &provider,
@@ -215,12 +271,8 @@ impl AgentSessionEngine {
     /// arm or the startup chain.
     fn resolve_registry_model_unchecked(&self) -> anyhow::Result<Model> {
         let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
-        let mut registry =
+        let registry =
             pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
-        // A fresh registry gates private Prime Inference models out until the
-        // async authorization refresh runs; adopt the on-disk cache so
-        // create-time resolution can pick the session's private model.
-        registry.load_private_authorization_from_cache();
         let selection = self.current_selection();
         let Some(model_name) = selection.model.as_deref() else {
             if let Some(model) = self.restored_model_resolution(&registry) {
@@ -242,9 +294,33 @@ impl AgentSessionEngine {
         if let Some(error) = resolved.error {
             anyhow::bail!("{error}");
         }
+        self.model_resolution_warning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .latest = resolved.warning;
         resolved
             .model
             .ok_or_else(|| anyhow::anyhow!("No matching model found."))
+    }
+
+    /// The latest resolution's warning while no turn has emitted it.
+    pub(super) fn unshown_model_resolution_warning(&self) -> Option<String> {
+        let warning = self
+            .model_resolution_warning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if warning.latest == warning.shown {
+            return None;
+        }
+        warning.latest.clone()
+    }
+
+    /// Record the warning a turn emitted as a row.
+    pub(super) fn mark_model_resolution_warning_shown(&self, warning: String) {
+        self.model_resolution_warning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .shown = Some(warning);
     }
 
     /// Test seam: a scripted faux provider (same script contract as pa-cli's
@@ -255,7 +331,7 @@ impl AgentSessionEngine {
     ///
     /// The script model serves the session while the selection is unset or
     /// names it; any other selection resolves through the registry (a
-    /// models.json faux-api model streams through the same registered
+    /// models.json faux-api model streams through this engine's scripted
     /// provider).
     pub(crate) fn resolve_model(&self) -> anyhow::Result<Model> {
         if let Some(script) = &self.config.faux_script {
@@ -278,7 +354,11 @@ impl AgentSessionEngine {
             if names_script_model {
                 return Ok(model);
             }
-            return self.resolve_registry_model();
+            let mut resolved = self.resolve_registry_model()?;
+            if resolved.api == "faux" {
+                resolved.api = model.api;
+            }
+            return Ok(resolved);
         }
         self.resolve_registry_model()
     }
@@ -363,82 +443,143 @@ impl AgentSessionEngine {
         resolved
     }
 
-    /// The request-time api key AND its resolved provider headers (the
-    /// selection's own headers lead; the registry resolves the model's
-    /// otherwise): models needing custom or auth headers send them on every
-    /// request.
-    pub(crate) fn resolve_request_key_and_headers(
+    /// The full request-auth resolution: the registry's single lookup —
+    /// possibly refreshing an expired OAuth token through the engine's
+    /// OAuth integration. `request_model` carries the per-call xAI
+    /// request model the lookup serves (TS `requestModel`); other
+    /// providers leave it unset.
+    ///
+    /// The create-config key rides the store's runtime-override arm (TS
+    /// installs `--api-key` with `setRuntimeApiKey` before lookup, v0.9.8
+    /// main.ts:862), so the registry's resolution — the key, the headers,
+    /// and the xAI request model — follows one winning source: a stored
+    /// subscription never re-shapes a session the config keys
+    /// explicitly, and a mid-session `/login` never switches the request
+    /// model under the override.
+    ///
+    /// The engine keeps one request-auth `ModelRegistry`, and with it one
+    /// `AuthStorage`, for its life — TS's single registry and auth-storage
+    /// instance, whose `reload()` keeps the last read's data on a read
+    /// error (v0.9.8 auth-storage.ts:674-687): a failed store read is NOT a
+    /// logout. While another writer holds the auth document's lock, or
+    /// while auth.json does not parse, the runtime override and the
+    /// last-read credential keep serving, and the lookup's own arms still
+    /// answer environment keys and the configured `models.json` fallback —
+    /// exactly what a healthy store that holds nothing for the provider
+    /// would serve. The registry re-reads `models.json` only at
+    /// [`Self::rebuild_request_auth_registry`].
+    ///
+    /// The live session's stream consults this per provider call through
+    /// the resolver `build_session` wires, so a credential rotated by
+    /// another process (`/login`) or an OAuth token refreshed at expiry
+    /// serves the next request without a restart. The resolution is
+    /// blocking I/O; the stream seam runs it off the executor under the
+    /// turn's abort signal.
+    pub(crate) fn resolve_request_auth(
         &self,
         model: &Model,
-    ) -> (
-        Option<String>,
-        Option<std::collections::BTreeMap<String, String>>,
-    ) {
-        let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
-        let mut registry =
-            pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
+    ) -> pa_core::models::ResolvedRequestAuth {
+        // Poison recovery (the repo's pattern): a panic inside one
+        // resolution must not break every later provider call — the
+        // poisoned slot is already `None` (the panicked call took the
+        // registry and never returned it), so the next call rebuilds it.
+        let mut slot = self
+            .request_auth_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut registry = slot
+            .take()
+            .unwrap_or_else(|| self.new_request_auth_registry(None));
+        // The per-call reload keeps the resolution live: a credential
+        // another process wrote serves the next call, and a failed read
+        // keeps the last read's data (TS `this.data`).
+        registry.auth.reload();
+        match &self.current_selection().api_key {
+            Some(api_key) => registry
+                .auth
+                .set_runtime_api_key(&model.provider, api_key.clone()),
+            None => registry.auth.remove_runtime_api_key(&model.provider),
+        }
+        // The registry's single possibly-refreshing lookup answers the key,
+        // the headers, the request model, and whether a live source served
+        // (the lookup may OAuth-refresh and store a fresh token); a second
+        // refreshing lookup here would re-fetch a token the first just
+        // failed to refresh.
         let resolved = registry.get_api_key_and_headers(model, model.headers.as_ref());
-        if let Some(api_key) = &self.current_selection().api_key {
-            // The create-config key override pins the key, never the headers:
-            // the registry's merged headers still ship, exactly like the TS
-            // `getApiKeyAndHeaders` override path.
-            return (Some(api_key.clone()), resolved.headers);
+        // The registry returns to the engine carrying whatever the lookup
+        // refreshed: the next call's last-read data is the freshest.
+        *slot = Some(registry);
+        resolved
+    }
+
+    /// Force-refresh the OAuth credential `provider` rejected, on the store
+    /// the per-call resolution reads (its last read served the rejected call).
+    pub(crate) fn refresh_rejected_request_auth(
+        &self,
+        provider: &str,
+    ) -> Result<(), pa_core::auth::OAuthRefreshFailure> {
+        self.request_auth_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_mut()
+            .map_or(Ok(()), |registry| {
+                registry.auth.refresh_rejected_oauth(provider)
+            })
+    }
+
+    /// Request auth for a model call outside the session stream
+    /// (compaction, branch summary, refine, the turn boundary, session
+    /// slash commands): the live resolution's key and the model shaped for
+    /// the credential that serves it (the xAI request model).
+    pub(crate) fn resolve_request_target(&self, model: Model) -> (Model, Option<String>) {
+        let resolved = self.resolve_request_auth(&model);
+        (resolved.request_model.unwrap_or(model), resolved.api_key)
+    }
+
+    /// Rebuild the request-auth registry over the engine's store: the
+    /// session build and a model switch re-read `models.json` here (where
+    /// main re-resolved request auth through a fresh registry), never a
+    /// provider call. The store carries over, keeping its last read.
+    /// Construction resolves the Prime Inference credential for the
+    /// catalog layer, so a stored `!command` runs at most once per rebuild.
+    pub(crate) fn rebuild_request_auth_registry(&self) {
+        let mut slot = self
+            .request_auth_registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let auth = slot.take().map(|registry| registry.auth);
+        *slot = Some(self.new_request_auth_registry(auth));
+    }
+
+    fn new_request_auth_registry(
+        &self,
+        auth: Option<pa_core::auth::AuthStorage>,
+    ) -> pa_core::models::ModelRegistry {
+        let auth = auth.unwrap_or_else(|| {
+            pa_core::auth::AuthStorage::create_with_oauth(
+                &self.config.agent_dir,
+                std::sync::Arc::clone(&self.request_auth_oauth),
+            )
+        });
+        pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"))
+    }
+
+    /// The primary target a failover episode restores: the captured
+    /// model with the serving service tier. Request auth needs no
+    /// restore — the live session's stream re-resolves it from the
+    /// credential store on every provider call, so the slot's auth half
+    /// is write-only for the daemon's stream.
+    pub(crate) fn restored_primary_target(
+        &self,
+        primary: &Model,
+    ) -> pa_core::session_engine::provider_adapter::ProviderTarget {
+        pa_core::session_engine::provider_adapter::ProviderTarget {
+            service_tier: *self.service_tier.read().expect("service tier lock"),
+            api_key: None,
+            model: primary.clone(),
+            headers: None,
         }
-        (resolved.api_key, resolved.headers)
     }
-
-    pub(crate) fn resolve_request_api_key(&self, model: &Model) -> Option<String> {
-        if let Some(api_key) = &self.current_selection().api_key {
-            return Some(api_key.clone());
-        }
-        let auth = pa_core::auth::AuthStorage::create(&self.config.agent_dir);
-        let mut registry =
-            pa_core::models::ModelRegistry::create(auth, self.config.agent_dir.join("models.json"));
-        registry
-            .get_api_key_and_headers(model, model.headers.as_ref())
-            .api_key
-    }
-}
-
-/// The last persisted `rlm_max_depth_state` custom entry in a session
-/// file (TS `_loadPersistedRlmMaxDepthState`): the chat override a resumed
-/// session re-seeds its depth bound from. `None` when absent or unreadable.
-/// Same contract as the reference oracle (`agent_engine/tests.rs`): whole
-/// file valid UTF-8, newest-first, malformed lines skip.
-pub(crate) fn persisted_rlm_max_depth(path: Option<&str>) -> Option<u64> {
-    let path = std::path::Path::new(path?);
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(
-        &mut std::io::BufReader::new(std::fs::File::open(path).ok()?),
-        &mut bytes,
-    )
-    .ok()?;
-    let content = std::str::from_utf8(&bytes).ok()?;
-    content
-        .lines()
-        .rev()
-        // The exact union gate: a matching row's raw text carries either the
-        // `customType` literal or a `\u`-escape (serde never letter-escapes),
-        // so the union admits every line the reference could match;
-        // `rlm_max_depth_row` judges the candidates by the decoded fields.
-        .filter(|line| line.contains("rlm_max_depth_state") || line.contains("\\u"))
-        .find_map(rlm_max_depth_row)
-}
-
-/// One candidate line's depth bound: `Some(depth)` for a matching custom
-/// row with a parseable `data.maxDepth`, `None` otherwise.
-fn rlm_max_depth_row(line: &str) -> Option<u64> {
-    let value: Value = serde_json::from_str(line.trim()).ok()?;
-    if value.get("type").and_then(Value::as_str) != Some("custom") {
-        return None;
-    }
-    if value.get("customType").and_then(Value::as_str) != Some("rlm_max_depth_state") {
-        return None;
-    }
-    value
-        .get("data")
-        .and_then(|data| data.get("maxDepth"))
-        .and_then(Value::as_u64)
 }
 
 /// The saved model context of a session file: the pinned `(provider,

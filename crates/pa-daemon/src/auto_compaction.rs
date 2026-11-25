@@ -20,9 +20,21 @@ pub(crate) enum AutoCompactionRun {
     /// The check fired and a compaction ran (success, skip, or failure —
     /// the `compaction_start`/`compaction_end` pair went out either way).
     Ran,
+    /// A summary committed and the retained context replaced the old context.
+    Compacted,
     /// The emit callback cancelled the run (an aborted turn): the caller
     /// stops the turn loop like any other cancelled emit.
     Cancelled,
+}
+
+impl AutoCompactionRun {
+    /// Whether in-run threshold checks stay armed after this boundary
+    /// outcome: a summary attempt that failed to commit suppresses the
+    /// rest of the run's checks; a committed summary and a plain
+    /// not-due recheck keep them armed.
+    pub(crate) fn continues_threshold_checks(self) -> bool {
+        !matches!(self, Self::Ran)
+    }
 }
 
 impl AgentSessionEngine {
@@ -81,7 +93,7 @@ impl AgentSessionEngine {
                 .lock()
                 .expect("auto compaction abort lock") = Some(std::sync::Arc::clone(&controller));
         }
-        let api_key = self.resolve_request_api_key(&model);
+        let (model, api_key) = self.resolve_request_target(model);
         // The lock covers the clone only; the summarizer call below must not ride it.
         let engine = self.session.blocking_lock().clone();
         let Some(engine) = engine else {
@@ -89,41 +101,35 @@ impl AgentSessionEngine {
             return AutoCompactionRun::NotDue;
         };
         let outcome = {
-            // The abort race drops the summarizer request in flight; the
-            // signal also lands the pre-commit check inside the compaction.
-            let compact = async {
-                engine
-                    .session
-                    .compact(None, &model, api_key, Some(&signal))
-                    .await
-            };
-            let outcome = self
-                .runtime
-                .block_on(pa_agent::abort::race_with_abort(compact, &signal));
+            // The signal drops the summarizer request in flight and lands the
+            // pre-commit check; a committed compaction finishes.
+            let outcome =
+                self.runtime
+                    .block_on(engine.session.compact(None, &model, api_key, Some(&signal)));
             self.clear_auto_compaction_abort(&controller);
             outcome
         };
         pa_core::session_engine::compaction_trace::trace(
             "auto.compact_returned",
             &(match &outcome {
-                Ok(Ok(CompactOutcome::Ran(_))) => {
+                Ok(CompactOutcome::Ran(_)) => {
                     serde_json::json!({ "outcome": "ran" })
                 }
-                Ok(Ok(CompactOutcome::Skipped(_))) => {
+                Ok(CompactOutcome::Skipped(_)) => {
                     serde_json::json!({ "outcome": "skipped" })
                 }
-                // The abort marker (from either layer) is checked before the
-                // generic failure, so a cancelled run traces "cancelled".
-                Ok(Err(error)) | Err(error) if pa_agent::abort::is_abort_error(error) => {
+                // The abort marker is checked before the generic failure, so a
+                // cancelled run traces "cancelled".
+                Err(error) if pa_agent::abort::is_abort_error(error) => {
                     serde_json::json!({ "outcome": "cancelled" })
                 }
-                Ok(Err(_)) | Err(_) => {
+                Err(_) => {
                     serde_json::json!({ "outcome": "failed" })
                 }
             }),
         );
         match &outcome {
-            Ok(Ok(CompactOutcome::Ran(run))) => {
+            Ok(CompactOutcome::Ran(run)) => {
                 // The post-compaction kernel notice goes out before the settled end (TS
                 // `_syncKernelStateAfterCompaction`): its `message_start`/`message_end` pair
                 // precedes `compaction_end`.
@@ -167,7 +173,7 @@ impl AgentSessionEngine {
             }
             // A skip consumed the check (TS `CompactionSkippedError`): the disclosure row
             // goes out with its message pair, then the end event carries the warning.
-            Ok(Ok(CompactOutcome::Skipped(message))) => {
+            Ok(CompactOutcome::Skipped(message)) => {
                 if !self.emit_unsuccessful_compaction(
                     CompactionOutcomeReason::Threshold,
                     CompactionOutcomeKind::Skipped,
@@ -178,10 +184,10 @@ impl AgentSessionEngine {
                     return AutoCompactionRun::Cancelled;
                 }
             }
-            // An abort from either layer — the race dropped the in-flight summarizer request,
-            // or the pre-commit signal check fired (TS `_runAutoCompaction`'s aborted arm,
-            // checked before the skip and failure arms).
-            Ok(Err(error)) | Err(error) if pa_agent::abort::is_abort_error(error) => {
+            // An abort before the commit — the dropped summarizer request or the pre-commit
+            // signal check (TS `_runAutoCompaction`'s aborted arm, checked before the skip
+            // and failure arms).
+            Err(error) if pa_agent::abort::is_abort_error(error) => {
                 if !self.emit_unsuccessful_compaction(
                     CompactionOutcomeReason::Threshold,
                     CompactionOutcomeKind::Cancelled,
@@ -194,7 +200,7 @@ impl AgentSessionEngine {
             }
             // A failed run persists the disclosure row and emits the `compaction_end` failure
             // (TS `_endCompactionUnsuccessfully`: automatic failures carry no `errorSeverity`).
-            Ok(Err(error)) | Err(error) => {
+            Err(error) => {
                 if !self.emit_unsuccessful_compaction(
                     CompactionOutcomeReason::Threshold,
                     CompactionOutcomeKind::Failed,
@@ -206,6 +212,10 @@ impl AgentSessionEngine {
                 }
             }
         }
-        AutoCompactionRun::Ran
+        if matches!(outcome, Ok(CompactOutcome::Ran(_))) {
+            AutoCompactionRun::Compacted
+        } else {
+            AutoCompactionRun::Ran
+        }
     }
 }

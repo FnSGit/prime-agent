@@ -49,6 +49,78 @@ macro_rules! str_setting {
 }
 
 impl ClientSettings for CliClientSettings {
+    fn harness_refinements(&self) -> bool {
+        self.manager().get_harness_refinements()
+    }
+
+    fn set_harness_refinements(&self, enabled: bool) -> Result<()> {
+        let mut manager = self.manager();
+        manager.set_harness_refinements(enabled)?;
+        // Adoption bookkeeping stays off the UI input/paint path.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let agent_dir = self.agent_dir.clone();
+            runtime.spawn_blocking(move || {
+                let client = pa_core::session_engine::telemetry::build_client(&manager, &agent_dir);
+                let mut properties = pa_telemetry::Properties::new();
+                properties.set("enabled", serde_json::json!(enabled));
+                client.track("harness refinements changed", properties);
+            });
+        }
+        Ok(())
+    }
+
+    fn compaction_threshold_percent(&self) -> f64 {
+        self.manager().get_compaction_threshold_percent()
+    }
+
+    fn set_compaction_threshold_percent(&self, percent: f64) -> Result<()> {
+        self.manager().set_compaction_threshold_percent(percent)?;
+        let settings = self.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let manager = settings.manager();
+                if crate::mode::telemetry_disabled(&manager) {
+                    return;
+                }
+                let client =
+                    pa_core::session_engine::telemetry::build_client(&manager, &settings.agent_dir);
+                let mut properties = pa_telemetry::base_properties("interactive");
+                properties.set("threshold_percent", serde_json::json!(percent));
+                client.track("autocompact threshold changed", properties);
+                let _ = client.shutdown().await;
+            });
+        }
+        Ok(())
+    }
+
+    fn web_search_provider(&self) -> String {
+        self.manager().get_web_search_provider().id().to_string()
+    }
+
+    fn set_web_search_provider(&self, provider: &str) -> Result<()> {
+        let parsed: pa_core::settings::WebSearchProvider = serde_json::from_value(
+            serde_json::Value::String(provider.to_string()),
+        )
+        .map_err(|error| anyhow::anyhow!("Invalid web search provider \"{provider}\": {error}"))?;
+        self.manager().set_web_search_provider(parsed)?;
+        let settings = self.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let manager = settings.manager();
+                if crate::mode::telemetry_disabled(&manager) {
+                    return;
+                }
+                let client =
+                    pa_core::session_engine::telemetry::build_client(&manager, &settings.agent_dir);
+                let mut properties = pa_telemetry::base_properties("interactive");
+                properties.set("provider", serde_json::json!(parsed.id()));
+                client.track("web search provider changed", properties);
+                let _ = client.shutdown().await;
+            });
+        }
+        Ok(())
+    }
+
     fn theme(&self) -> Option<String> {
         self.manager().get_theme().map(str::to_string)
     }
@@ -131,6 +203,13 @@ impl ClientSettings for CliClientSettings {
         set_show_hardware_cursor,
         get_show_hardware_cursor,
         set_show_hardware_cursor,
+        bool
+    );
+    setting!(
+        emoji_shortcodes,
+        set_emoji_shortcodes,
+        get_emoji_shortcodes,
+        set_emoji_shortcodes,
         bool
     );
     setting!(
@@ -295,6 +374,15 @@ mod tests {
         assert_eq!(value["theme"], "dark");
         assert_eq!(value["idleEvictionMinutes"], "off");
         assert_eq!(value["treeFilterMode"], "all");
+
+        // The web search provider defaults to Serper and persists the choice.
+        assert_eq!(settings.web_search_provider(), "serper");
+        settings.set_web_search_provider("eco").expect("provider");
+        assert_eq!(settings.web_search_provider(), "eco");
+        let content =
+            std::fs::read_to_string(agent_dir.join("settings.json")).expect("settings file");
+        let value: serde_json::Value = serde_json::from_str(&content).expect("parse");
+        assert_eq!(value["webSearchProvider"], "eco");
 
         // The update channel starts unset (the version infers it) and
         // pins through the /nightly off path's seam.

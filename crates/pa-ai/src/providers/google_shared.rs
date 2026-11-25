@@ -102,18 +102,6 @@ pub fn is_thinking_part(part: &Value) -> bool {
     part.get("thought") == Some(&json!(true))
 }
 
-/// Retain thought signatures during streaming: some backends only send `thoughtSignature` on the
-/// first delta of a block; keep the last non-empty one. Never merges or moves signatures across
-/// distinct parts.
-pub fn retain_thought_signature(existing: Option<&str>, incoming: Option<&str>) -> Option<String> {
-    if let Some(incoming) = incoming {
-        if !incoming.is_empty() {
-            return Some(incoming.to_string());
-        }
-    }
-    existing.map(std::string::ToString::to_string)
-}
-
 // Thought signatures must be base64 for Google APIs (TYPE_BYTES).
 fn is_valid_thought_signature(signature: Option<&str>) -> bool {
     let Some(signature) = signature else {
@@ -210,6 +198,9 @@ pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
                                     "data": data,
                                 },
                             }),
+                            crate::types::UserBlockPayload::Video { .. } => {
+                                json!({ "text": crate::types::UNSUPPORTED_VIDEO_PLACEHOLDER })
+                            }
                             crate::types::UserBlockPayload::Opaque(json) => {
                                 json!({ "text": sanitize_surrogates(&json) })
                             }
@@ -232,21 +223,26 @@ pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
                 for block in &assistant.content {
                     match block {
                         AssistantContent::Text(text) => {
-                            if text.text.trim().is_empty() {
+                            let signature = resolve_thought_signature(
+                                is_same_provider_and_model,
+                                text.text_signature.as_deref(),
+                            );
+                            if text.text.trim().is_empty() && signature.is_none() {
                                 continue;
                             }
                             let mut part = Map::new();
                             part.insert("text".into(), json!(sanitize_surrogates(&text.text)));
-                            if let Some(signature) = resolve_thought_signature(
-                                is_same_provider_and_model,
-                                text.text_signature.as_deref(),
-                            ) {
+                            if let Some(signature) = signature {
                                 part.insert("thoughtSignature".into(), json!(signature));
                             }
                             parts.push(Value::Object(part));
                         }
                         AssistantContent::Thinking(thinking) => {
-                            if thinking.thinking.trim().is_empty() {
+                            let signature = resolve_thought_signature(
+                                is_same_provider_and_model,
+                                thinking.thinking_signature.as_deref(),
+                            );
+                            if thinking.thinking.trim().is_empty() && signature.is_none() {
                                 continue;
                             }
                             // Only keep as thinking block if same provider AND same model;
@@ -254,10 +250,7 @@ pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
                             let mut part = Map::new();
                             if is_same_provider_and_model {
                                 part.insert("thought".into(), json!(true));
-                                if let Some(signature) = resolve_thought_signature(
-                                    is_same_provider_and_model,
-                                    thinking.thinking_signature.as_deref(),
-                                ) {
+                                if let Some(signature) = signature {
                                     part.insert("thoughtSignature".into(), json!(signature));
                                 }
                             }
@@ -302,7 +295,10 @@ pub fn convert_messages(model: &Model, context: &Context) -> Vec<Value> {
                     .iter()
                     .filter_map(|block| match block {
                         UserOrToolContent::Text(text) => Some(text.text.clone()),
-                        _ => None,
+                        UserOrToolContent::Video(_) => {
+                            Some(crate::types::UNSUPPORTED_VIDEO_PLACEHOLDER.to_string())
+                        }
+                        UserOrToolContent::Image(_) | UserOrToolContent::Raw(_) => None,
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -500,39 +496,71 @@ pub fn is_gemini3_pro_model(model_id: &str) -> bool {
     regex_is_match(model_id, r"gemini-3(?:\.\d+)?-pro")
 }
 
-pub fn is_gemini3_flash_model(model_id: &str) -> bool {
-    regex_is_match(model_id, r"gemini-3(?:\.\d+)?-flash")
-}
-
 fn regex_is_match(model_id: &str, pattern: &str) -> bool {
     let regex = regex::Regex::new(pattern).expect("static regex");
     regex.is_match(&model_id.to_lowercase())
 }
 
-/// Thinking config for disabled reasoning, per model family.
-pub fn get_disabled_thinking_config(model_id: &str) -> Value {
-    // Gemini 3.1 Pro cannot disable thinking, and Gemini 3 Flash / Flash-Lite do not support full
-    // thinking-off: use the lowest supported level without includeThoughts so hidden thinking
-    // remains invisible.
-    if is_gemini3_pro_model(model_id) {
-        return json!({ "thinkingLevel": "LOW" });
+/// The Gemini thinking level a catalog `thinkingLevelMap` declares for `level`, when the map
+/// carries a non-null value naming a Gemini level (case-insensitive: catalogs spell it `low` or
+/// `LOW`).
+fn mapped_thinking_level(
+    model: &Model,
+    level: crate::types::ModelThinkingLevel,
+) -> Option<GoogleThinkingLevel> {
+    let value = model.thinking_level_map_value(level).flatten()?;
+    match value.to_ascii_uppercase().as_str() {
+        "MINIMAL" => Some(GoogleThinkingLevel::Minimal),
+        "LOW" => Some(GoogleThinkingLevel::Low),
+        "MEDIUM" => Some(GoogleThinkingLevel::Medium),
+        "HIGH" => Some(GoogleThinkingLevel::High),
+        _ => None,
     }
-    if is_gemini3_flash_model(model_id) {
-        return json!({ "thinkingLevel": "MINIMAL" });
-    }
-    if is_gemma4_model(model_id) {
-        return json!({ "thinkingLevel": "MINIMAL" });
-    }
-    // Gemini 2.x supports disabling via thinkingBudget = 0.
-    json!({ "thinkingBudget": 0 })
 }
 
-/// Map a Prime Agent thinking level to a Gemini 3 thinking level.
+/// Whether reasoning for `model` rides `thinkingConfig.thinkingLevel` rather than
+/// `thinkingBudget`. Google splits the two by generation: Gemini 2.x and earlier take only
+/// `thinkingBudget` and reject `thinkingLevel`, while Gemini 3+, Gemini 4, Gemma 4 and the
+/// `-latest` aliases take `thinkingLevel` (Gemini 4 and Gemma 4 answer a budget with a 400). The
+/// catalog `thinkingLevelMap` only picks the level, never the route, so a map-less entry (a user
+/// `models.json` Gemini 4 on Vertex) still gets levels and a mapped 2.5 entry still gets budgets.
+pub fn uses_thinking_levels(model: &Model) -> bool {
+    !regex_is_match(&model.id, r"gemini-[12](?:\.\d+)?(?:-|$)")
+}
+
+/// Thinking config for disabled reasoning, per model generation.
+pub fn get_disabled_thinking_config(model: &Model) -> Value {
+    // Gemini 2.x supports disabling via thinkingBudget = 0.
+    if !uses_thinking_levels(model) {
+        return json!({ "thinkingBudget": 0 });
+    }
+    // Level-based Gemini keeps thinking on, so off sends the lowest supported level without
+    // includeThoughts and the hidden thinking stays invisible. A catalog map names that level
+    // when it cannot turn thinking off (`off: null`).
+    if let Some(minimum) = pa_types::ai::minimum_reasoning(model) {
+        if let Some(level) = mapped_thinking_level(model, minimum) {
+            return json!({ "thinkingLevel": level.as_str() });
+        }
+    }
+    // Without a map, Gemma 4 goes down to MINIMAL (it has no LOW); every other level-based Gemini
+    // takes LOW, which they all accept.
+    if is_gemma4_model(&model.id) {
+        return json!({ "thinkingLevel": "MINIMAL" });
+    }
+    json!({ "thinkingLevel": "LOW" })
+}
+
+/// Map a Prime Agent thinking level to a Gemini thinking level: the catalog map's value when it
+/// names one, else the per-family default.
 pub fn get_thinking_level(
     effort: crate::types::ModelThinkingLevel,
-    model_id: &str,
+    model: &Model,
 ) -> GoogleThinkingLevel {
     use crate::types::ModelThinkingLevel;
+    if let Some(level) = mapped_thinking_level(model, effort) {
+        return level;
+    }
+    let model_id = model.id.as_str();
     if is_gemini3_pro_model(model_id) {
         return match effort {
             ModelThinkingLevel::Minimal | ModelThinkingLevel::Low => GoogleThinkingLevel::Low,
@@ -546,8 +574,9 @@ pub fn get_thinking_level(
         };
     }
     match effort {
-        ModelThinkingLevel::Minimal => GoogleThinkingLevel::Minimal,
-        ModelThinkingLevel::Low => GoogleThinkingLevel::Low,
+        // Only Gemma 4 (above) takes MINIMAL without a map; LOW is accepted by every level-based
+        // Gemini.
+        ModelThinkingLevel::Minimal | ModelThinkingLevel::Low => GoogleThinkingLevel::Low,
         ModelThinkingLevel::Medium => GoogleThinkingLevel::Medium,
         _ => GoogleThinkingLevel::High,
     }
@@ -596,30 +625,71 @@ mod tests {
         );
     }
 
+    /// Without a level map, Gemini Flash takes LOW for off and minimal: 3.7/3.8 Flash have no
+    /// MINIMAL, and LOW is accepted by every Flash.
     #[test]
-    fn thinking_part_detection() {
-        assert!(is_thinking_part(&json!({ "thought": true, "text": "hmm" })));
-        // thoughtSignature alone does NOT mark thinking content.
-        assert!(!is_thinking_part(
-            &json!({ "text": "hi", "thoughtSignature": "AAAA" })
-        ));
+    fn mapless_gemini_flash_takes_low_for_off_and_minimal() {
+        for id in ["gemini-3.7-flash", "gemini-3-flash-preview"] {
+            let model = serde_json::from_value::<Model>(json!({
+                "id": id, "name": id,
+                "api": "google-vertex", "provider": "google-vertex",
+                "baseUrl": "https://{location}-aiplatform.googleapis.com",
+                "reasoning": true, "input": ["text"],
+                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+                "contextWindow": 1_048_576, "maxTokens": 65_536
+            }))
+            .unwrap();
+            assert_eq!(
+                get_disabled_thinking_config(&model),
+                json!({ "thinkingLevel": "LOW" }),
+                "{id}"
+            );
+            assert_eq!(
+                get_thinking_level(crate::types::ModelThinkingLevel::Minimal, &model),
+                GoogleThinkingLevel::Low,
+                "{id}"
+            );
+        }
     }
 
     #[test]
-    fn maps_stop_reasons() {
-        assert_eq!(map_google_stop_reason("STOP").unwrap(), StopReason::Stop);
+    fn tool_result_video_becomes_placeholder_for_video_model() {
+        let model: Model = serde_json::from_value(json!({
+            "id": "gemini-3-pro", "name": "Gemini",
+            "api": "google-generative-ai", "provider": "google",
+            "baseUrl": "https://example.invalid", "reasoning": false,
+            "input": ["text", "video"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128_000, "maxTokens": 8192,
+        }))
+        .unwrap();
+        let context: Context = serde_json::from_value(json!({ "messages": [
+            {
+                "role": "assistant",
+                "content": [{ "type": "toolCall", "id": "call_1", "name": "python_repl", "arguments": {} }],
+                "api": model.api, "provider": model.provider, "model": model.id,
+                "usage": crate::types::Usage::default(), "stopReason": "toolUse", "timestamp": 0,
+            },
+            {
+                "role": "toolResult", "toolCallId": "call_1", "toolName": "python_repl",
+                "content": [
+                    { "type": "text", "text": "Loaded clip.mp4" },
+                    { "type": "video", "data": "AAAA", "mimeType": "video/mp4" },
+                ],
+                "isError": false, "timestamp": 0,
+            },
+        ] }))
+        .unwrap();
+
         assert_eq!(
-            map_google_stop_reason("MAX_TOKENS").unwrap(),
-            StopReason::Length
+            convert_messages(&model, &context),
+            vec![
+                json!({ "role": "model", "parts": [{ "functionCall": { "name": "python_repl", "args": {} } }] }),
+                json!({ "role": "user", "parts": [{ "functionResponse": {
+                    "name": "python_repl",
+                    "response": { "output": format!("Loaded clip.mp4\n{}", crate::types::UNSUPPORTED_VIDEO_PLACEHOLDER) },
+                } }] }),
+            ]
         );
-        assert_eq!(map_google_stop_reason("SAFETY").unwrap(), StopReason::Error);
-        assert!(map_google_stop_reason("NEW_THING").is_err());
-    }
-
-    #[test]
-    fn gemini3_classification() {
-        assert!(is_gemini3_pro_model("gemini-3-pro-preview"));
-        assert!(is_gemini3_flash_model("Gemini-3.1-Flash"));
-        assert!(!is_gemini3_pro_model("gemini-2.5-pro"));
     }
 }

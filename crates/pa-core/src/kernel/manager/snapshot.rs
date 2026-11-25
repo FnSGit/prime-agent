@@ -3,8 +3,8 @@
 
 use super::{
     describe_failure, lock, Arc, CaptureFreshness, Duration, ExecuteOptions, ExecuteStatus, Inner,
-    Instant, KernelState, ManifestStat, MemoSlot, Request, RestoreResult, RestoredNamespaceSkip,
-    SnapshotResult, SnapshotSkip, Value, DEFAULT_SNAPSHOT_DEBOUNCE_MS, DEFAULT_SNAPSHOT_MAX_BYTES,
+    Instant, ManifestStat, MemoSlot, Request, RestoreResult, RestoredNamespaceSkip, SnapshotResult,
+    SnapshotSkip, Value, DEFAULT_SNAPSHOT_DEBOUNCE_MS, DEFAULT_SNAPSHOT_MAX_BYTES,
     DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES, REPAIR_STEP_TIMEOUT_MS, RESTORE_EXECUTION_TIMEOUT_MS,
     SNAPSHOT_EXECUTION_TIMEOUT_MS,
 };
@@ -26,7 +26,7 @@ impl Inner {
         prune_oversized: bool,
     ) -> Option<SnapshotResult> {
         let cfg = self.options.snapshot.clone()?;
-        if !self.is_running_state() {
+        if !lock(&self.guarded).lifecycle.is_running() {
             return None;
         }
         // While the namespace provably cannot have changed, a fresh capture would reproduce the
@@ -52,7 +52,6 @@ impl Inner {
         let result = self
             .enqueue_request(
                 request,
-                "",
                 ExecuteOptions {
                     internal: true,
                     ..ExecuteOptions::default()
@@ -108,13 +107,19 @@ impl Inner {
             }
             Err(error) => {
                 self.append_diagnostic(&format!("state snapshot error: {error:#}"));
+                // A failed capture stays owed: the next backgrounded cell's
+                // settle (any status, kernel alive) retries it. No re-check
+                // of the detached cell here: it may settle between the
+                // failure and a re-check, which would drop the capture.
+                self.snapshot_owed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 None
             }
         }
     }
 
-    fn is_running_state(&self) -> bool {
-        lock(&self.guarded).state == KernelState::Running
+    pub(crate) fn is_running_state(&self) -> bool {
+        lock(&self.guarded).lifecycle.is_running()
     }
 
     /// The recurring capture-freshness skip (see `CaptureFreshness`):
@@ -228,7 +233,6 @@ impl Inner {
         let result = self
             .enqueue_request(
                 request,
-                "",
                 ExecuteOptions {
                     internal: true,
                     protocol_repair,
@@ -417,7 +421,7 @@ impl Inner {
     }
 
     async fn run_snapshot_flush_for_dispose(self: &Arc<Self>) {
-        if self.options.snapshot.is_none() || !self.is_running_state() {
+        if self.options.snapshot.is_none() || !lock(&self.guarded).lifecycle.is_running() {
             return;
         }
         // A kernel that never (fully) restored the saved namespace must not
@@ -429,8 +433,13 @@ impl Inner {
         // snapshot and stall dispose.
         lock(&self.guarded).flushing_snapshot_for_dispose = true;
         async {
-            if lock(&self.guarded).active_execution.is_some() {
-                let _ = self.interrupt(None).await;
+            let running: Vec<String> = lock(&self.guarded)
+                .active_executions
+                .iter()
+                .map(|execution| execution.request_id.clone())
+                .collect();
+            for id in running {
+                let _ = self.interrupt(Some(&id)).await;
             }
             // Wait for the execution queue to drain, bounded by the snapshot
             // execution timeout.

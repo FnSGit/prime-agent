@@ -1,17 +1,21 @@
 //! Session lifecycle on the worker: shutdown, replacement handoff,
 //! resume, compaction triggers, and the wait-for-settled arms.
 use super::{
-    json, queue_lanes, response_failure, response_success, session_snapshot, AgentSessionEngine,
-    DaemonResponse, QueueCheckpoint, QueuePriority, QueuedItem, SessionFile, TurnPolicy, Value,
+    json, queue_lanes, queued_bash_completion_notices, queued_cell_completion_deliveries,
+    response_failure, response_success, session_snapshot, AgentSessionEngine, DaemonResponse,
+    QueueCheckpoint, QueuePriority, QueuedItem, SessionCore, SessionFile, TurnPolicy, Value,
     Worker, SIDE_QUESTION_SETTLE_TIMEOUT,
 };
+
+/// How long the shutdown waits for the connections' fan-outs to flush.
+const SHUTDOWN_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Worker {
     /// `update_snapshot` (supervisor plane, update flow spec §8): a read-only
     /// capture; the queue lanes persist BEFORE replying, so the reported queue
     /// and the durable respawn state agree (`busy` is the continuation signal).
     pub(crate) fn handle_update_snapshot(&self) -> DaemonResponse {
-        let (core_data, lanes) = {
+        let (core_data, lanes, suspended) = {
             let core = self.core.lock().unwrap();
             let store = core.store.as_ref();
             let data = json!({
@@ -37,20 +41,33 @@ impl Worker {
                 "busy": core.busy,
                 "compacting": core.compacting,
             });
-            (data, queue_lanes(&core))
+            (data, queue_lanes(&core), core.queued_input_suspended)
         };
         // Journal the lanes after releasing the core lock (record paths take
         // the locks in the opposite order).
         self.persist_queue_snapshot(
             core_data["activeSessionId"].as_str().unwrap_or_default(),
+            suspended,
             &lanes,
         );
         response_success(None, "update_snapshot", Some(core_data))
     }
 
+    pub(crate) fn release_session_lease(&self) {
+        let lease = self
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_mut()
+            .and_then(|store| store.lease.take());
+        drop(lease);
+    }
+
     /// Graceful stop: the connection loop exits the process after
     /// replying. The session's telemetry finalizes first.
-    pub(crate) async fn handle_shutdown(&self) -> DaemonResponse {
+    pub(crate) async fn handle_shutdown(&self, payload: &Value) -> DaemonResponse {
+        let daemon_wide = payload.get("daemonShutdown").and_then(Value::as_bool) == Some(true);
         // The session is closing: the continuation mint sites and their
         // settle-hook retries bail, but unlike a kill the close KEEPS the
         // resume entry — the scheduled jobs survive for the later wake.
@@ -62,17 +79,23 @@ impl Worker {
         self.side_questions
             .abort_all_and_settle(SIDE_QUESTION_SETTLE_TIMEOUT)
             .await;
-        {
+        let interrupted_turn = {
             let mut core = self.core.lock().unwrap();
+            // Every explicit cancellation also sets `abort_requested`.
+            let interrupted_turn = core.busy && !core.abort_requested && !core.turn_completed;
             // The shutdown gate closes FIRST: a racing execute_bash must see the
-            // stop before the abort runs, or the fresh claim clears the abort and
-            // spawns a child the exit leaves running.
+            // stop before the abort runs — a claim that slipped in after the
+            // abort would register a controller nothing later cancels, and the
+            // exit leaves its child running.
             core.shutdown_requested = true;
             core.abort_requested = true;
-        }
+            interrupted_turn
+        };
         // The running user bash goes with the stop: the passivation stop must
-        // never leave the user's process running after the worker exits.
-        self.user_bash.abort().await;
+        // never leave the user's process running after the worker exits. Each
+        // run kills its tree in its own task, so the stop waits (bounded) for
+        // the runs to settle (TS `abortBashForClose`).
+        self.user_bash.abort_and_settle().await;
         // TS `shutdown` closes through `session.abort()` -> `requestAbort()`:
         // the in-flight turn's fetch cancels now, not at its next event.
         self.engine.abort_in_flight_turn();
@@ -83,6 +106,34 @@ impl Worker {
         self.compaction.abort();
         self.tree_navigation.abort();
         self.await_session_work_settled().await;
+        // A daemon-wide shutdown that interrupted a running turn queues the
+        // continuation prompt so the next boot resumes the turn.
+        let continue_turn = daemon_wide && interrupted_turn && {
+            let mut core = self.core.lock().unwrap();
+            let still_interrupted = !core.turn_cancelled && !core.turn_completed;
+            if still_interrupted {
+                core.steering.push_front(QueuedItem {
+                    priority: QueuePriority::Human,
+                    preview: None,
+                    message: crate::update_restore::UPDATE_RESTART_CONTINUATION_PROMPT.to_string(),
+                    custom_message: None,
+                    agent_message: None,
+                    queue_key: None,
+                    admission_id: None,
+                    images: Vec::new(),
+                    done: None,
+                    queue_visible: false,
+                    policy: TurnPolicy::Direct,
+                    forced_batch: false,
+                });
+            }
+            still_interrupted
+        };
+        if continue_turn {
+            self.checkpoint_queue(QueueCheckpoint::Admitted {
+                operation: "prompt_accepted",
+            });
+        }
         // The children close before the exit (an unreachable child must not
         // block the worker's own exit); their resume entries and scheduled
         // jobs survive.
@@ -96,20 +147,44 @@ impl Worker {
             agent_engine.dispose_kernel().await;
         }
         self.engine.end_telemetry().await;
-        let lease = self
-            .core
-            .lock()
-            .unwrap()
-            .store
-            .as_mut()
-            .and_then(|store| store.lease.take());
-        drop(lease);
+        self.release_session_lease();
         // The worker's quit (TS `session_shutdown` reason `quit`): the
         // pane reporter releases its pane as the last write on the wire
         // — awaited here so the release lands before this reply unlocks
         // the process exit, and no late report reclaims the pane.
         let reporter = self.herdr.lock().unwrap().clone();
         reporter.release().await;
+        // The verdict is durable BEFORE the reply: the supervisor may escalate
+        // the stop as soon as the reply lands. Parked (suspended) lanes are not
+        // busy: they wait for an explicit resume.
+        let busy = {
+            let core = self.core.lock().unwrap();
+            !core.queued_input_suspended
+                && (!core.steering.is_empty() || !core.follow_up.is_empty())
+        };
+        let _ = self.record_recovery(busy, "shutdown");
+        // The reply unlocks the process exit (and the supervisor's stop
+        // escalation), so every connection's fan-out first writes the
+        // frames broadcast so far - the kill's `session_closed` among them:
+        // an exit mid-write tears the frame an attached client is reading.
+        // Bounded: a client that stopped reading must not hold the stop.
+        let gate = self.events.current_seq();
+        let sinks: Vec<_> = self
+            .connection_sinks
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        let flushed = futures::future::join_all(sinks.iter().map(|sink| sink.wait_flushed(gate)));
+        if tokio::time::timeout(SHUTDOWN_FLUSH_BUDGET, flushed)
+            .await
+            .is_err()
+        {
+            eprintln!(
+                "pa-daemon: shutdown proceeds with a client's frames unflushed after {SHUTDOWN_FLUSH_BUDGET:?}"
+            );
+        }
         response_success(None, "shutdown", None)
     }
 
@@ -199,6 +274,7 @@ impl Worker {
                 let busy = core.busy || core.compacting;
                 if busy {
                     core.abort_requested = true;
+                    core.turn_cancelled = true;
                 }
                 busy
             };
@@ -253,6 +329,10 @@ impl Worker {
     /// TS dispatch handlers that call `rebindCronJobsToState` after the
     /// runtime call.
     pub(crate) async fn refresh_replaced_session_state(&self) {
+        // The teardown closed the retired session; its successor starts live.
+        if let Some(agent_engine) = &self.agent_engine {
+            agent_engine.clear_session_closed();
+        }
         let (rlm_depth, summary, child_script) = {
             let (mut core, inputs) = self.summary_inputs();
             // The moved-to file's persisted depth wins (the replacement
@@ -286,6 +366,7 @@ impl Worker {
                 child_script,
                 // A TS replacement runtime has no semantic spawn.
                 semantic_spawn: None,
+                factory_child: false,
             }) {
             Ok(()) => self.reseed_rlm_children().await,
             Err(error) => eprintln!("pa-daemon: replacement identity rebind failed: {error:#}"),
@@ -312,6 +393,64 @@ impl Worker {
         Ok(())
     }
 
+    /// `resume_queue`: the queue's queued work resumes (the turn runner
+    /// drains the lanes when idle); the failure string is TS-verbatim for the empty queue.
+    pub(crate) fn handle_resume_queue(&self) -> DaemonResponse {
+        if let Err(response) = self.require_created("resume_queue") {
+            return response;
+        }
+        let queued_at_transition = {
+            let mut recovery = self.recovery.lock().unwrap();
+            let mut core = self.core.lock().unwrap();
+            let has_queued_work = !core.steering.is_empty() || !core.follow_up.is_empty();
+            // Persist only the idle parked transition. Active turns have already
+            // picked their inputs out of these lanes; rewriting that snapshot
+            // could erase their original recovery evidence. An idle compaction
+            // picks nothing, so it checkpoints like any idle resume.
+            let checkpoint_idle_resume = core.queued_input_suspended && !core.busy;
+            if let (true, Some(journal)) = (checkpoint_idle_resume, recovery.as_mut()) {
+                let lanes = crate::worker::queue_lanes(&core);
+                let store = core.store.as_ref();
+                let session_file = store.map(|store| store.path.to_string_lossy().to_string());
+                // Keep pickup and cancellation blocked until this transition
+                // is durable; failure leaves the live suspension unchanged.
+                if let Err(error) = journal.record_queue_checkpoint(
+                    &core.active_session_id,
+                    store.map_or("", crate::session_store::SessionFile::session_id),
+                    session_file.as_deref(),
+                    has_queued_work,
+                    "queue_resumed",
+                    &lanes.steering,
+                    &lanes.follow_up,
+                    /*suspended*/ false,
+                ) {
+                    eprintln!("pa-daemon: queue resume checkpoint failed: {error:#}");
+                    return response_failure(
+                        None,
+                        "resume_queue",
+                        "Could not persist queue resume state",
+                        None,
+                    );
+                }
+            }
+            // Busy and already-resumed calls retain legacy behavior
+            // without replacing the saved admission snapshot.
+            core.queued_input_suspended = false;
+            has_queued_work
+        };
+        // Only effects run after unlock; a concurrent later abort must not have
+        // its suspension cleared again here.
+        self.wake_queued_input();
+        let has_queued_work = queued_at_transition || {
+            let core = self.core.lock().unwrap();
+            !core.steering.is_empty() || !core.follow_up.is_empty()
+        };
+        if !has_queued_work {
+            return response_failure(None, "resume_queue", "No queued work to resume", None);
+        }
+        response_success(None, "resume_queue", None)
+    }
+
     /// Clear the queued-input suspension and wake the turn runner so parked
     /// lanes drain; an owed continuation re-evaluates here too.
     pub(crate) fn resume_queued_input(&self) {
@@ -321,6 +460,12 @@ impl Worker {
                 core.queued_input_suspended = false;
             }
         }
+        self.wake_queued_input();
+    }
+
+    /// Wake queued work and re-evaluate owed continuations without changing
+    /// the suspension gate.
+    pub(crate) fn wake_queued_input(&self) {
         self.work_notify.notify_one();
         if let Some(engine) = self.agent_engine.as_ref() {
             engine.retry_owed_goal_continuation();
@@ -525,17 +670,18 @@ impl Worker {
             let idle = self.idle_notify.notified();
             tokio::pin!(idle);
             idle.as_mut().enable();
-            {
-                let core = self.core.lock().unwrap();
-                if !core.busy
-                    && (core.steering.is_empty() && core.follow_up.is_empty()
-                        || self.input_pauses.paused())
-                {
-                    return;
-                }
+            if self.is_idle(&self.core.lock().unwrap()) {
+                return;
             }
             idle.await;
         }
+    }
+
+    /// The idle predicate: no turn running, and no queued input left to
+    /// run (or input paused).
+    fn is_idle(&self, core: &SessionCore) -> bool {
+        !core.busy
+            && (core.steering.is_empty() && core.follow_up.is_empty() || self.input_pauses.paused())
     }
 
     /// The idle wait, plus `waitForRlmQuiescence` (TS
@@ -582,13 +728,104 @@ impl Worker {
         }
     }
 
-    /// `wait_for_idle`: park until the session is idle;
-    /// `waitForRlmQuiescence` also holds until its RLM children settled
-    /// (the parent-side settle watcher and `collect` wait out a child's
-    /// whole subtree this way).
+    /// The parent's child wait (`wait_for_idle` with `waitForRlmQuiescence`,
+    /// sent by the settle watcher and `collect`): the quiescence barrier,
+    /// held while [`Self::pending_background_completions`] is non-zero, the
+    /// same count the parent's busy check reads from `get_state`. An owed
+    /// completion ends in a queued notice turn, whose end notifies idle, so
+    /// the re-check needs no poll. `wait_for_headless_completion` keeps the
+    /// plain barrier: ACP reports background work instead of waiting on it.
+    async fn wait_until_child_idle(&self, payload: &Value) {
+        let holds_background =
+            payload.get("waitForRlmQuiescence").and_then(Value::as_bool) == Some(true);
+        loop {
+            // Register the permit before the count read: a completion that
+            // lands between the read and the await still wakes this waiter.
+            let idle = self.idle_notify.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            self.wait_until_quiescent(payload).await;
+            if !holds_background {
+                return;
+            }
+            // The detached count first: a cell queues its notice before it
+            // leaves the count. Then the queued rows and the idle state under
+            // one core lock: a notice the turn runner picks after the
+            // quiescent wait has left the queue but made the session busy.
+            let detached = self.pending_detached_completions();
+            {
+                let core = self.core.lock().unwrap();
+                if detached + queued_completion_deliveries(&core) == 0 && self.is_idle(&core) {
+                    return;
+                }
+            }
+            idle.await;
+        }
+    }
+
+    /// `wait_for_idle`: park until the session is idle or `timeoutMs` expires;
+    /// expiry returns `timedOut: true` without stopping the session.
+    /// `waitForRlmQuiescence` also holds until its RLM children settled and
+    /// its owed background completions delivered (the parent-side settle
+    /// watcher and `collect` wait out a child's whole subtree this way).
     pub(crate) async fn handle_wait_for_idle(&self, payload: &Value) -> DaemonResponse {
-        self.wait_until_quiescent(payload).await;
-        response_success(None, "wait_for_idle", None)
+        let timed_out = if let Some(timeout_ms) = payload.get("timeoutMs").and_then(Value::as_u64) {
+            tokio::select! {
+                biased;
+                () = self.wait_until_child_idle(payload) => false,
+                () = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => true,
+            }
+        } else {
+            self.wait_until_child_idle(payload).await;
+            false
+        };
+        let data = timed_out.then(|| json!({"timedOut": true}));
+        response_success(None, "wait_for_idle", data)
+    }
+
+    /// The background lanes' outstanding work at a quiescence observation:
+    /// live background work ([`AgentSessionEngine::background_work_count`]:
+    /// detached cells and live `bash()` handles) plus
+    /// [`queued_completion_deliveries`]. Zero when nothing will wake the
+    /// session. The ACP quiescence frames report it; the child-idle decision
+    /// reads the narrower [`Self::pending_background_completions`], so a child
+    /// that leaves a server running still settles.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the session-core mutex is poisoned.
+    pub(crate) fn outstanding_background_jobs(&self) -> u64 {
+        let live = self
+            .agent_engine
+            .as_ref()
+            .map_or(0, |engine| engine.background_work_count());
+        (live + queued_completion_deliveries(&self.core.lock().unwrap())) as u64
+    }
+
+    /// The background completions still owed to this run: detached cells
+    /// whose terminal notice is not yet admitted, plus
+    /// [`queued_completion_deliveries`]. `get_state` reports it as
+    /// `pendingBackgroundCompletions`, and the child wait holds on it
+    /// ([`Self::wait_until_child_idle`]). The one intentional difference
+    /// from [`AgentSessionEngine::background_work_count`]: a live `bash()`
+    /// handle alone does not count, since it may never end (a child that
+    /// leaves a server running still settles).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the session-core mutex is poisoned.
+    pub(crate) fn pending_background_completions(&self) -> u64 {
+        let detached = self.pending_detached_completions();
+        (detached + queued_completion_deliveries(&self.core.lock().unwrap())) as u64
+    }
+
+    /// Detached cells whose terminal notice is not yet admitted.
+    fn pending_detached_completions(&self) -> usize {
+        self.agent_engine
+            .as_ref()
+            .and_then(|engine| engine.live_handles())
+            .and_then(|handles| handles.kernel_provisioner.upgrade())
+            .map_or(0, |provisioner| provisioner.pending_detached_completions())
     }
 
     /// `wait_for_headless_completion` (TS daemon command): settle the
@@ -609,11 +846,17 @@ impl Worker {
             .autonomous_status()
             .await
             .unwrap_or_else(pa_core::autonomous::disabled_autonomous_status);
-        response_success(
-            None,
-            "wait_for_headless_completion",
-            Some(serde_json::to_value(&status).unwrap_or(Value::Null)),
-        )
+        // The bash quiescence count rides the status data as an additive
+        // key (the ACP quiescence observation reads it; a degraded status
+        // still answers).
+        let mut data = serde_json::to_value(&status).unwrap_or(Value::Null);
+        if let Some(object) = data.as_object_mut() {
+            object.insert(
+                "outstandingBackgroundJobs".to_string(),
+                json!(self.outstanding_background_jobs()),
+            );
+        }
+        response_success(None, "wait_for_headless_completion", Some(data))
     }
 }
 /// Agents-view visibility is message-based: a resident subagent is visible
@@ -626,4 +869,11 @@ pub(super) fn active_lifecycle(runtime_kind: &str, messageless: bool, busy: bool
     } else {
         "draft"
     }
+}
+
+/// The completion notices still queued for delivery: `[bash-done]` rows and
+/// pending cell deliveries (a full `[cell-done]` row or the coalesced inbox
+/// arrival that covers one).
+fn queued_completion_deliveries(core: &SessionCore) -> usize {
+    queued_bash_completion_notices(core) + queued_cell_completion_deliveries(core)
 }

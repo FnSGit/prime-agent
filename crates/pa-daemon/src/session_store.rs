@@ -28,6 +28,10 @@ mod stream_tests;
 mod window_tests;
 
 // The index concern lives in session_store::index; the facade re-imports keep the callers in scope.
+mod child_usage;
+#[cfg(test)]
+#[path = "session_store/child_usage_tests.rs"]
+mod child_usage_tests;
 mod index;
 
 use index::fold_child_usage_attributions;
@@ -66,16 +70,12 @@ mod info;
 mod info_sidecar;
 
 pub(crate) use info::read_session_info_from;
+pub use info::{find_most_recent_session_for_cwd, read_session_info, SessionInfo};
 #[cfg(test)]
 use info::{
-    append_capped_search_text, fold_scan_entry, message_content_text, raw_string, raw_u64,
-    session_info_cache, SessionInfoEntry, SessionInfoGeneration, SessionInfoScanCache,
-    SessionScanAccumulator, SessionScanState, SESSION_SCAN_MAX_CACHED_STATES,
+    message_content_text, raw_string, raw_u64, session_info_cache, SessionInfoEntry,
+    SessionInfoGeneration, SessionInfoScanCache, SessionScanState, SESSION_SCAN_MAX_CACHED_STATES,
     SESSION_SCAN_RESUME_TAIL_BYTES,
-};
-pub use info::{
-    find_most_recent_session_for_cwd, read_session_info, SessionInfo,
-    SESSION_LIST_SEARCH_TEXT_MAX_CHARS,
 };
 pub(crate) use info_sidecar::persist_info_sidecar;
 
@@ -103,6 +103,104 @@ pub struct SessionEntry {
     pub fields: Value,
 }
 
+/// One display-transcript page ([`SessionFile::transcript_page`]).
+#[derive(Debug, Clone)]
+pub struct TranscriptPageRows {
+    pub messages: Vec<Value>,
+    pub first_entry_id: Option<String>,
+    pub last_entry_id: Option<String>,
+    /// Rows exist past the page's far side: older ones for an end page, newer
+    /// ones before `until` for a start page.
+    pub more: bool,
+}
+
+/// One display-transcript slice ([`SessionFile::session_messages`]).
+#[derive(Debug, Clone)]
+pub struct SessionMessages {
+    /// Each row's index among the matching rows, entry id, and wire message, oldest first.
+    pub rows: Vec<(usize, String, Value)>,
+    /// How many rows match on the active branch.
+    pub total: usize,
+}
+
+impl SessionMessages {
+    /// The `get_session_messages` reply `{messages: [{index, id, message}], total}`,
+    /// snapshot image payloads left out.
+    #[must_use]
+    pub fn into_reply(self) -> Value {
+        let messages: Vec<Value> = self
+            .rows
+            .into_iter()
+            .map(|(index, id, mut message)| {
+                crate::snapshot_stream::elide_snapshot_image_payloads(std::slice::from_mut(
+                    &mut message,
+                ));
+                json!({ "index": index, "id": id, "message": message })
+            })
+            .collect();
+        json!({ "messages": messages, "total": self.total })
+    }
+}
+
+/// One `get_session_messages` request: the slice bounds and the compiled role globs.
+pub struct SessionMessagesQuery {
+    start: i64,
+    limit: usize,
+    roles: globset::GlobSet,
+}
+
+impl SessionMessagesQuery {
+    /// Compile the role globs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a role is not a valid glob.
+    pub fn new(start: i64, limit: u64, roles: &[String]) -> Result<Self, globset::Error> {
+        let mut globs = globset::GlobSetBuilder::new();
+        for role in roles {
+            globs.add(globset::Glob::new(role)?);
+        }
+        Ok(Self {
+            start,
+            limit: usize::try_from(limit).unwrap_or(usize::MAX),
+            roles: globs.build()?,
+        })
+    }
+
+    /// The slice from `store`; `None` when it reaches a windowed store's unloaded prefix.
+    pub fn read(
+        &self,
+        store: &mut SessionFile,
+        running_calls: &std::collections::HashSet<String>,
+    ) -> Option<SessionMessages> {
+        store.session_messages(
+            self.start,
+            self.limit,
+            |role| self.roles.is_match(role),
+            running_calls,
+        )
+    }
+
+    /// The slice from a session file no worker holds, read-only: no lease and no
+    /// session-file write (the windowed open may refresh its window-cache sidecar).
+    /// The windowed open serves slices inside the window; one that reaches the
+    /// unloaded prefix reads the full file. Nothing runs, so nothing is in flight.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file cannot be read.
+    pub fn read_file(&self, path: &Path) -> Result<SessionMessages> {
+        let idle = std::collections::HashSet::new();
+        if let Some(slice) = self.read(&mut SessionFile::open_windowed(path)?, &idle) {
+            return Ok(slice);
+        }
+        let slice = self.read(&mut SessionFile::open(path)?, &idle);
+        // The whole-file load was transient: release its freed heap.
+        pa_types::memory_release::trim_freed_heap();
+        slice.ok_or_else(|| anyhow!("Session history is unavailable"))
+    }
+}
+
 /// The windowed sequence's summary scalars (newest timestamp, message count),
 /// from [`SessionFile::scan_message_scalars`] without materializing the fold.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
@@ -120,9 +218,21 @@ pub struct SessionFile {
     pub header: SessionHeader,
     pub(crate) entries: Vec<SessionEntry>,
     pub(crate) by_id: HashMap<String, usize>,
-    pub(crate) leaf_id: Option<String>,
+    /// Parallel to `entries`: each entry's parent-chain link (maintained with `by_id`).
+    chain: Vec<index::ChainLink>,
+    leaf_id: Option<String>,
+    /// The active branch's display rows by role, a window's unloaded prefix included: kept
+    /// by [`Self::set_leaf`], `None` while stale (the next read recounts).
+    branch_roles: Option<HashMap<String, usize>>,
     pub(crate) window: Option<SessionWindow>,
+    pub(crate) trace_upload: Option<std::sync::Arc<pa_core::agent_traces::ContinuousTraceUpload>>,
     pub(crate) lease: Option<std::sync::Arc<crate::lease::SessionLease>>,
+    child_usage_recovery: child_usage::ChildUsageRecovery,
+    /// Rows the full reader skipped as unparsable (the TS loader's
+    /// lenient skip): zero on a healthy file. A reopen that found damage
+    /// logs this count (silent skips are how a torn session degraded
+    /// unnoticed — the operator's 2026-10-08 report).
+    pub(crate) skipped_lines: usize,
     /// Whether this session has already drawn the Anthropic subscription
     /// ban-risk warning (the once-per-session-lifecycle gate, operator
     /// directive 2026-09-29): hydrated from the persisted
@@ -132,6 +242,21 @@ pub struct SessionFile {
     /// serve it through `get_state`
     /// (`SessionSummary::anthropic_warning_shown`).
     pub(crate) anthropic_warning_shown: bool,
+    /// Told about each appended row that bills a model call (the engine's
+    /// goal budget and telemetry accounting).
+    pub(crate) billed_row_sink: BilledRowSinkSlot,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct BilledRowSinkSlot(pub(crate) Option<pa_core::session::billed_row::BilledRowSink>);
+
+impl std::fmt::Debug for BilledRowSinkSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("BilledRowSinkSlot")
+            .field(&self.0.is_some())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

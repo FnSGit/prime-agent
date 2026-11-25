@@ -6,7 +6,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use tokio::time::Duration;
@@ -34,6 +33,10 @@ pub struct McpOAuthConfig {
     pub url: String,
     /// Pre-registered client id (servers without dynamic registration).
     pub client_id: Option<String>,
+    /// Fixed loopback port registered for a public client; otherwise use the DCR port range.
+    pub callback_port: Option<u16>,
+    /// Secret of a pre-registered confidential client, sent as `client_secret_post`.
+    pub client_secret: Option<String>,
     /// Requested scopes; defaults to the server's advertised scopes.
     pub scopes: Option<String>,
 }
@@ -135,6 +138,7 @@ pub async fn mcp_login(
     config: &McpOAuthConfig,
     ui: &dyn McpLoginUi,
 ) -> Result<AuthCredential> {
+    super::oauth_callback::validate_callback_port(config.callback_port)?;
     let discovery = discover(http, &config.url).await?;
     ui.on_progress(&format!(
         "Discovered {}",
@@ -174,6 +178,7 @@ pub async fn mcp_login(
             registration_endpoint,
             &config.label,
             (!scope.is_empty()).then_some(scope.as_str()),
+            config.callback_port,
         )
         .await?
     };
@@ -182,7 +187,7 @@ pub async fn mcp_login(
     // `state` is independent of the PKCE verifier: the verifier is the
     // token-exchange secret, `state` is echoed on the redirect URL.
     let state = random_state();
-    let callback = Arc::new(CallbackServer::start(&config.label).await?);
+    let callback = CallbackServer::start(&config.label, config.callback_port).await?;
     let redirect_uri = callback.redirect_uri();
     let mut auth_params: Vec<(String, String)> = vec![
         ("client_id".to_string(), client_id.clone()),
@@ -198,6 +203,11 @@ pub async fn mcp_login(
     if let Some(resource) = &discovery.resource {
         auth_params.push(("resource".to_string(), resource.clone()));
     }
+    // Google issues a refresh token only for offline access, and re-issues one only on consent.
+    if discovery.metadata.issuer == "https://accounts.google.com" {
+        auth_params.push(("access_type".to_string(), "offline".to_string()));
+        auth_params.push(("prompt".to_string(), "consent".to_string()));
+    }
     let auth_url = authorization_url(&discovery.metadata.authorization_endpoint, &auth_params)?;
     ui.on_auth(
         &auth_url,
@@ -208,10 +218,12 @@ pub async fn mcp_login(
     // Race the local callback server against a manual paste. A real paste cancels the callback
     // waiter; manual cancellation settles it after a short grace so an in-flight browser redirect
     // can win first.
-    let mut manual_task = ui.on_manual_code_input().map(|manual| {
-        let callback = Arc::clone(&callback);
+    let mut manual_input = ui.on_manual_code_input().map(|manual| {
+        // Keep this future inside the login: a detached task could retain the callback
+        // server after the user cancelled the parent login.
+        let callback = &callback;
         let state = state.clone();
-        tokio::spawn(async move {
+        Box::pin(async move {
             let Some(input) = manual.await else {
                 tokio::time::sleep(Duration::from_millis(500)).await;
                 callback.cancel().await;
@@ -239,17 +251,22 @@ pub async fn mcp_login(
         })
     });
 
-    let mut result = callback.wait_for_code().await;
+    let (mut result, manual_outcome) = if let Some(input) = manual_input.as_mut() {
+        callback.wait_for_code_or_input(input.as_mut()).await
+    } else {
+        (callback.wait_for_code().await, None)
+    };
     let mut manual_error: Option<anyhow::Error> = None;
     if result.is_none() {
-        if let Some(task) = manual_task.take() {
-            match task.await {
-                Ok(ManualOutcome::Code(code)) => result = Some(code),
-                Ok(ManualOutcome::Cancelled) => {}
-                Ok(ManualOutcome::Failed(error)) => manual_error = Some(error),
-                Err(join_error) => {
-                    manual_error = Some(anyhow!("Manual login input failed: {join_error}"));
-                }
+        if let Some(input) = manual_input.take() {
+            let outcome = match manual_outcome {
+                Some(outcome) => outcome,
+                None => input.await,
+            };
+            match outcome {
+                ManualOutcome::Code(code) => result = Some(code),
+                ManualOutcome::Cancelled => {}
+                ManualOutcome::Failed(error) => manual_error = Some(error),
             }
         } else {
             // No paste surface: a blocking prompt is the fallback once the
@@ -264,9 +281,8 @@ pub async fn mcp_login(
             result = Some(CallbackCode { code, state });
         }
     }
-    if let Some(task) = &manual_task {
-        task.abort();
-    }
+    drop(manual_input);
+    callback.cancel().await;
     let Some(result) = result else {
         return Err(manual_error.unwrap_or_else(|| anyhow!("Missing authorization code")));
     };
@@ -282,6 +298,9 @@ pub async fn mcp_login(
         ("client_id".to_string(), client_id.clone()),
         ("code_verifier".to_string(), verifier),
     ];
+    if let Some(client_secret) = &config.client_secret {
+        token_params.push(("client_secret".to_string(), client_secret.clone()));
+    }
     if let Some(resource) = &discovery.resource {
         token_params.push(("resource".to_string(), resource.clone()));
     }
@@ -335,14 +354,14 @@ pub async fn mcp_refresh_token(
     } = credentials
     else {
         bail!(
-            "Stored credentials for {} are not OAuth; re-run /mcp login {}",
+            "Stored credentials for {} are not OAuth; re-run /mcp and select {}",
             config.label,
             config.server
         );
     };
     if endpoint.as_deref() != Some(config.url.as_str()) {
         bail!(
-            "Stored OAuth credentials are not bound to {}; re-run /mcp login {}",
+            "Stored OAuth credentials are not bound to {}; re-run /mcp and select {}",
             config.url,
             config.server
         );
@@ -366,7 +385,7 @@ pub async fn mcp_refresh_token(
         if stored_audience != allowed_audience {
             bail!(
                 "Stored OAuth credentials are not bound to {allowed_audience}; re-run /mcp \
-                 login {}",
+                 and select {}",
                 config.server
             );
         }
@@ -375,7 +394,7 @@ pub async fn mcp_refresh_token(
         (true, true) | (false, false) => {}
         _ => bail!(
             "Stored OAuth credentials for {} have incomplete resource binding; re-run /mcp \
-             login {}",
+             and select {}",
             config.label,
             config.server
         ),
@@ -389,7 +408,7 @@ pub async fn mcp_refresh_token(
     {
         bail!(
             "Stored OAuth credentials for {} have an unknown audience mode; re-run /mcp \
-             login {}",
+             and select {}",
             config.label,
             config.server
         );
@@ -403,7 +422,7 @@ pub async fn mcp_refresh_token(
     }
     let Some(refresh_token) = refresh.as_deref().filter(|token| !token.is_empty()) else {
         bail!(
-            "No refresh token stored for {}; re-run /mcp login {}",
+            "No refresh token stored for {}; re-run /mcp and select {}",
             config.label,
             config.server
         );
@@ -412,7 +431,7 @@ pub async fn mcp_refresh_token(
     let discovery = discover(http, &config.url).await?;
     if resource.is_some() != discovery.resource.is_some() {
         bail!(
-            "OAuth discovery mode changed for {}; re-run /mcp login {}",
+            "OAuth discovery mode changed for {}; re-run /mcp and select {}",
             config.url,
             config.server
         );
@@ -433,7 +452,7 @@ pub async fn mcp_refresh_token(
         if legacy_audience && current_mode != Some(AudienceMode::Exact) {
             bail!(
                 "Stored OAuth credentials for {} predate origin-level resource audiences and \
-                 may not be refreshed against them; re-run /mcp login {}",
+                 may not be refreshed against them; re-run /mcp and select {}",
                 config.label,
                 config.server
             );
@@ -441,7 +460,7 @@ pub async fn mcp_refresh_token(
         if !legacy_audience && current_mode.map(AudienceMode::as_str) != audience_mode.as_deref() {
             bail!(
                 "Stored OAuth credentials do not match current resource audience for {}; \
-                 re-run /mcp login {}",
+                 re-run /mcp and select {}",
                 config.url,
                 config.server
             );
@@ -466,7 +485,7 @@ pub async fn mcp_refresh_token(
         .unwrap_or_default();
     if token_endpoint.is_empty() {
         bail!(
-            "No token endpoint stored for {}; re-run /mcp login {}",
+            "No token endpoint stored for {}; re-run /mcp and select {}",
             config.label,
             config.server
         );
@@ -477,6 +496,9 @@ pub async fn mcp_refresh_token(
     ];
     if !client_id.is_empty() {
         refresh_params.push(("client_id".to_string(), client_id.clone()));
+    }
+    if let Some(client_secret) = &config.client_secret {
+        refresh_params.push(("client_secret".to_string(), client_secret.clone()));
     }
     if let Some(resource) = resource {
         refresh_params.push(("resource".to_string(), resource.clone()));
@@ -667,7 +689,148 @@ mod tests {
             label: server.to_string(),
             url: url.to_string(),
             client_id: None,
+            callback_port: None,
+            client_secret: None,
             scopes: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_a_login_with_a_pending_paste_releases_the_registered_port() {
+        struct PendingUi(Mutex<String>);
+        impl McpLoginUi for PendingUi {
+            fn on_progress(&self, _message: &str) {}
+            fn on_auth(&self, url: &str, _instructions: &str) {
+                *self.0.lock().unwrap() = url.to_string();
+            }
+            fn on_prompt(
+                &self,
+                _message: &str,
+                _placeholder: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
+                Box::pin(std::future::pending())
+            }
+            fn on_manual_code_input(
+                &self,
+            ) -> Option<Pin<Box<dyn Future<Output = Option<String>> + Send>>> {
+                Some(Box::pin(std::future::pending()))
+            }
+        }
+        let http = ScriptedHttp::new(vec![
+            (ORIGIN_URL, 404, None, ""),
+            (
+                "https://srv.test/.well-known/oauth-protected-resource/mcp",
+                404,
+                None,
+                "",
+            ),
+            (ORIGIN_META_URL, 200, None, &json_response(&origin_meta())),
+        ]);
+        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let mut config = config("Slack", ORIGIN_URL);
+        config.client_id = Some("registered-client".to_string());
+        config.callback_port = Some(port);
+        let ui = PendingUi(Mutex::default());
+        let mut login = Box::pin(mcp_login(&http, &config, &ui));
+        assert!(futures::poll!(login.as_mut()).is_pending());
+        assert!(
+            !ui.0.lock().unwrap().is_empty(),
+            "login reached browser authorization"
+        );
+        drop(login);
+        let rebound = std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("cancelling login must release its callback port before the next attempt");
+        drop(rebound);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn settled_browser_code_wins_over_paste_cancel_and_validation_errors() {
+        struct GraceUi {
+            auth_url: Mutex<String>,
+            input: Option<String>,
+        }
+        impl McpLoginUi for GraceUi {
+            fn on_progress(&self, _message: &str) {}
+            fn on_auth(&self, url: &str, _instructions: &str) {
+                *self.auth_url.lock().unwrap() = url.to_string();
+            }
+            fn on_prompt(
+                &self,
+                _message: &str,
+                _placeholder: &str,
+            ) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> {
+                Box::pin(async { Err(anyhow!("unexpected fallback prompt")) })
+            }
+            fn on_manual_code_input(
+                &self,
+            ) -> Option<Pin<Box<dyn Future<Output = Option<String>> + Send>>> {
+                let input = self.input.clone();
+                Some(Box::pin(async move { input }))
+            }
+        }
+        let http = ScriptedHttp::new(vec![
+            (ORIGIN_URL, 404, None, ""),
+            (
+                "https://srv.test/.well-known/oauth-protected-resource/mcp",
+                404,
+                None,
+                "",
+            ),
+            (ORIGIN_META_URL, 200, None, &json_response(&origin_meta())),
+            (
+                ORIGIN_TOKEN,
+                200,
+                None,
+                r#"{"access_token":"browser-access"}"#,
+            ),
+        ]);
+        let client = pa_ai::utils::tls::http_client_builder().build().unwrap();
+        for input in [
+            None,
+            Some("http://localhost/callback?code=paste&state=wrong".to_string()),
+        ] {
+            // Every schedule must succeed; repetition exercises select's fair branch ordering,
+            // rather than retrying a failed login until it happens to succeed.
+            for _ in 0..32 {
+                let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let port = reservation.local_addr().unwrap().port();
+                drop(reservation);
+                let mut config = config("Slack", ORIGIN_URL);
+                config.client_id = Some("registered-client".to_string());
+                config.callback_port = Some(port);
+                let ui = GraceUi {
+                    auth_url: Mutex::default(),
+                    input: input.clone(),
+                };
+                let mut login = Box::pin(mcp_login(&http, &config, &ui));
+                assert!(futures::poll!(login.as_mut()).is_pending());
+                let auth_url = Url::parse(&ui.auth_url.lock().unwrap()).unwrap();
+                let state = auth_url
+                    .query_pairs()
+                    .find(|(key, _)| key == "state")
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap();
+                let response = client
+                    .get(format!(
+                        "http://127.0.0.1:{port}/callback?code=browser-code&state={state}"
+                    ))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                // Both the browser result and the expired paste grace are now ready before
+                // the login future is polled again; no wall-clock sleeps or timing guesses.
+                tokio::time::advance(Duration::from_secs(1)).await;
+                login
+                    .await
+                    .expect("the settled browser code must survive the paste outcome");
+                let requests = http.seen.lock().unwrap();
+                let (url, body) = requests.last().unwrap();
+                assert_eq!(url, ORIGIN_TOKEN);
+                assert!(body.as_ref().unwrap().contains("code=browser-code"));
+            }
         }
     }
 
@@ -1269,7 +1432,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_registered_client_skips_registration() {
+    async fn zero_callback_port_fails_before_any_oauth_request() {
+        for client_id in [None, Some("fixture-client".to_string())] {
+            let http = ScriptedHttp::new(vec![]);
+            let ui = test_ui();
+            let mut login_config = config("fixture", ORIGIN_URL);
+            login_config.client_id = client_id;
+            login_config.callback_port = Some(0);
+            let error = mcp_login(&http, &login_config, &ui).await.unwrap_err();
+            assert!(error.to_string().contains("callbackPort"));
+            assert!(http.seen.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_registered_client_skips_registration_and_pins_the_redirect() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
         let http = ScriptedHttp::new(vec![
             (ORIGIN_URL, 404, None, ""),
             (
@@ -1289,6 +1469,7 @@ mod tests {
         let ui = test_ui();
         let mut login_config = config("root", ORIGIN_URL);
         login_config.client_id = Some("root-client".to_string());
+        login_config.callback_port = Some(port);
         let credentials = mcp_login(&http, &login_config, &ui).await.unwrap();
         match &credentials {
             AuthCredential::Oauth {
@@ -1307,6 +1488,80 @@ mod tests {
             .map(|(url, _)| url.clone())
             .collect();
         assert!(!urls.contains(&ORIGIN_REGISTER.to_string()));
+        let redirect_uri = format!("http://localhost:{port}/callback");
+        let auth_url = Url::parse(&ui.auth_url.lock().unwrap()).unwrap();
+        let redirect = auth_url
+            .query_pairs()
+            .find(|(key, _)| key == "redirect_uri")
+            .map(|(_, value)| value.to_string())
+            .unwrap();
+        assert_eq!(redirect, redirect_uri);
+        let token_request = http
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(url, _)| url == ORIGIN_TOKEN)
+            .cloned()
+            .unwrap();
+        let body = token_request.1.unwrap();
+        let encoded_redirect = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("redirect_uri", &redirect_uri)
+            .finish();
+        assert!(body.contains(&encoded_redirect));
+    }
+
+    #[tokio::test]
+    async fn dynamic_registration_advertises_the_pinned_redirect() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let http = ScriptedHttp::new(vec![
+            (ORIGIN_URL, 404, None, ""),
+            (
+                "https://srv.test/.well-known/oauth-protected-resource/mcp",
+                404,
+                None,
+                "",
+            ),
+            (ORIGIN_META_URL, 200, None, &json_response(&origin_meta())),
+            (
+                ORIGIN_REGISTER,
+                200,
+                None,
+                &json_response(&serde_json::json!({ "client_id": "range-client" })),
+            ),
+            (
+                ORIGIN_TOKEN,
+                200,
+                None,
+                &json_response(&serde_json::json!({ "access_token": "range-access" })),
+            ),
+        ]);
+        let ui = test_ui();
+        let mut login_config = config("origin", ORIGIN_URL);
+        login_config.callback_port = Some(port);
+        let credentials = mcp_login(&http, &login_config, &ui).await.unwrap();
+        match &credentials {
+            AuthCredential::Oauth { access, .. } => assert_eq!(access, "range-access"),
+            other => panic!("oauth credential expected, got {other:?}"),
+        }
+        let registration_request = http
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(url, _)| url == ORIGIN_REGISTER)
+            .cloned()
+            .unwrap();
+        let registration_body =
+            serde_json::from_str::<serde_json::Value>(&registration_request.1.unwrap()).unwrap();
+        assert_eq!(
+            registration_body.get("redirect_uris"),
+            Some(&serde_json::json!([format!(
+                "http://localhost:{port}/callback"
+            )]))
+        );
     }
 
     /// The Vercel shape (TS parity): a root endpoint whose declared

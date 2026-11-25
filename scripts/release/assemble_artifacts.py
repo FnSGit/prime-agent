@@ -16,10 +16,11 @@ Usage:
 
 `--catalog-assets` is the directory holding the generated bundled catalog
 assets (`models.bundled.json` + `mcp-services.bundled.json`); the packer
-hard-fails without VALIDATED assets (version gates + >= 42 transport tuples +
->= 68 services — see scripts/release/bundle_catalog.py, the catalog spec §3.2
-no-cold-start layer 2). CI generates them from the live catalog repo; offline
-builds use `bundle_catalog.py generate --fixture`.
+hard-fails without VALIDATED assets (version gates + the transport-tuple and
+service minimums — see scripts/release/bundle_catalog.py, the catalog spec
+§3.2 no-cold-start layer 2). CI generates them from the live catalog repo at
+one resolved commit per run; offline builds use
+`bundle_catalog.py generate --fixture`.
 
 `--binary` defaults to `<repo>/target/<target>/release/<binary-name>` (cross
 builds) and falls back to `<repo>/target/release/<binary-name>` (host builds),
@@ -27,9 +28,10 @@ where the binary name is `prime-agent.exe` for the Windows MSVC target and
 `prime-agent` everywhere else (`binary_name_for_target`).
 `--runtime-dir` defaults to `<repo>/prime-agent-runtime` (the vendored sidecar
 from the kernel-packaging lane).
+Every archive includes a `package.json` version manifest beside the binary
+(TS installer parity: it is one of NATIVE_RELEASE_ASSETS).
 `--sha` (the continuous-build stamp): a full 40-char git commit SHA. When
-given, a `package.json` version manifest is staged beside the binary (TS
-installer parity: it is one of NATIVE_RELEASE_ASSETS) whose `version` is
+given, that manifest's `version` is
 `<version>-continuous.<sha>`, so the shipped binary reports the exact commit it
 was built from via `--version`; the manifest records the commit too. The
 archive name keeps the bare `<version>` so rolling releases overwrite assets.
@@ -60,6 +62,7 @@ from pathlib import Path
 
 # The bundled-catalog validation gate (same release-scripts directory).
 from bundle_catalog import BUNDLED_CATALOG_FILES, validate_bundled_catalog_dir
+from native_compat import stage_native_compat
 
 # Tarball-root payload order mirrors the TS `binaryAssets` list so the
 # installer lane can extract both distributions identically. The binary
@@ -67,11 +70,17 @@ from bundle_catalog import BUNDLED_CATALOG_FILES, validate_bundled_catalog_dir
 # build ships `prime-agent.exe`), so the list names the binary slot via
 # the placeholder resolved in `main`/`stage_tree`.
 BINARY_PLACEHOLDER = "prime-agent"
+# The licenses of every crate linked into the binary (`write_third_party_notices`).
+THIRD_PARTY_NOTICES = "THIRD-PARTY-NOTICES.txt"
+# Terminal control characters (C0 except tab and newline, DEL, C1): crate
+# license texts must not reach the terminal of whoever prints the notices.
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 STAGED_ENTRIES = [
     BINARY_PLACEHOLDER,
     "prime-agent-runtime",
     "skills",
     "LICENSE",
+    THIRD_PARTY_NOTICES,
     "README.md",
     # The bundled catalog assets (spec §3.2 layer 2): staged at the tarball
     # root beside the binary — the runtime resolves <packageDir>/<name> (the
@@ -267,14 +276,61 @@ def copy_runtime_tree(source: Path, target: Path) -> None:
     shutil.copytree(source, target, ignore=ignore)
 
 
+def deny_allowed_licenses(deny_toml: Path) -> list[str]:
+    """The `[licenses] allow` list of deny.toml, the one license allowlist.
+
+    Read with a minimal parser: the release build hosts run Python 3.9/3.10,
+    which have no tomllib, and the list is a flat array of strings.
+    """
+    text = "\n".join(line.split("#", 1)[0] for line in deny_toml.read_text().splitlines())
+    section = re.search(r"^\[licenses\]$(.*?)(?=^\[|\Z)", text, re.MULTILINE | re.DOTALL)
+    array = section and re.search(r"^allow\s*=\s*\[(.*?)\]", section.group(1),
+                                  re.MULTILINE | re.DOTALL)
+    if not array:
+        fail(f"no [licenses] allow list in {deny_toml}")
+    return re.findall(r'"([^"]+)"', array.group(1))
+
+
+def write_third_party_notices(repo_root: Path, target: str, out: Path) -> None:
+    """Render the licenses of every crate the shipped binary links for
+    `target` (cargo-about over pa-cli's normal dependency graph) to `out`.
+
+    cargo-about accepts exactly the licenses deny.toml allows, so a crate
+    under any other license fails the release here as it fails cargo-deny.
+    """
+    accepted = deny_allowed_licenses(repo_root / "deny.toml")
+    template = Path(__file__).resolve().parent / "third-party-notices.hbs"
+    with tempfile.TemporaryDirectory(prefix="prime-agent-about-") as tmp:
+        config = Path(tmp) / "about.toml"
+        config.write_text(
+            f"accepted = {json.dumps(accepted)}\n"
+            f"targets = {json.dumps([target])}\n"
+            "ignore-build-dependencies = true\n"
+            "ignore-dev-dependencies = true\n"
+        )
+        command = [
+            "cargo-about", "generate", "--locked", "--fail",
+            "--config", str(config),
+            "--manifest-path", str(repo_root / "crates" / "pa-cli" / "Cargo.toml"),
+            "--output-file", str(out), str(template),
+        ]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True)
+        except FileNotFoundError:
+            fail("cargo-about not found on PATH (install the version "
+                 ".github/actions/install-cargo-about pins)")
+    if result.returncode != 0:
+        fail(f"cargo-about failed for {target}:\n{result.stderr.strip()}")
+    text = out.read_bytes().decode("utf-8")
+    out.write_bytes(CONTROL_CHARACTERS.sub("", text).encode("utf-8"))
+
 
 def stage_tree(staging: Path, args: argparse.Namespace, stamped_version: str | None) -> dict:
     """Copy the tarball payload into the staging dir; return per-entry facts.
 
-    `stamped_version` is the continuous-build version stamp (None for plain
-    releases); when set, a `package.json` manifest is staged beside the binary
-    so `--version` reports it at runtime (the same exe-adjacent manifest the
-    TS binaryAssets carry — the Rust binary resolves it from `current_exe()`).
+    `stamped_version` overrides the plain release version in the always-staged
+    `package.json`. The binary reports it at runtime (the same exe-adjacent
+    manifest TS binaryAssets carry; Rust resolves it from `current_exe()`).
 
     The runtime entry ships the curated content (see
     RUNTIME_EXCLUDED_*); every other entry is a
@@ -313,6 +369,7 @@ def stage_tree(staging: Path, args: argparse.Namespace, stamped_version: str | N
                 shutil.copytree(source, target_path)
         else:
             shutil.copy2(source, target_path)
+    write_third_party_notices(args.repo_root, args.target, staging / THIRD_PARTY_NOTICES)
     # `chmod` is a no-op beyond the read-only bit on Windows hosts (the
     # exec bit the tar member filter re-pins below); on POSIX it makes the
     # staged binary executable for the `--version` probes.
@@ -334,17 +391,19 @@ def stage_tree(staging: Path, args: argparse.Namespace, stamped_version: str | N
         shutil.copyfile(catalog_assets / name, staging / name)
     payload = [binary_name if entry == BINARY_PLACEHOLDER else entry
                for entry in STAGED_ENTRIES]
+    manifest = {
+        "name": "prime-agent",
+        "version": stamped_version or args.version,
+        "description": "Prime Agent: the RLM coding agent (Rust build)",
+        "bin": {"prime-agent": binary_name},
+        "piConfig": {"name": "prime-agent", "configDir": ".prime/agent"},
+    }
     if stamped_version is not None:
-        manifest = {
-            "name": "prime-agent",
-            "version": stamped_version,
-            "description": "Prime Agent: the RLM coding agent (Rust build)",
-            "bin": {"prime-agent": binary_name},
-            "piConfig": {"name": "prime-agent", "configDir": ".prime/agent"},
-            "commit": args.sha,
-        }
-        (staging / "package.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        payload.append("package.json")
+        manifest["commit"] = args.sha
+    (staging / "package.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    payload.append("package.json")
+    if "-windows-" not in args.target:
+        payload.extend(stage_native_compat(staging))
     # The payload guard runs on the staged tree BEFORE packing: a decoder
     # sidecar staged by a later change fails here, not in the field.
     fail_if_decoder_in_tree(staging)

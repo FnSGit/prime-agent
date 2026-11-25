@@ -177,7 +177,7 @@ async fn digest_session_with_harness(
 
 /// A resumed session over the entries of a prior session (converted
 /// loop context, adopted manager).
-async fn resumed_digest_session(
+pub(super) async fn resumed_digest_session(
     entries: Vec<FileEntry>,
     harness: crate::session_engine::harness_digest::HarnessDigestContext,
 ) -> AgentSession {
@@ -232,9 +232,9 @@ async fn loop_digest_rows(session: &AgentSession) -> Vec<(String, Option<String>
 
 /// TS #2400 + #2394 at the resume boundary: unchanged state does not
 /// re-deliver a drifted-looking digest; a state change re-delivers
-/// exactly one, replacing the superseded copy.
+/// an appended update without rewriting the existing context prefix.
 #[tokio::test]
-async fn resume_dedupes_by_state_fingerprint_and_replaces_stale_digests() {
+async fn resume_dedupes_by_state_fingerprint_and_appends_stale_digest_update() {
     let tmp = tempfile::tempdir().unwrap();
     let harness_dir = tmp.path().join("harness");
     // Seeded global state: entries whose ranked order differs once the
@@ -334,8 +334,8 @@ async fn resume_dedupes_by_state_fingerprint_and_replaces_stale_digests() {
     );
 
     // Changed disk state: the fingerprint moves, so the boundary
-    // re-delivers — and the fresh row replaces the superseded copy
-    // instead of stacking (TS #2394).
+    // appends an authoritative update while preserving the prior prefix.
+    let prior_messages = resumed.agent().state().await.messages;
     state
         .entries
         .get_mut(&crate::refinement::RefinementKind::Memory)
@@ -361,15 +361,21 @@ async fn resume_dedupes_by_state_fingerprint_and_replaces_stale_digests() {
     crate::refinement::save_harness_state(&harness_dir, &state).unwrap();
     let refreshed = resumed_digest_session(entries.clone(), harness).await;
     let rows = loop_digest_rows(&refreshed).await;
-    assert_eq!(rows.len(), 1, "the fresh digest replaces the old copy");
+    let refreshed_messages = refreshed.agent().state().await.messages;
+    assert_eq!(
+        serde_json::to_value(&refreshed_messages[..prior_messages.len()]).unwrap(),
+        serde_json::to_value(&prior_messages).unwrap(),
+        "resume must preserve every existing provider-context row"
+    );
+    assert_eq!(rows.len(), 2, "the fresh digest appends to the old copy");
     assert!(
-        rows[0].1.is_some(),
+        rows[1].1.is_some(),
         "the delivered custom row carries its state fingerprint"
     );
-    assert!(rows[0].0.contains("Resume test memory"));
+    assert!(rows[1].0.contains("Resume test memory"));
     // The persisted transcript keeps every copy (TS #2394: the newest
     // digest remains authoritative), so the file holds both while the
-    // live context carries exactly one.
+    // live context retains both without rewriting the old prefix.
     let persisted: Vec<String> = refreshed
         .entries()
         .await
@@ -392,7 +398,7 @@ async fn resume_dedupes_by_state_fingerprint_and_replaces_stale_digests() {
     assert_eq!(persisted.len(), 2);
     assert_eq!(persisted[0], first_fingerprint);
     assert_ne!(persisted[1], first_fingerprint);
-    assert_eq!(Some(persisted[1].as_str()), rows[0].1.as_deref());
+    assert_eq!(Some(persisted[1].as_str()), rows[1].1.as_deref());
 }
 
 /// The digest body of the newest digest custom entry (fixture lookup).
@@ -463,7 +469,7 @@ async fn prompt_rides_digest_row_into_the_run() {
     // events and never crosses an await.
     let (end_messages, kinds) = {
         let captured = events.lock().unwrap();
-        let Some(AgentEvent::AgentEnd { messages }) = captured
+        let Some(AgentEvent::AgentEnd { messages, .. }) = captured
             .iter()
             .rev()
             .find(|event| matches!(event, AgentEvent::AgentEnd { .. }))
@@ -547,7 +553,7 @@ async fn prompt_rides_digest_row_into_the_run() {
             .iter()
             .rev()
             .find_map(|event| match event {
-                AgentEvent::AgentEnd { messages } => Some(
+                AgentEvent::AgentEnd { messages, .. } => Some(
                     messages
                         .iter()
                         .map(|message| message.role().to_string())
@@ -644,6 +650,288 @@ async fn prompt_injected_message_persists_one_custom_row() {
         user_rows, 0,
         "the injected turn must not persist a user row"
     );
+}
+
+/// The busy-delivery pins (the inbox-notice injection class): a message
+/// admitted while the agent streams must QUEUE with its streaming
+/// behavior — steer or follow-up — report the parked outcome
+/// ([`PromptOutcome::Queued`]), and carry every batched co-delivered row
+/// in the same batch; the streamingBehavior rejection stays only for the
+/// no-behavior call (the exact live failure text). Mutation: reverting
+/// the behavior-carrying admission to the busy bail turns the queue pins
+/// red; dropping the batch walk turns the batch pin red; reporting
+/// `Prompt` from the busy branch turns the outcome pins red; dropping the
+/// no-behavior bail turns the rejection pins red.
+#[tokio::test]
+async fn a_busy_session_queues_deliveries_with_a_behavior_and_rejects_without_one() {
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    provider.push_stalled_turn("holding the turn");
+    let options = AgentOptions {
+        initial_state: AgentInitialState {
+            model: Some(test_model()),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        ..Default::default()
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let session = Arc::new(
+        AgentSession::new(
+            Arc::new(Agent::new(options)),
+            SessionManager::in_memory(tmp.path()),
+            vec![],
+        )
+        .await
+        .unwrap(),
+    );
+    // Start the stalled run and wait until the session streams.
+    let held = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move {
+            let _ = session
+                .prompt("hold the turn", PromptOptions::default())
+                .await;
+        })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !session.agent().state().await.is_streaming {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stalled run never registered"
+        );
+        tokio::task::yield_now().await;
+    }
+    let notice = |text: &str| pa_types::session::CustomMessage {
+        custom_type: "inbox_notice".to_string(),
+        content: pa_types::ai::UserContent::Text(text.to_string()),
+        display: true,
+        details: None,
+        timestamp: 0,
+        rest: serde_json::Map::default(),
+    };
+
+    // The injected notice class queues by the delivery's behavior, and
+    // the outcome says so: a parked row is never reported as a finished
+    // turn (the daemon's delivery seat keys its drain off `Queued`).
+    let outcome = session
+        .prompt_injected_message_with_behavior(&notice("steer notice"), StreamingBehavior::Steer)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        PromptOutcome::Queued,
+        "a busy injected delivery reports the parked outcome"
+    );
+    let outcome = session
+        .prompt_injected_message_with_behavior(
+            &notice("follow-up notice"),
+            StreamingBehavior::FollowUp,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, PromptOutcome::Queued);
+    // A custom row previews as an empty string, so the queue COUNTS are
+    // the observable: each behavior landed one batch on its queue.
+    assert_eq!(
+        session.agent().steering_previews().len(),
+        1,
+        "the steer delivery queues on the steering queue"
+    );
+    assert_eq!(
+        session.agent().follow_up_previews().len(),
+        1,
+        "the follow-up delivery queues behind the run"
+    );
+
+    // A user message with the steer behavior queues the same way (the
+    // operator ruling: user messages steer, never fail the delivery).
+    let outcome = session
+        .prompt(
+            "continue",
+            PromptOptions {
+                streaming_behavior: Some(StreamingBehavior::Steer),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, PromptOutcome::Queued);
+    assert_eq!(
+        session
+            .agent()
+            .steering_previews()
+            .iter()
+            .filter(|preview| preview.contains("continue"))
+            .count(),
+        1,
+        "the user's steer rides the steering queue"
+    );
+
+    // The batched co-delivery rows ride the busy branch too (the accepted
+    // rows a batched turn already persisted must reach the agent): ONE
+    // batch, primary first, the rows in delivery order.
+    let outcome = session
+        .prompt(
+            "batched primary",
+            PromptOptions {
+                streaming_behavior: Some(StreamingBehavior::Steer),
+                batch: vec![
+                    super::PromptBatchRow {
+                        text: "batch row one".to_string(),
+                        images: Vec::new(),
+                    },
+                    super::PromptBatchRow {
+                        text: "batch row two".to_string(),
+                        images: Vec::new(),
+                    },
+                ],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome, PromptOutcome::Queued);
+    assert_eq!(
+        session
+            .agent()
+            .steering_previews()
+            .last()
+            .map(String::as_str),
+        Some("batched primary batch row one batch row two"),
+        "the whole batch queues as one batch, primary first: {:?}",
+        session.agent().steering_previews()
+    );
+
+    // Without a behavior the busy rejection stays LOUD, both classes.
+    let rejection = "Agent is already processing. \
+Specify streamingBehavior ('steer' or 'followUp') to queue the message.";
+    let error = session
+        .prompt_injected_message(&notice("no behavior"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), rejection);
+    let error = session
+        .prompt("plain continue", PromptOptions::default())
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), rejection);
+
+    // Cleanup: abort the stalled run and let everything unwind.
+    session.agent().abort();
+    session.agent().wait_for_idle().await;
+    let _ = held.await;
+}
+
+/// A busy image delivery never re-routes a live episode: while the run
+/// streams, the busy branch queues the batch without consulting the
+/// router seam (the streaming run keeps its own target; the steered
+/// rows join the live episode, so the routing decision belongs to the
+/// run that actually serves them). The router records every call, so
+/// the pin goes red the moment the busy branch touches routing while
+/// `is_streaming` holds. Mutation: dropping the `!state.is_streaming`
+/// guard in the busy branch routes this delivery mid-episode — `decide`
+/// and `swap_target` both record.
+#[tokio::test]
+async fn a_busy_streaming_image_delivery_never_touches_the_router() {
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    provider.push_stalled_turn("holding the turn");
+    let options = AgentOptions {
+        initial_state: AgentInitialState {
+            model: Some(test_model()),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        ..Default::default()
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut session = AgentSession::new(
+        Arc::new(Agent::new(options)),
+        SessionManager::in_memory(tmp.path()),
+        vec![],
+    )
+    .await
+    .unwrap();
+    // The recording router: every `decide` and `swap_target` call counts.
+    let decide_calls = Arc::new(std::sync::Mutex::new(0u32));
+    let swap_calls = Arc::new(std::sync::Mutex::new(0u32));
+    session.set_image_model_router(Some(image_model_routing::ImageModelRouter {
+        decide: {
+            let decide_calls = Arc::clone(&decide_calls);
+            Arc::new(move |_carries_images, _level| {
+                *decide_calls.lock().unwrap() += 1;
+                Ok(None)
+            })
+        },
+        swap_target: {
+            let swap_calls = Arc::clone(&swap_calls);
+            Arc::new(move |_target| {
+                *swap_calls.lock().unwrap() += 1;
+            })
+        },
+    }));
+    let session = Arc::new(session);
+    // Start the stalled run and wait until the session streams.
+    let held = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move {
+            let _ = session
+                .prompt("hold the turn", PromptOptions::default())
+                .await;
+        })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !session.agent().state().await.is_streaming {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stalled run never registered"
+        );
+        tokio::task::yield_now().await;
+    }
+    // The stalled run's own idle admission legitimately consulted the
+    // router at its dispatch; zero the recorders so the pins below count
+    // only the busy delivery's calls.
+    *decide_calls.lock().unwrap() = 0;
+    *swap_calls.lock().unwrap() = 0;
+    let images = vec![pa_agent::types::ImageContent {
+        data: "aGk=".to_string(),
+        mime_type: "image/png".to_string(),
+    }];
+    let outcome = session
+        .prompt_with_images(
+            "describe this",
+            images,
+            PromptOptions {
+                streaming_behavior: Some(StreamingBehavior::Steer),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        PromptOutcome::Queued,
+        "the image delivery queues behind the run"
+    );
+    assert_eq!(
+        *decide_calls.lock().unwrap(),
+        0,
+        "the busy branch never consults routing while the run streams"
+    );
+    assert_eq!(
+        *swap_calls.lock().unwrap(),
+        0,
+        "the live episode keeps its own serving target"
+    );
+    assert_eq!(
+        session.agent().steering_previews().len(),
+        1,
+        "the image delivery parked its row on the steering lane"
+    );
+
+    // Cleanup: abort the stalled run and let everything unwind.
+    session.agent().abort();
+    session.agent().wait_for_idle().await;
+    let _ = held.await;
 }
 
 /// The comparison covers the whole request - system prompt, tools, and
@@ -826,6 +1114,434 @@ async fn prompt_persists_tool_results() {
     assert!(entry["timestamp"].as_str().is_some());
 }
 
+/// The tool-call lifecycle trace: a `tool_started` row at call issuance
+/// (call id, tool name, the command text), `tool_progress` heartbeat ticks
+/// while a long call runs, and the completed result carrying its duration.
+/// A stalled call is visible in the session trace while it runs — the
+/// Oscar incident showed a 13-minute recursive grep with a blank trace
+/// between issuance and the user's cancel.
+#[tokio::test]
+async fn long_tool_call_persists_started_tick_and_duration_rows() {
+    struct SlowTool;
+    impl pa_agent::types::AgentTool for SlowTool {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn description(&self) -> &'static str {
+            "sleeps before answering"
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            static PARAMETERS: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            PARAMETERS.get_or_init(|| serde_json::json!({ "type": "object" }))
+        }
+        fn execute(
+            self: Arc<Self>,
+            _tool_call_id: String,
+            _params: serde_json::Value,
+            _signal: pa_agent::abort::AbortSignal,
+            _on_update: pa_agent::types::AgentToolUpdateCallback,
+        ) -> pa_agent::BoxFut<'static, anyhow::Result<pa_agent::types::AgentToolResult>> {
+            Box::pin(async {
+                let started = std::time::Instant::now();
+                // Staged long call: ~5s run with the tick threshold pinned
+                // at 1s, so the heartbeat fires well before completion.
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let mut result = pa_agent::types::AgentToolResult::text("done");
+                result.details = serde_json::json!({
+                    "status": "ok",
+                    "durationMs": started.elapsed().as_millis() as u64,
+                });
+                Ok(result)
+            })
+        }
+    }
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    provider.push_tool_call_turn(
+        Some("calling"),
+        vec![(
+            "call-1",
+            "slow",
+            serde_json::json!({ "command": "grep -rli training ~/" }),
+        )],
+    );
+    provider.push_text_turn("done");
+    let options = AgentOptions {
+        initial_state: AgentInitialState {
+            model: Some(test_model()),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        tool_progress: Some(pa_agent::types::ToolProgressCadence {
+            after_ms: 1_000,
+            every_ms: 1_000,
+        }),
+        ..Default::default()
+    };
+    let agent = Agent::new(options);
+    agent.set_tools(vec![Arc::new(SlowTool)]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let session = SessionManager::persisted(std::path::Path::new("/w"), tmp.path());
+    let engine = AgentSession::new(Arc::new(agent), session, vec![])
+        .await
+        .unwrap();
+    engine.prompt("hi", PromptOptions::default()).await.unwrap();
+    engine.agent().wait_for_idle().await;
+    let entries = engine.entries().await;
+
+    let started = entries
+        .iter()
+        .find_map(|entry| match entry {
+            FileEntry::ToolStarted { payload, .. } => Some(payload.clone()),
+            _ => None,
+        })
+        .expect("tool_started row persisted");
+    assert_eq!(started.tool_call_id, "call-1");
+    assert_eq!(started.tool_name, "slow");
+    assert_eq!(
+        started.args,
+        serde_json::json!({ "command": "grep -rli training ~/" })
+    );
+
+    let ticks: Vec<pa_types::session::ToolProgressEntry> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            FileEntry::ToolProgress { payload, .. } => Some(payload.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !ticks.is_empty(),
+        "a 5s call with a 1s tick must emit at least one tool_progress row"
+    );
+    assert!(ticks.len() <= 5, "ticks bounded by the cadence: {ticks:?}");
+    assert!(ticks.iter().all(|tick| tick.tool_call_id == "call-1"));
+    assert!(ticks.iter().all(|tick| tick.tool_name == "slow"));
+    assert!(
+        ticks
+            .iter()
+            .all(|tick| tick.elapsed_ms >= 900 && tick.elapsed_ms < 5_500),
+        "tick elapsed is wall-clock time since the call started: {ticks:?}"
+    );
+
+    let tool_result = entries
+        .iter()
+        .find_map(|entry| match entry {
+            FileEntry::Message {
+                message: SessionAgentMessage::ToolResult(result),
+                ..
+            } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("toolResult entry persisted");
+    assert!(!tool_result.is_error);
+    assert_eq!(
+        tool_result.details.as_ref().and_then(|d| d.get("status")),
+        Some(&serde_json::json!("ok"))
+    );
+    let duration = tool_result
+        .details
+        .as_ref()
+        .and_then(|d| d.get("durationMs"))
+        .and_then(serde_json::Value::as_u64)
+        .expect("completed result carries durationMs");
+    assert!(duration >= 4_500, "durationMs: {duration}");
+
+    // The rows also live on disk in the session jsonl (the trace the
+    // session zip contains), with the new types round-tripping.
+    let file = tmp
+        .path()
+        .join(format!("{}.jsonl", engine.session_id().await))
+        .to_string_lossy()
+        .to_string();
+    let lines: Vec<serde_json::Value> = std::fs::read_to_string(file)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let started_line = lines
+        .iter()
+        .find(|line| line.get("type") == Some(&serde_json::json!("tool_started")))
+        .expect("tool_started line on disk");
+    assert_eq!(started_line["toolCallId"], "call-1");
+    assert_eq!(started_line["toolName"], "slow");
+    assert_eq!(started_line["args"]["command"], "grep -rli training ~/");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.get("type") == Some(&serde_json::json!("tool_progress"))),
+        "tool_progress line on disk"
+    );
+}
+
+/// The short-call contract: the start row and the result row persist, and
+/// the heartbeat stays quiet (no `tool_progress` row under the threshold).
+#[tokio::test]
+async fn short_tool_call_persists_started_row_without_progress() {
+    struct FastTool;
+    impl pa_agent::types::AgentTool for FastTool {
+        fn name(&self) -> &'static str {
+            "fast"
+        }
+        fn description(&self) -> &'static str {
+            "answers immediately"
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            static PARAMETERS: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            PARAMETERS.get_or_init(|| serde_json::json!({ "type": "object" }))
+        }
+        fn execute(
+            self: Arc<Self>,
+            _tool_call_id: String,
+            _params: serde_json::Value,
+            _signal: pa_agent::abort::AbortSignal,
+            _on_update: pa_agent::types::AgentToolUpdateCallback,
+        ) -> pa_agent::BoxFut<'static, anyhow::Result<pa_agent::types::AgentToolResult>> {
+            Box::pin(async { Ok(pa_agent::types::AgentToolResult::text("done")) })
+        }
+    }
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    provider.push_tool_call_turn(
+        Some("calling"),
+        vec![("call-1", "fast", serde_json::json!({}))],
+    );
+    provider.push_text_turn("done");
+    let options = AgentOptions {
+        initial_state: AgentInitialState {
+            model: Some(test_model()),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        tool_progress: Some(pa_agent::types::ToolProgressCadence {
+            after_ms: 1_000,
+            every_ms: 1_000,
+        }),
+        ..Default::default()
+    };
+    let agent = Agent::new(options);
+    agent.set_tools(vec![Arc::new(FastTool)]).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let session = SessionManager::in_memory(tmp.path());
+    let engine = AgentSession::new(Arc::new(agent), session, vec![])
+        .await
+        .unwrap();
+    engine.prompt("hi", PromptOptions::default()).await.unwrap();
+    engine.agent().wait_for_idle().await;
+    let entries = engine.entries().await;
+    assert!(
+        entries.iter().any(|entry| matches!(entry, FileEntry::ToolStarted { payload, .. } if payload.tool_call_id == "call-1")),
+        "short call still persists its tool_started row"
+    );
+    assert!(
+        entries
+            .iter()
+            .all(|entry| !matches!(entry, FileEntry::ToolProgress { .. })),
+        "a fast call must not emit tool_progress rows"
+    );
+    assert!(
+        entries.iter().any(|entry| matches!(
+            entry,
+            FileEntry::Message {
+                message: SessionAgentMessage::ToolResult(_),
+                ..
+            }
+        )),
+        "short call persists its toolResult row"
+    );
+}
+
+/// The aborted completion carries the elapsed duration: the trace shows how
+/// long the call ran before the kill, not just that it died. Before this
+/// fix, the aborted toolResult row carried only the bare "Tool execution
+/// aborted" text with no duration.
+#[tokio::test]
+async fn aborted_tool_call_result_carries_elapsed_duration() {
+    struct StalledTool(Arc<std::sync::atomic::AtomicBool>);
+    impl pa_agent::types::AgentTool for StalledTool {
+        fn name(&self) -> &'static str {
+            "stalled"
+        }
+        fn description(&self) -> &'static str {
+            "never finishes on its own"
+        }
+        fn parameters(&self) -> &serde_json::Value {
+            static PARAMETERS: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+            PARAMETERS.get_or_init(|| serde_json::json!({ "type": "object" }))
+        }
+        fn execute(
+            self: Arc<Self>,
+            _tool_call_id: String,
+            _params: serde_json::Value,
+            _signal: pa_agent::abort::AbortSignal,
+            _on_update: pa_agent::types::AgentToolUpdateCallback,
+        ) -> pa_agent::BoxFut<'static, anyhow::Result<pa_agent::types::AgentToolResult>> {
+            let entered = Arc::clone(&self.0);
+            Box::pin(async move {
+                entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                // The recursive-scan shape: unbounded runtime, only the
+                // abort ends it.
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                Ok(pa_agent::types::AgentToolResult::text("done"))
+            })
+        }
+    }
+    let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    provider.push_tool_call_turn(
+        Some("calling"),
+        vec![("call-1", "stalled", serde_json::json!({}))],
+    );
+    provider.push_text_turn("done");
+    let options = AgentOptions {
+        initial_state: AgentInitialState {
+            model: Some(test_model()),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        ..Default::default()
+    };
+    let agent = Agent::new(options);
+    agent
+        .set_tools(vec![Arc::new(StalledTool(Arc::clone(&entered)))])
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let session = SessionManager::in_memory(tmp.path());
+    let engine = Arc::new(
+        AgentSession::new(Arc::new(agent), session, vec![])
+            .await
+            .unwrap(),
+    );
+    let prompt_engine = Arc::clone(&engine);
+    let prompting =
+        tokio::spawn(async move { prompt_engine.prompt("hi", PromptOptions::default()).await });
+    // Bounded entered wait: a stalled tool that never starts fails the
+    // test instead of hanging the suite.
+    let tool_entered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !entered.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        tool_entered.is_ok(),
+        "the stalled tool never entered within 2s"
+    );
+    // Let the call run briefly so the elapsed duration is non-zero.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    engine.agent().abort();
+    prompting.await.unwrap().unwrap();
+    engine.agent().wait_for_idle().await;
+    let entries = engine.entries().await;
+    let tool_result = entries
+        .iter()
+        .find_map(|entry| match entry {
+            FileEntry::Message {
+                message: SessionAgentMessage::ToolResult(result),
+                ..
+            } => Some(result.clone()),
+            _ => None,
+        })
+        .expect("aborted toolResult entry persisted");
+    assert!(tool_result.is_error);
+    match &tool_result.content[..] {
+        [pa_types::ai::UserContentBlock::Text(text)] => {
+            assert_eq!(text.text, "Tool execution aborted");
+        }
+        other => panic!("expected the abort error text: {other:?}"),
+    }
+    let details = tool_result
+        .details
+        .as_ref()
+        .expect("aborted result has details");
+    assert_eq!(details.get("status"), Some(&serde_json::json!("aborted")));
+    let duration = details
+        .get("durationMs")
+        .and_then(serde_json::Value::as_u64)
+        .expect("aborted result carries durationMs");
+    assert!(duration >= 100, "durationMs: {duration}");
+}
+
+/// Persisted `ipython`/`python` calls dispatch through `ToolDefinitionBridge`
+/// to the registered Python tool.
+#[tokio::test]
+async fn python_tool_aliases_dispatch_to_python_repl() {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let definition = crate::tools::tool_definition::ToolDefinition {
+        name: pa_types::ai::PYTHON_TOOL_NAME.to_string(),
+        label: "Python".to_string(),
+        description: "Echoes its input".to_string(),
+        prompt_snippet: String::new(),
+        parameters: serde_json::json!({ "type": "object" }),
+        execution_mode: None,
+        prepare_arguments: None,
+        execute: {
+            let calls = Arc::clone(&calls);
+            Arc::new(move |_id, params, _signal, _on_update| {
+                let text = params
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    Ok(crate::tools::tool_definition::ToolExecutionResult::text(
+                        format!("echo:{text}"),
+                    ))
+                })
+            })
+        },
+    };
+    let provider = Arc::new(ScriptedProvider::new(test_model()));
+    provider.push_tool_call_turn(
+        Some("calling"),
+        vec![
+            ("call-1", "ipython", serde_json::json!({ "text": "a" })),
+            ("call-2", "python", serde_json::json!({ "text": "b" })),
+        ],
+    );
+    provider.push_text_turn("done");
+    let options = AgentOptions {
+        initial_state: AgentInitialState {
+            model: Some(test_model()),
+            ..Default::default()
+        },
+        stream_fn: Some(provider.stream_fn()),
+        ..Default::default()
+    };
+    let agent = Agent::new(options);
+    agent
+        .set_tools(vec![crate::session_engine::tool_bridge::bridge_tool(
+            definition,
+        )])
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let session = SessionManager::in_memory(tmp.path());
+    let engine = AgentSession::new(Arc::new(agent), session, vec![])
+        .await
+        .unwrap();
+    engine.prompt("go", PromptOptions::default()).await.unwrap();
+    engine.agent().wait_for_idle().await;
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let entries = engine.entries().await;
+    let texts: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| match entry {
+            FileEntry::Message {
+                message: SessionAgentMessage::ToolResult(result),
+                ..
+            } => Some(result),
+            _ => None,
+        })
+        .map(|result| {
+            assert!(!result.is_error, "result: {result:?}");
+            match &result.content[..] {
+                [pa_types::ai::UserContentBlock::Text(text)] => text.text.as_str(),
+                _ => panic!("expected a single text block: {result:?}"),
+            }
+        })
+        .collect();
+    assert_eq!(texts, ["echo:a", "echo:b"]);
+}
+
 /// A `toolResult` entry captured from a live TS session (read-only, from
 /// the installed product's own session store) parses into the Rust
 /// session types and re-serializes to the identical wire shape.
@@ -1000,4 +1716,107 @@ async fn run_boundaries_record_git_state() {
             },
         ]
     );
+}
+
+/// Cancelling a caller once its bill is resolved must not cancel that bill,
+/// whether the session lock or the durable store is busy.
+#[tokio::test]
+async fn a_resolved_model_bill_survives_its_callers_cancellation() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+    use tokio::sync::Notify;
+
+    struct GatedStore {
+        inner: Arc<dyn rlm_usage::RlmChildUsageStore>,
+        entered: Notify,
+        release: Notify,
+        completed: Notify,
+    }
+    impl rlm_usage::RlmChildUsageStore for GatedStore {
+        fn last_assistant(
+            &self,
+        ) -> rlm_usage::RlmChildUsageFuture<'_, Option<(String, pa_types::ai::Usage)>> {
+            self.inner.last_assistant()
+        }
+        fn append_attribution(
+            &self,
+            row_id: &str,
+            target_id: &str,
+            child_usage: pa_types::ai::Usage,
+            origin: Option<pa_types::session::ChildUsageOrigin>,
+        ) -> rlm_usage::RlmChildUsageFuture<'_, std::io::Result<rlm_usage::ChildUsageAppendResult>>
+        {
+            self.inner
+                .append_attribution(row_id, target_id, child_usage, origin)
+        }
+        fn append_model_usage(
+            &self,
+            session_id: String,
+            usage: model_usage::ModelUsage,
+        ) -> rlm_usage::RlmChildUsageFuture<'_, std::io::Result<()>> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                self.release.notified().await;
+                let result = self.inner.append_model_usage(session_id, usage).await;
+                self.completed.notify_one();
+                result
+            })
+        }
+        fn observe_billed_rows(
+            &self,
+            sink: crate::session::billed_row::BilledRowSink,
+        ) -> rlm_usage::RlmChildUsageFuture<'_, ()> {
+            self.inner.observe_billed_rows(sink)
+        }
+    }
+
+    let mut session = scripted_session().await;
+    let store = Arc::new(GatedStore {
+        inner: Arc::clone(&session.usage_store),
+        entered: Notify::new(),
+        release: Notify::new(),
+        completed: Notify::new(),
+    });
+    session.set_usage_store(store.clone());
+    let bill = model_usage::ModelUsage::new(
+        "compaction_discarded",
+        "test",
+        "m",
+        pa_types::ai::Usage {
+            input: 11,
+            output: 7,
+            total_tokens: 18,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let busy_session = Arc::clone(session.session_handle()).lock_owned().await;
+    let mut recording = Box::pin(session.record_model_usage(Some(bill.clone())));
+    // One poll hands the bill to its recording task, which waits on the
+    // held session lock. Readiness is the store's signal, never a fixed sleep.
+    assert!(recording
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    drop(recording);
+    drop(busy_session);
+    tokio::time::timeout(std::time::Duration::from_secs(5), store.entered.notified())
+        .await
+        .expect("recording reached the store");
+    store.release.notify_one();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.completed.notified(),
+    )
+    .await
+    .expect("a resolved bill must persist after its caller is cancelled");
+    let rows: Vec<serde_json::Value> = session
+        .entries()
+        .await
+        .into_iter()
+        .map(|entry| serde_json::to_value(entry).unwrap())
+        .filter(|entry| entry["customType"] == model_usage::MODEL_USAGE_CUSTOM_TYPE)
+        .map(|entry| entry["data"].clone())
+        .collect();
+    assert_eq!(rows, vec![serde_json::to_value(bill).unwrap()]);
 }

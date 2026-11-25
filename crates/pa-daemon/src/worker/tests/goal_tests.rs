@@ -186,12 +186,8 @@ async fn compact_with_paused_goal_never_continues() {
 /// or built with uv on PATH (the guard inside names the
 /// recipe when the cell fails instead of letting the loop drain
 /// the faux script into a misleading count mismatch).
-#[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
 #[tokio::test]
 async fn goal_turn_end_loop_runs_to_completion() {
-    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = std::env::temp_dir().join(format!("pa-worker-goal-loop-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = WorkerConfig {
@@ -209,7 +205,7 @@ async fn goal_turn_end_loop_runs_to_completion() {
                 "first pursuit turn",
                 "second pursuit turn",
                 { "content": [
-                    { "type": "toolCall", "name": "ipython",
+                    { "type": "toolCall", "name": "python_repl",
                       "arguments": { "code": "import goal; await goal.complete()" } },
                 ] },
                 "wrap-up after the completion",
@@ -241,8 +237,8 @@ async fn goal_turn_end_loop_runs_to_completion() {
     let idle = worker.dispatch("wait_for_idle", &json!({})).await;
     assert!(idle.success, "the goal loop never settled: {idle:?}");
     let events = session_events_since(&mut subscription);
-    // A gate run without the kernel environment (the kernel venv, or
-    // uv on PATH to build it) fails the
+    // A gate run without the kernel environment (the kernel venv with the
+    // bundled skills installed, or uv on PATH to build it) fails the
     // completing ipython cell: the goal stays active and the loop
     // keeps minting (TS parity: goal continuations are unbounded while
     // the goal is active) until the faux script runs dry. Fail with
@@ -251,12 +247,14 @@ async fn goal_turn_end_loop_runs_to_completion() {
     let kernel_failure = events.iter().find(|event| {
         event.get("type").and_then(Value::as_str) == Some("message_end")
             && event["message"]["role"] == "toolResult"
-            && event["message"]["isError"] == json!(true)
+            && (event["message"]["isError"] == json!(true)
+                || event["message"]["details"]["status"] == "error")
     });
     if let Some(failure) = kernel_failure {
         panic!(
             "the completing ipython cell failed — this test needs the kernel \
-                 environment (the bootstrapped kernel venv, or uv on PATH to build it): {failure:?}"
+                 environment (the bootstrapped kernel venv, or uv on PATH to build it; \
+                 a PRIME_AGENT_KERNEL_PYTHON override skips the skill install): {failure:?}"
         );
     }
     let goal_rows: Vec<&Value> = events
@@ -316,12 +314,8 @@ async fn goal_turn_end_loop_runs_to_completion() {
     assert!(plain.success, "a post-goal prompt failed: {plain:?}");
 }
 
-#[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
 #[tokio::test]
 async fn goal_pause_withdraws_the_queued_continuation() {
-    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = std::env::temp_dir().join(format!("pa-worker-goal-pause-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = WorkerConfig {
@@ -335,10 +329,8 @@ async fn goal_pause_withdraws_the_queued_continuation() {
         telemetry_disabled: None,
         script: Some(json!({
             "engine": "faux",
-            "responses": [
-                "start turn",
-                "one continuation turn at most",
-            ],
+            "responses": ["start turn", "continuation turn"],
+            "repeatLastResponse": true,
         })),
     };
     let worker = std::sync::Arc::new(Worker::new(config, None));
@@ -359,22 +351,78 @@ async fn goal_pause_withdraws_the_queued_continuation() {
         )
         .await;
     assert!(start.success, "the goal start failed: {start:?}");
+    // Holding queued input lets the running goal turn settle and mint its
+    // continuation, which then stays queued.
+    let input_pause = worker
+        .dispatch(
+            "acquire_session_input_pause",
+            &json!({
+                "activeSessionId": "goal-pause-session",
+                "leaseKey": "goal-pause",
+                "clientId": "test",
+            }),
+        )
+        .await;
+    assert!(
+        input_pause.success,
+        "the input pause failed: {input_pause:?}"
+    );
+    let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+    assert!(idle.success, "the held loop never parked: {idle:?}");
+    let queued_continuations = worker
+        .core
+        .lock()
+        .unwrap()
+        .follow_up
+        .iter()
+        .filter(|item| crate::worker::is_goal_context_item(item))
+        .count();
+    assert_eq!(queued_continuations, 1, "one continuation is queued");
+    let assistant_rows = || async {
+        let messages = worker.dispatch("get_messages", &json!({})).await;
+        messages
+            .data
+            .as_ref()
+            .and_then(|data| data.get("messages"))
+            .and_then(Value::as_array)
+            .map_or(0, |messages| {
+                messages
+                    .iter()
+                    .filter(|message| crate::types::message_role(message) == Some("assistant"))
+                    .count()
+            })
+    };
+    let assistant_rows_before = assistant_rows().await;
+    // The pause takes the steering lane ahead of the queued continuation.
     let pause = worker
         .dispatch(
-            "prompt_and_wait",
+            "prompt",
             &json!({ "activeSessionId": "goal-pause-session", "message": "/goal pause" }),
         )
         .await;
-    assert!(pause.success, "the pause never ran: {pause:?}");
-    // The loop is quiet: the idle wait settles without consuming
-    // further turns (a live continuation would starve it).
+    assert!(pause.success, "the pause was not admitted: {pause:?}");
+    let released = worker
+        .dispatch(
+            "release_session_input_pause",
+            &json!({
+                "activeSessionId": "goal-pause-session",
+                "pauseId": input_pause.data.as_ref().unwrap()["pauseId"],
+                "clientId": "test",
+            }),
+        )
+        .await;
+    assert!(
+        released.success,
+        "the input pause release failed: {released:?}"
+    );
     let idle = worker.dispatch("wait_for_idle", &json!({})).await;
     assert!(idle.success, "the loop never went quiet: {idle:?}");
     let goal = worker.engine.goal_state_value();
     assert_eq!(goal["status"], "paused", "goal state: {goal}");
-    assert!(
-        goal["continuationsUsed"].as_u64().unwrap_or(0) <= 2,
-        "the pause never withdrew the loop: {goal}"
+    assert_eq!(
+        assistant_rows().await,
+        assistant_rows_before,
+        "no continuation turn ran after the pause"
     );
 }
 

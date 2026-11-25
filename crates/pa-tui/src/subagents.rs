@@ -41,7 +41,7 @@ impl SessionIdentity {
             keys.push(format!("session:{id}"));
         }
         if let Some(path) = self.session_file.as_deref() {
-            keys.push(format!("file:{path}"));
+            keys.push(crate::agents_view_state::file_identity(path));
         }
         keys
     }
@@ -78,7 +78,7 @@ pub(crate) fn summary_parent_keys(summary: &Value) -> Vec<String> {
         keys.push(format!("session:{id}"));
     }
     if let Some(path) = get_str(summary, "parentSessionPath") {
-        keys.push(format!("file:{path}"));
+        keys.push(crate::agents_view_state::file_identity(path));
     }
     keys
 }
@@ -93,7 +93,7 @@ pub(crate) fn summary_identity_keys(summary: &Value) -> Vec<String> {
         keys.push(format!("session:{id}"));
     }
     if let Some(path) = get_str(summary, "sessionFile") {
-        keys.push(format!("file:{path}"));
+        keys.push(crate::agents_view_state::file_identity(path));
     }
     keys
 }
@@ -101,6 +101,16 @@ pub(crate) fn summary_identity_keys(summary: &Value) -> Vec<String> {
 /// Whether a summary is a spawned subagent (TS `isSubagentSummary`): the
 /// runtime kind decides when present; summaries from daemons that predate
 /// it still carry subagent linkage and never surface as top-level agents.
+/// Whether a summary belongs to a Decision API child (`decisionChild`):
+/// the agents view hides these System 1 children from the user; their
+/// spend still rolls into the parent's cost.
+pub(crate) fn is_decision_child_summary(summary: &Value) -> bool {
+    summary
+        .get("decisionChild")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
 pub(crate) fn is_subagent_summary(summary: &Value) -> bool {
     match summary.get("runtimeKind").and_then(Value::as_str) {
         Some(kind) => kind == "subagent",
@@ -147,7 +157,13 @@ pub(crate) fn depth_consistent_binding(
     else {
         return false;
     };
-    parent_file == Some(parent_path) && parent_depth == Some(depth - 1)
+    // The binding compares the SAME file's two Windows string forms (the
+    // raw summary form against the ledger's verbatim form), so it folds
+    // through the shared normalizer - an exact compare detaches the
+    // ledger's children exactly where the forest's keys do.
+    let parent_file = parent_file.map(crate::agents_view_state::normalize_session_file_path);
+    let normalized_path = crate::agents_view_state::normalize_session_file_path(parent_path);
+    parent_file.as_deref() == Some(normalized_path.as_str()) && parent_depth == Some(depth - 1)
 }
 
 /// Every row whose summary descends from `parent`, breadth-first over the
@@ -223,25 +239,6 @@ pub fn descendant_positions_with_depth(
     positions
 }
 
-/// The descendant positions of `parent`, depth-free (the flat
-/// consumers).
-#[must_use]
-pub fn descendant_positions(summaries: &[&Value], parent: &SessionIdentity) -> Vec<usize> {
-    descendant_positions_with_depth(summaries, parent)
-        .into_iter()
-        .map(|(position, _)| position)
-        .collect()
-}
-
-/// The summaries that descend from `parent`.
-#[must_use]
-pub fn descendant_rows<'a>(summaries: &[&'a Value], parent: &SessionIdentity) -> Vec<&'a Value> {
-    descendant_positions(summaries, parent)
-        .into_iter()
-        .map(|position| summaries[position])
-        .collect()
-}
-
 /// The roster entries that descend from `parent`, with each entry's
 /// depth below it (1 = a direct child).
 ///
@@ -264,15 +261,6 @@ pub fn descendant_entries_with_depth<'a>(
     descendant_positions_with_depth(&summaries, parent)
         .into_iter()
         .map(|(position, depth)| (with_summaries[position], depth))
-        .collect()
-}
-
-/// The roster entries that descend from `parent`.
-#[must_use]
-pub fn descendant_entries<'a>(roster: &'a [Value], parent: &SessionIdentity) -> Vec<&'a Value> {
-    descendant_entries_with_depth(roster, parent)
-        .into_iter()
-        .map(|(entry, _)| entry)
         .collect()
 }
 
@@ -307,6 +295,12 @@ pub fn entry_status(entry: &Value) -> AgentRosterStatus {
 pub fn count_descendants(roster: &[Value], parent: &SessionIdentity) -> SubagentCounts {
     let mut counts = SubagentCounts::default();
     for (entry, depth) in descendant_entries_with_depth(roster, parent) {
+        // The Decision API child's summary (`decisionChild`): a System 1
+        // server, not an interactive agent — the user never sees or
+        // manages it, so it never counts in the user-facing readout.
+        if entry.get("summary").is_some_and(is_decision_child_summary) {
+            continue;
+        }
         counts.total += 1;
         match entry_status(entry) {
             AgentRosterStatus::Running => {
@@ -328,7 +322,7 @@ pub fn count_descendants(roster: &[Value], parent: &SessionIdentity) -> Subagent
 /// agents view bills the session's row. `None` when the roster holds no
 /// record for the session.
 pub(crate) fn family_cost(roster: &[Value], session: &SessionIdentity) -> Option<f64> {
-    let records = crate::agents_view_state::reconcile_unified_sessions(roster, &[]);
+    let records = crate::agents_view_state::reconcile_unified_sessions(roster, &[], None);
     let rollups = crate::agents_view_forest::compute_rollups(&records);
     let keys = session.keys();
     records
@@ -402,6 +396,27 @@ mod tests {
     }
 
     #[test]
+    fn decision_children_never_count() {
+        let mut decision = child_summary("dc", "p1", "subagent");
+        decision["decisionChild"] = json!(true);
+        let roster = vec![
+            entry("parent", &parent_summary("p1"), "idle"),
+            entry("c1", &child_summary("c1", "p1", "subagent"), "running"),
+            entry("dc", &decision, "running"),
+        ];
+        let counts = count_descendants(
+            &roster,
+            &SessionIdentity::new(
+                Some("p1-live".to_string()),
+                Some("p1".to_string()),
+                Some("/sessions/p1.jsonl".to_string()),
+            ),
+        );
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.running, 1);
+    }
+
+    #[test]
     fn running_split_counts_direct_and_nested() {
         let mut roster = vec![
             entry("parent", &parent_summary("p1"), "idle"),
@@ -469,7 +484,7 @@ mod tests {
         assert_eq!(family_cost(&roster, &identity), Some(2.30));
         // Pinned against the agents-view row itself, not a second copy
         // of the formula.
-        let records = crate::agents_view_state::reconcile_unified_sessions(&roster, &[]);
+        let records = crate::agents_view_state::reconcile_unified_sessions(&roster, &[], None);
         let rollups = crate::agents_view_forest::compute_rollups(&records);
         let rows = crate::agents_view_forest::build_rows(
             &records,
@@ -477,6 +492,7 @@ mod tests {
             &std::collections::HashSet::new(),
             &std::collections::HashSet::new(),
             &rollups,
+            &crate::agents_view_forest::ActivityCounts::default(),
             None,
         );
         let row = rows

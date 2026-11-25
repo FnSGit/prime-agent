@@ -273,7 +273,7 @@ impl AgentSessionEngine {
                 .lock()
                 .expect("auto compaction abort lock") = Some(std::sync::Arc::clone(&controller));
         }
-        let api_key = self.resolve_request_api_key(&model);
+        let (model, api_key) = self.resolve_request_target(model);
         // The lock covers the clone only; the summarizer call below must not ride it.
         let engine = self.session.blocking_lock().clone();
         let Some(engine) = engine else {
@@ -281,25 +281,18 @@ impl AgentSessionEngine {
             return OverflowAttempt::None;
         };
         let outcome = {
-            let compact = async {
-                engine
-                    .session
-                    .compact(
-                        custom_instructions.as_deref(),
-                        &model,
-                        api_key,
-                        Some(&signal),
-                    )
-                    .await
-            };
-            let outcome = self
-                .runtime
-                .block_on(pa_agent::abort::race_with_abort(compact, &signal));
+            // The signal cancels the compaction only before its commit.
+            let outcome = self.runtime.block_on(engine.session.compact(
+                custom_instructions.as_deref(),
+                &model,
+                api_key,
+                Some(&signal),
+            ));
             self.clear_auto_compaction_abort(&controller);
             outcome
         };
         match outcome {
-            Ok(Ok(CompactOutcome::Ran(run))) => {
+            Ok(CompactOutcome::Ran(run)) => {
                 // Adoption telemetry: every completed compaction counts into
                 // the active run.
                 {
@@ -359,7 +352,7 @@ impl AgentSessionEngine {
             }
             // A skipped overflow recovery does not re-issue (TS excludes
             // overflow from `resumeAfterFailure`).
-            Ok(Ok(CompactOutcome::Skipped(message))) => {
+            Ok(CompactOutcome::Skipped(message)) => {
                 if !self.emit_unsuccessful_compaction(
                     CompactionOutcomeReason::Overflow,
                     CompactionOutcomeKind::Skipped,
@@ -371,10 +364,9 @@ impl AgentSessionEngine {
                 }
                 OverflowAttempt::Finished
             }
-            // An abort from either layer — the race dropped the in-flight
-            // summarizer request, or the pre-commit signal check fired:
-            // the cancelled recovery does not re-issue.
-            Ok(Err(error)) | Err(error) if pa_agent::abort::is_abort_error(&error) => {
+            // An abort before the commit — the dropped summarizer request or
+            // the pre-commit signal check: the cancelled recovery does not re-issue.
+            Err(error) if pa_agent::abort::is_abort_error(&error) => {
                 if !self.emit_unsuccessful_compaction(
                     CompactionOutcomeReason::Overflow,
                     CompactionOutcomeKind::Cancelled,
@@ -386,7 +378,7 @@ impl AgentSessionEngine {
                 }
                 OverflowAttempt::Finished
             }
-            Ok(Err(error)) | Err(error) => {
+            Err(error) => {
                 if !self.emit_unsuccessful_compaction(
                     CompactionOutcomeReason::Overflow,
                     CompactionOutcomeKind::Failed,
@@ -405,7 +397,6 @@ impl AgentSessionEngine {
 #[cfg(test)]
 mod tests {
     use crate::agent_engine::tests::{admit, faux_engine_with_settings};
-    use crate::agent_engine::FAUX_TEST_LOCK;
     use crate::agent_engine::{AgentEngineConfig, AgentSessionEngine};
     use crate::engine::EngineEvent;
     use crate::engine::SessionEngine;
@@ -445,7 +436,7 @@ mod tests {
     fn faux_engine_with_compaction_settings(
         script: &Value,
         settings: &Value,
-    ) -> (AgentSessionEngine, tempfile::TempDir) {
+    ) -> (std::sync::Arc<AgentSessionEngine>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let agent_dir = dir.path().join("agent");
         std::fs::create_dir_all(&agent_dir).unwrap();
@@ -466,6 +457,10 @@ mod tests {
             queued_steering_probe: None,
         })
         .unwrap();
+        let engine = std::sync::Arc::new(engine);
+        // The worker registers the engine's own arc: the live-auth
+        // resolver upgrades it per provider call.
+        engine.register_arc();
         (engine, dir)
     }
 
@@ -530,9 +525,6 @@ mod tests {
 
     #[test]
     fn overflow_compacts_retries_once_then_reports_the_failure() {
-        let _faux = FAUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (engine, _dir) = faux_engine_with_settings(
             &json!({
                 "responses": [
@@ -620,9 +612,6 @@ mod tests {
 
     #[test]
     fn overflow_retry_succeeds_on_the_compacted_context() {
-        let _faux = FAUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (engine, _dir) = faux_engine_with_settings(
             &json!({
                 "responses": [
@@ -664,9 +653,6 @@ mod tests {
 
     #[test]
     fn combined_limit_overflow_compacts_and_retries() {
-        let _faux = FAUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (engine, _dir) = faux_engine_with_settings(
             &json!({
                 "responses": [
@@ -708,9 +694,6 @@ mod tests {
 
     #[test]
     fn overflow_recovery_skip_surfaces_the_warning_row() {
-        let _faux = FAUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // `keepRecentTokens` beyond the whole session: the cut keeps
         // everything, so the compaction has no history to summarize.
         let (engine, _dir) = faux_engine_with_compaction_settings(
@@ -752,9 +735,6 @@ mod tests {
 
     #[test]
     fn stale_overflow_error_recovers_before_the_next_prompt() {
-        let _faux = FAUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (engine, _dir) = faux_engine_with_settings(
             &json!({
                 "responses": [
@@ -820,9 +800,6 @@ mod tests {
 
     #[test]
     fn non_overflow_error_never_triggers_the_arm() {
-        let _faux = FAUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (engine, _dir) = faux_engine_with_settings(
             &json!({
                 "responses": [
@@ -844,9 +821,6 @@ mod tests {
 
     #[test]
     fn overflow_recovery_aborted_mid_run_records_the_cancelled_outcome() {
-        let _faux = FAUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (engine, _dir) = faux_engine_with_settings(
             &json!({
                 "responses": [
@@ -914,9 +888,6 @@ mod tests {
 
     #[test]
     fn overflow_error_with_compaction_disabled_ends_without_recovery() {
-        let _faux = FAUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (engine, _dir) = faux_engine_with_compaction_settings(
             &json!({
                 "responses": [

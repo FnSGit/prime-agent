@@ -154,6 +154,118 @@ fn a_parked_retry_reuses_its_id_only_for_an_identical_body_in_the_same_epoch() {
     );
 }
 
+#[test]
+fn a_retry_of_a_finished_request_mints_a_fresh_id() {
+    let (identity, _dir) = identity("session-f");
+    let recorder = Arc::new(SemanticEdgeRecorder::open(identity));
+    // A failed request's retry reuses its id.
+    let failed = recorder
+        .start_turn_request(FINGERPRINT_A)
+        .expect("the recorder mints ids");
+    recorder.fail_request(&failed);
+    recorder.prepare_turn_retry();
+    assert_eq!(
+        recorder.start_turn_request(FINGERPRINT_A).as_deref(),
+        Some(failed.as_str())
+    );
+    // A finished request (a completed reply the turn runner rejected) is
+    // never re-sent under its id, and its id still anchors child spawns.
+    let finished = recorder
+        .start_turn_request(FINGERPRINT_B)
+        .expect("the recorder mints ids");
+    recorder.finish_request(&finished);
+    assert_eq!(
+        recorder.last_turn_request_id().as_deref(),
+        Some(finished.as_str())
+    );
+    recorder.prepare_turn_retry();
+    let retried = recorder
+        .start_turn_request(FINGERPRINT_B)
+        .expect("the recorder mints ids");
+    assert_ne!(retried, finished);
+}
+
+/// The parent cancels a child mid-run: one parent -> child
+/// `child_cancelled` line anchored to the cancelling request, recorded at
+/// most once per child — including across a reopen, whose replay rebuilds
+/// the at-most-once claim (nano-rlm #202's `recordSubagentCancel`).
+#[test]
+fn a_child_cancel_is_ledgered_once_anchored_to_the_cancelling_request() {
+    let (identity, _dir) = identity("session-h");
+    let recorder = SemanticEdgeRecorder::open(identity.clone());
+    let request_id = recorder
+        .start_turn_request(FINGERPRINT_A)
+        .expect("the recorder mints ids");
+    let cancel = SemanticEdgeLedgerEvent::ChildCancelled {
+        session_id: "session-h".to_string(),
+        child_session_id: "child-session".to_string(),
+        request_id: request_id.clone(),
+        reason: super::ChildCancelledReason::UserCancel,
+    };
+    // The same child cancelled twice records one line.
+    recorder.record_child_cancelled("child-session", super::ChildCancelledReason::UserCancel);
+    recorder.record_child_cancelled("child-session", super::ChildCancelledReason::UserCancel);
+    assert_eq!(
+        read_ledger(&identity),
+        vec![
+            session_registered("session-h"),
+            request_started("session-h", &request_id),
+            cancel.clone(),
+        ]
+    );
+    // A reopen replays the cancel line, so a later cancel of the same
+    // child records nothing.
+    drop(recorder);
+    let reopened = SemanticEdgeRecorder::open(identity.clone());
+    reopened.record_child_cancelled("child-session", super::ChildCancelledReason::UserCancel);
+    // A different child still records, anchored to the replayed last turn.
+    reopened.record_child_cancelled("child-other", super::ChildCancelledReason::ParentDelete);
+    assert_eq!(
+        read_ledger(&identity),
+        vec![
+            session_registered("session-h"),
+            request_started("session-h", &request_id),
+            cancel,
+            SemanticEdgeLedgerEvent::ChildCancelled {
+                session_id: "session-h".to_string(),
+                child_session_id: "child-other".to_string(),
+                request_id,
+                reason: super::ChildCancelledReason::ParentDelete,
+            },
+        ]
+    );
+}
+
+/// A cancel with no live request anchors to nothing: a recorder that
+/// never started a turn, or one whose ledger is disabled, records no
+/// cancel (an absent edge beats a wrong one).
+#[test]
+fn a_child_cancel_without_a_live_request_records_nothing() {
+    let (identity, _dir) = identity("session-i");
+    let recorder = SemanticEdgeRecorder::open(identity.clone());
+    // No turn ever started: nothing anchors the cancel.
+    recorder.record_child_cancelled("child-session", super::ChildCancelledReason::UserCancel);
+    assert_eq!(
+        read_ledger(&identity),
+        vec![session_registered("session-i")]
+    );
+    // A live turn first, then a directory at the ledger path fails the
+    // cancel's append and permanently disables the recorder (works as
+    // root too).
+    recorder
+        .start_turn_request(FINGERPRINT_A)
+        .expect("the recorder mints ids");
+    let path = identity.ledger_path.as_ref().unwrap();
+    std::fs::remove_file(path).unwrap();
+    std::fs::create_dir(path).unwrap();
+    recorder.record_child_cancelled("child-session", super::ChildCancelledReason::UserCancel);
+    std::fs::remove_dir(path).unwrap();
+    // The disabled recorder has no last turn: even a fresh child records
+    // no cancel.
+    recorder.record_child_cancelled("child-other", super::ChildCancelledReason::UserCancel);
+    assert_eq!(read_ledger(&identity), Vec::new());
+}
+
 #[tokio::test]
 async fn split_summary_slices_commit_in_resolve_order() {
     let (identity, _dir) = identity("session-g");
@@ -398,6 +510,85 @@ async fn turn_requests_carry_both_headers_and_settle_by_stop_reason() {
             SemanticEdgeLedgerEvent::RequestFailed {
                 request_id: dropped_id,
             },
+        ]
+    );
+}
+
+/// A wrapped call dropped before the inner call returns — a turn abort
+/// while the live-auth resolution is in flight, what the agent loop's
+/// unbiased abort select does — still fails its started request: the
+/// ledger keeps its one-request-one-terminal-event contract, exactly
+/// like a dropped unsettled stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_call_mid_resolution_fails_its_started_request() {
+    use std::time::Duration;
+
+    use crate::models::ResolvedRequestAuth;
+    use crate::session_engine::provider_adapter::{
+        switchable_stream_fn_with_live_auth, LiveAuthResolver, ProviderTarget,
+    };
+
+    let registration =
+        pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+            api: Some("semantic-dropped-call-test".to_owned()),
+            ..Default::default()
+        });
+    registration.set_repeat_last_response(true);
+    registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Message(
+        pa_ai::faux::faux_assistant_text_message(
+            "ok",
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        ),
+    )]);
+    let (identity, _dir) = identity("session-dropped-mid-resolution");
+    let recorder = Arc::new(SemanticEdgeRecorder::open(identity.clone()));
+    // A resolver that blocks until released: the wrapped call parks on
+    // the live-auth resolution after `request_started` landed.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let entered_tx = Mutex::new(entered_tx);
+    let release_rx = Mutex::new(release_rx);
+    let resolver: LiveAuthResolver = Arc::new(move |_model| {
+        let _ = entered_tx.lock().unwrap().send(());
+        let _ = release_rx.lock().unwrap().recv();
+        ResolvedRequestAuth::default()
+    });
+    let stream_fn = wrap_stream_fn(
+        Arc::clone(&recorder),
+        switchable_stream_fn_with_live_auth(
+            Arc::new(std::sync::RwLock::new(Some(ProviderTarget {
+                api_key: Some("captured-key".to_string()),
+                model: registration.get_model(),
+                service_tier: None,
+                headers: None,
+            }))),
+            resolver,
+        ),
+    );
+    let mut call = stream_fn(
+        Model::unknown(),
+        LlmContext::default(),
+        StreamRequestOptions::default(),
+    );
+    let pending = futures::poll!(&mut call).is_pending();
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the resolution entered");
+    drop(call);
+    release_tx.send(()).expect("the release channel is open");
+    registration.unregister();
+    assert!(pending, "the wrapped call parks on the resolution");
+    let events = read_ledger(&identity);
+    let Some(SemanticEdgeLedgerEvent::RequestStarted { request_id, .. }) = events.get(1) else {
+        panic!("the ledger must carry the started request: {events:?}");
+    };
+    let request_id = request_id.clone();
+    assert_eq!(
+        events,
+        vec![
+            session_registered("session-dropped-mid-resolution"),
+            request_started("session-dropped-mid-resolution", &request_id),
+            SemanticEdgeLedgerEvent::RequestFailed { request_id },
         ]
     );
 }

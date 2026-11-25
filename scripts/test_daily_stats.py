@@ -3,7 +3,10 @@
 import contextlib
 import io
 import json
+import os
+import subprocess
 import tempfile
+import textwrap
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -14,6 +17,55 @@ import daily_stats as stats
 
 
 DAY = date(2026, 10, 5)
+
+
+class DeliveryLookupTests(unittest.TestCase):
+    def lookup(self, ids="", status=0, error=""):
+        workflow = (Path(__file__).resolve().parents[1] /
+                    ".github/workflows/daily-stats.yml").read_text()
+        step = workflow.split("      - name: Check previous delivery attempt\n", 1)[1]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1]
+                                 .split("      - name:", 1)[0])
+        # Stub only the API boundary; execute the workflow's actual Bash script.
+        gh = r'''
+gh() {
+  [[ "$1" == api && "$2" == --paginate ]] || return 99
+  [[ "$3" == "repos/test/repo/actions/artifacts?name=prime-agent-stats-2026-10-05&per_page=100" ]] || return 99
+  [[ "$4" == --jq && "$5" == '.artifacts[] | select(.name == "prime-agent-stats-2026-10-05" and .expired == false) | .id' ]] || return 99
+  printf '%s' "$API_IDS"
+  printf '%s' "$API_ERROR" >&2
+  return "$API_STATUS"
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            env = {"PATH": os.environ["PATH"], "REPORT_DAY": DAY.isoformat(),
+                   "GITHUB_REPOSITORY": "test/repo", "GITHUB_OUTPUT": str(output),
+                   "API_IDS": ids, "API_STATUS": str(status), "API_ERROR": error}
+            result = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o",
+                                     "pipefail", "-c", gh + script + "\necho lookup-complete"],
+                                    env=env, capture_output=True, text=True, timeout=10)
+            return result, output.read_text() if output.exists() else ""
+
+    def test_successful_empty_lookup_allows_report_preparation(self):
+        result, output = self.lookup()
+        self.assertEqual((result.returncode, result.stdout, output),
+                         (0, "lookup-complete\n", ""))
+
+    def test_existing_markers_prevent_duplicate_delivery(self):
+        for ids in ("123\n", "123\n456\n"):
+            with self.subTest(ids=ids):
+                result, output = self.lookup(ids=ids)
+                self.assertEqual((result.returncode, output), (0, "attempted=true\n"))
+                self.assertIn("skipping", result.stdout)
+
+    def test_api_errors_stop_before_report_preparation_even_after_partial_results(self):
+        for ids, error in (("", "unexpected end of JSON input"),
+                           ("", "HTTP 500"), ("123\n", "HTTP 500 on later page")):
+            with self.subTest(ids=ids, error=error):
+                result, output = self.lookup(ids=ids, status=1, error=error)
+                self.assertEqual((result.returncode, output), (1, ""))
+                self.assertNotIn("lookup-complete", result.stdout)
 
 
 def fixture():
@@ -67,20 +119,21 @@ class ReportTests(unittest.TestCase):
                 stats.parse_results(response, DAY)
 
     def test_percentage_changes_and_zero_baselines(self):
-        cases = [(100, 80, "↑ 25.0%"), (80, 100, "↓ 20.0%"),
+        cases = [(100, 80, "🟢 ↑ 25.0%"), (80, 100, "🔴 ↓ 20.0%"),
                  (100, 100, "→ 0.0%"), (0, 0, "→ 0.0%"),
                  (100, 0, "new (baseline 0)"), (None, 100, "n/a")]
         for current, previous, expected in cases:
             self.assertEqual(stats.change(current, previous), expected)
-        self.assertEqual(stats.change(90, 80, percentage_points=True), "↑ 10.0pp")
+        self.assertEqual(stats.change(90, 80, percentage_points=True), "🟢 ↑ 10.0pp")
+        self.assertEqual(stats.change(80, 90, percentage_points=True), "🔴 ↓ 10.0pp")
 
     def test_report_compares_complete_rolling_windows_and_success_rate(self):
         report = stats.render_report(stats.parse_results(fixture(), DAY), DAY)
         self.assertTrue(report.startswith("*Prime Agent Daily Stats (Oct 5, 2026)*\n"))
         lines = report.splitlines()
-        self.assertTrue(lines[2].startswith("• *DAU: 100* · ↑ 25.0%"))
-        self.assertTrue(lines[3].startswith("• *WAU: 300* · ↑ 50.0%"))
-        self.assertTrue(lines[4].startswith("• *MAU: 700* · ↑ 40.0%"))
+        self.assertTrue(lines[2].startswith("• *DAU: 100* · 🟢 ↑ 25.0%"))
+        self.assertTrue(lines[3].startswith("• *WAU: 300* · 🟢 ↑ 50.0%"))
+        self.assertTrue(lines[4].startswith("• *MAU: 700* · 🟢 ↑ 40.0%"))
         self.assertNotIn("—", report)
         self.assertNotIn("(UTC)", report)
         for expected in ("DAU: 100", "↑ 25.0% vs yesterday", "↑ 100.0% vs last week",
@@ -111,7 +164,20 @@ class ReportTests(unittest.TestCase):
             request.assert_not_called()
             send.assert_not_called()
             self.assertNotIn("95.0%", stdout.getvalue())
-            self.assertIn("Run success rate: 95.0%", json.loads(output.read_text())["text"])
+            payload = json.loads(output.read_text())
+            text = stats.render_report(stats.parse_results(fixture(), DAY), DAY)
+            metrics, dashboard = text.rsplit("\n\n", 1)
+            self.assertEqual(payload, {
+                "text": text, "unfurl_links": False, "unfurl_media": False,
+                "blocks": [
+                    {"type": "section", "text": {"type": "mrkdwn", "text": metrics}},
+                    {"type": "divider"},
+                    {"type": "section", "text": {"type": "mrkdwn", "text": dashboard}},
+                ],
+            })
+            self.assertIn("Run success rate: 95.0%", payload["text"])
+            self.assertTrue(payload["text"].endswith(f"<{stats.DASHBOARD_URL}|Open dashboard>"))
+            self.assertNotIn("Active users count", payload["text"])
 
     def test_prepare_api_uses_fresh_blocking_query(self):
         with tempfile.TemporaryDirectory() as directory, \

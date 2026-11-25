@@ -17,7 +17,7 @@ use crate::agent_loop::{
 use crate::stream::StreamFn;
 use crate::types::{
     AgentEvent, AgentMessage, AgentTool, ImageContent, Model, ThinkingLevel, ToolExecutionMode,
-    Usage,
+    ToolProgressCadence, Usage,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -58,6 +58,14 @@ impl AgentContinueError {
             code,
             message: message.into(),
         }
+    }
+
+    /// The busy refusal with the caller's message: the shared typed form
+    /// every slot-refusal bail uses (callers classify the refusal instead
+    /// of matching text).
+    #[must_use]
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::new(AgentContinueErrorCode::Busy, message)
     }
 }
 
@@ -101,7 +109,12 @@ pub struct AgentOptions {
     pub steering_mode: Option<QueueMode>,
     pub follow_up_mode: Option<QueueMode>,
     pub session_id: Option<String>,
+    /// The transport every request of this agent asks for (TS `AgentOptions.transport`).
+    pub transport: Option<crate::types::Transport>,
     pub tool_execution: Option<ToolExecutionMode>,
+    /// Heartbeat cadence for in-flight tool calls; `None` keeps the 60s
+    /// default tick.
+    pub tool_progress: Option<ToolProgressCadence>,
 }
 
 struct MutableAgentState {
@@ -278,6 +291,14 @@ type AgentEventListener = Arc<
     dyn Fn(AgentEvent, AbortSignal) -> crate::BoxFut<'static, anyhow::Result<()>> + Send + Sync,
 >;
 
+/// Rewrites one `MessageEnd` row just before it lands in agent state and
+/// before listeners see the event: the session engine installs it to
+/// apply rows parked ahead of their landing message (late
+/// `agent_message.send` receipts), so live state and the persistence
+/// listener's row both carry the rewrite.
+pub type MessageEndTransformFn =
+    Arc<dyn Fn(AgentMessage) -> crate::BoxFut<'static, AgentMessage> + Send + Sync>;
+
 /// Unsubscribe handle: dropping it does NOT unsubscribe; call
 /// [`Subscription::unsubscribe`] explicitly to remove the listener.
 pub struct Subscription {
@@ -307,14 +328,67 @@ struct ActiveRun {
     model: Model,
 }
 
+/// An owned run slot: the claimed run's abort signal and model-override snapshot.
+struct RunClaim {
+    signal: AbortSignal,
+    model_override: Option<AgentModelOverride>,
+}
+
+impl Shared {
+    fn end_stream(&mut self) {
+        self.state.is_streaming = false;
+        self.state.streaming_message = None;
+        self.state.pending_tool_calls.clear();
+    }
+}
+
+/// Ends a started run on every exit path: the normal end settles it, and a
+/// dropped or panicking run future settles it on drop, so a lost run never
+/// leaves the slot taken and `is_streaming` set. The stream state clears
+/// before the slot frees, the order the busy checks rely on.
+struct RunEndGuard(Option<Arc<AgentInner>>);
+
+impl RunEndGuard {
+    async fn settle(mut self) {
+        // Stays armed across the lock wait: a cancelled settle ends the run on drop.
+        let inner = self.0.as_ref().expect("a run ends once");
+        inner.shared.lock().await.end_stream();
+        self.0.take().expect("a run ends once").release_run();
+    }
+}
+
+impl Drop for RunEndGuard {
+    fn drop(&mut self) {
+        let Some(inner) = self.0.take() else {
+            return;
+        };
+        let ended = match inner.shared.try_lock() {
+            Ok(mut shared) => {
+                shared.end_stream();
+                true
+            }
+            Err(_) => false,
+        };
+        if ended {
+            inner.release_run();
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // Another task holds the state for a moment: settle once it lets go.
+            runtime.spawn(Self(Some(inner)).settle());
+        }
+    }
+}
+
 struct AgentInner {
-    /// One lock serializes state reduction and listener awaits: emitted
-    /// events are processed strictly in the order the loop emits them.
+    /// Serializes state reduction and listener delivery without holding the
+    /// state lock across callbacks that may read or restore that state.
+    event_delivery: tokio::sync::Mutex<()>,
     shared: tokio::sync::Mutex<Shared>,
     steering_queue: Mutex<PendingMessageQueue>,
     follow_up_queue: Mutex<PendingMessageQueue>,
     /// Active-run bookkeeping. A plain mutex: never held across awaits.
     run: Mutex<Option<ActiveRun>>,
+    /// Serializes run admission with idle-only context commits.
+    admission: tokio::sync::Mutex<()>,
     convert_to_llm: ConvertToLlmFn,
     transform_context: Option<TransformContextFn>,
     stream_fn: Option<StreamFn>,
@@ -326,12 +400,18 @@ struct AgentInner {
     /// The natural-turn-end continuation hook: settable after construction so the session engine
     /// can install it. A plain mutex: cloned at run-config build, never held across an await.
     get_continuation_messages: Mutex<Option<GetContinuationMessagesFn>>,
+    /// The `MessageEnd` landing transform: settable after construction so
+    /// the session engine can install it. A plain mutex: cloned at event
+    /// processing entry, never held across an await.
+    message_end_transform: Mutex<Option<MessageEndTransformFn>>,
     /// Per-run model override; the owner sets it right before starting a routed run and clears it
     /// before the next dispatch. A plain mutex: read at run-config build, never held across an
     /// await.
     model_override: Mutex<Option<AgentModelOverride>>,
     session_id: Option<String>,
+    transport: Option<crate::types::Transport>,
     tool_execution: ToolExecutionMode,
+    tool_progress: ToolProgressCadence,
 }
 
 impl AgentInner {
@@ -350,7 +430,18 @@ impl AgentInner {
     }
 
     async fn process_events(self: &Arc<Self>, event: AgentEvent) -> anyhow::Result<()> {
+        let _delivery = self.event_delivery.lock().await;
+        let message_end_transform = self.message_end_transform.lock().unwrap().clone();
         let mut shared = self.shared.lock().await;
+        // The landing transform rewrites a `MessageEnd` row under the same
+        // shared lock as the state push: the row lands in state and reaches
+        // every listener exactly once, already rewritten.
+        let event = match (event, message_end_transform) {
+            (AgentEvent::MessageEnd { message }, Some(transform)) => AgentEvent::MessageEnd {
+                message: transform(message).await,
+            },
+            (event, _) => event,
+        };
 
         match &event {
             AgentEvent::MessageStart { message } => {
@@ -382,7 +473,8 @@ impl AgentInner {
             }
             AgentEvent::AgentStart
             | AgentEvent::TurnStart
-            | AgentEvent::ToolExecutionUpdate { .. } => {}
+            | AgentEvent::ToolExecutionUpdate { .. }
+            | AgentEvent::ToolExecutionProgress { .. } => {}
         }
 
         let Some(signal) = self.current_signal() else {
@@ -394,6 +486,7 @@ impl AgentInner {
             .iter()
             .map(|(_, listener)| Arc::clone(listener))
             .collect();
+        drop(shared);
         for listener in listeners {
             listener(event.clone(), signal.clone()).await?;
         }
@@ -476,6 +569,7 @@ impl AgentInner {
             .await;
         let _ = self
             .process_events(AgentEvent::AgentEnd {
+                aborted,
                 messages: vec![AgentMessage::Standard(crate::types::Message::Assistant(
                     failure_message.clone(),
                 ))],
@@ -533,6 +627,7 @@ impl AgentInner {
         config.max_tokens = None;
         config.reasoning = reasoning;
         config.session_id.clone_from(&self.session_id);
+        config.transport = self.transport;
         config.transform_context.clone_from(&self.transform_context);
         config.get_api_key.clone_from(&self.get_api_key);
         config.should_stop_after_turn = should_stop_after_turn;
@@ -543,18 +638,15 @@ impl AgentInner {
         config.get_follow_up_messages = Some(follow_up);
         config.get_continuation_messages = continuation;
         config.tool_execution = self.tool_execution;
+        config.tool_progress = self.tool_progress;
         config.before_tool_call.clone_from(&self.before_tool_call);
         config.after_tool_call.clone_from(&self.after_tool_call);
         config
     }
 
-    async fn run_with_lifecycle<F, Fut>(self: &Arc<Self>, executor: F) -> anyhow::Result<()>
-    where
-        F: FnOnce(AbortSignal, Option<AgentModelOverride>) -> Fut,
-        Fut: std::future::Future<Output = anyhow::Result<()>>,
-    {
-        let controller = AbortController::new();
-        let (idle_tx, _idle_rx) = watch::channel(false);
+    /// Claims the run slot with the run's model snapshot, or fails when a run is active.
+    async fn claim_run(&self) -> anyhow::Result<RunClaim> {
+        let admission = self.admission.lock().await;
         // The run's model-override snapshot, read once: a concurrent
         // `set_model_override` cannot split the run's model from its request fields.
         // Read before the run lock: the shared lock awaits, a std guard must never ride it.
@@ -565,19 +657,47 @@ impl AgentInner {
                 .as_ref()
                 .map_or_else(|| shared.state.model.clone(), |routed| routed.model.clone())
         };
-        {
-            let mut run = self.run.lock().unwrap();
-            if run.is_some() {
-                anyhow::bail!("Agent is already processing.");
-            }
-            *run = Some(ActiveRun {
-                controller: controller.clone(),
-                idle_tx,
-                model: run_model,
-            });
+        let mut run = self.run.lock().unwrap();
+        if run.is_some() {
+            // Typed as the busy refusal (the same message): callers that
+            // lost the run slot between their own check and this one
+            // classify the refusal instead of matching text.
+            return Err(anyhow::Error::new(AgentContinueError::new(
+                AgentContinueErrorCode::Busy,
+                "Agent is already processing.",
+            )));
         }
-        let run_signal = controller.signal();
+        let controller = AbortController::new();
+        let signal = controller.signal();
+        let (idle_tx, _idle_rx) = watch::channel(false);
+        *run = Some(ActiveRun {
+            controller,
+            idle_tx,
+            model: run_model,
+        });
+        drop(admission);
+        Ok(RunClaim {
+            signal,
+            model_override: run_override,
+        })
+    }
 
+    fn release_run(&self) {
+        if let Some(active) = self.run.lock().unwrap().take() {
+            let _ = active.idle_tx.send(true);
+        }
+    }
+
+    async fn run_with_lifecycle<F, Fut>(
+        self: &Arc<Self>,
+        claim: RunClaim,
+        executor: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(AbortSignal, Option<AgentModelOverride>) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        let run_end = RunEndGuard(Some(Arc::clone(self)));
         {
             let mut shared = self.shared.lock().await;
             shared.state.is_streaming = true;
@@ -585,7 +705,7 @@ impl AgentInner {
             shared.state.error_message = None;
         }
 
-        let result = executor(run_signal, run_override).await;
+        let result = executor(claim.signal, claim.model_override).await;
         if let Err(error) = &result {
             let aborted = self
                 .current_signal()
@@ -593,40 +713,36 @@ impl AgentInner {
             self.handle_run_failure(error, aborted).await;
         }
 
-        {
-            let mut shared = self.shared.lock().await;
-            shared.state.is_streaming = false;
-            shared.state.streaming_message = None;
-            shared.state.pending_tool_calls.clear();
-        }
-        {
-            let mut run = self.run.lock().unwrap();
-            if let Some(active) = run.take() {
-                let _ = active.idle_tx.send(true);
-            }
-        }
+        run_end.settle().await;
         result
     }
 
     async fn run_prompt_messages(
         self: &Arc<Self>,
+        claim: RunClaim,
         messages: Vec<AgentMessage>,
         skip_initial_steering_poll: bool,
     ) -> anyhow::Result<()> {
-        self.run_prompt_messages_with_start_signal(messages, skip_initial_steering_poll, None)
-            .await
+        self.run_prompt_messages_with_start_signal(
+            claim,
+            messages,
+            skip_initial_steering_poll,
+            None,
+        )
+        .await
     }
 
     /// The same run, firing `started` once the run registers; the caller
     /// returns while this run settles on its own.
     async fn run_prompt_messages_with_start_signal(
         self: &Arc<Self>,
+        claim: RunClaim,
         messages: Vec<AgentMessage>,
         skip_initial_steering_poll: bool,
         started: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> anyhow::Result<()> {
         let inner = Arc::clone(self);
-        self.run_with_lifecycle(|signal, model_override| async move {
+        self.run_with_lifecycle(claim, |signal, model_override| async move {
             if let Some(started) = started {
                 let _ = started.send(());
             }
@@ -659,8 +775,9 @@ impl AgentInner {
     }
 
     async fn run_continuation(self: &Arc<Self>) -> anyhow::Result<()> {
+        let claim = self.claim_run().await?;
         let inner = Arc::clone(self);
-        self.run_with_lifecycle(|signal, model_override| async move {
+        self.run_with_lifecycle(claim, |signal, model_override| async move {
             let (context, config) = {
                 let shared = inner.shared.lock().await;
                 (
@@ -691,17 +808,22 @@ impl AgentInner {
     /// Drains queued steering/follow-up messages as a run. Returns whether
     /// a run was started.
     async fn run_queued_messages(self: &Arc<Self>) -> anyhow::Result<bool> {
+        // Claim before draining: a caller that loses the run slot to a
+        // concurrent run must leave the queues for that run to deliver.
+        let claim = self.claim_run().await?;
         let queued_steering = self.steering_queue.lock().unwrap().drain();
-        if !queued_steering.is_empty() {
-            self.run_prompt_messages(queued_steering, true).await?;
-            return Ok(true);
+        let (messages, skip_initial_steering_poll) = if queued_steering.is_empty() {
+            (self.follow_up_queue.lock().unwrap().drain(), false)
+        } else {
+            (queued_steering, true)
+        };
+        if messages.is_empty() {
+            self.release_run();
+            return Ok(false);
         }
-        let queued_follow_ups = self.follow_up_queue.lock().unwrap().drain();
-        if !queued_follow_ups.is_empty() {
-            self.run_prompt_messages(queued_follow_ups, false).await?;
-            return Ok(true);
-        }
-        Ok(false)
+        self.run_prompt_messages(claim, messages, skip_initial_steering_poll)
+            .await?;
+        Ok(true)
     }
 
     fn normalize_prompt_input(input: AgentPromptInput) -> Vec<AgentMessage> {
@@ -742,6 +864,7 @@ impl Agent {
             ..MutableAgentState::default()
         };
         let inner = Arc::new(AgentInner {
+            event_delivery: tokio::sync::Mutex::new(()),
             shared: tokio::sync::Mutex::new(Shared {
                 state,
                 listeners: Vec::new(),
@@ -754,6 +877,7 @@ impl Agent {
                 options.follow_up_mode.unwrap_or(QueueMode::OneAtATime),
             )),
             run: Mutex::new(None),
+            admission: tokio::sync::Mutex::new(()),
             convert_to_llm: options
                 .convert_to_llm
                 .unwrap_or_else(AgentLoopConfig::default_convert_to_llm),
@@ -765,11 +889,14 @@ impl Agent {
             should_stop_after_turn: options.should_stop_after_turn,
             should_stop_before_turn: options.should_stop_before_turn,
             get_continuation_messages: Mutex::new(options.get_continuation_messages),
+            message_end_transform: Mutex::new(None),
             model_override: Mutex::new(None),
             session_id: options.session_id,
+            transport: options.transport,
             tool_execution: options
                 .tool_execution
                 .unwrap_or(ToolExecutionMode::Parallel),
+            tool_progress: options.tool_progress.unwrap_or_default(),
         });
         Agent { inner }
     }
@@ -807,6 +934,12 @@ impl Agent {
         shared
             .listeners
             .retain(|(listener_id, _)| *listener_id != id);
+    }
+
+    /// The session identity every request of this agent carries.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.inner.session_id.as_deref()
     }
 
     pub async fn state(&self) -> AgentStateSnapshot {
@@ -920,6 +1053,18 @@ impl Agent {
     /// Panics if the `get_continuation_messages` mutex is poisoned.
     pub fn set_continuation_hook(&self, hook: Option<GetContinuationMessagesFn>) {
         *self.inner.get_continuation_messages.lock().unwrap() = hook;
+    }
+
+    /// Install or replace the `MessageEnd` landing transform: the owner that
+    /// parks rows ahead of their landing message (the session engine's
+    /// late-receipt seam) wires it after the agent exists. `None` uninstalls
+    /// the transform.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `message_end_transform` mutex is poisoned.
+    pub fn set_message_end_transform(&self, transform: Option<MessageEndTransformFn>) {
+        *self.inner.message_end_transform.lock().unwrap() = transform;
     }
 
     /// # Panics
@@ -1045,12 +1190,46 @@ impl Agent {
         self.inner.current_signal()
     }
 
+    /// Whether a run occupies the active-run slot: the slot is taken before
+    /// `is_streaming` flips and released after it clears, so a busy decision
+    /// that must not fall into either window consults this beside the
+    /// streaming state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `run` mutex is poisoned.
+    #[must_use]
+    pub fn has_active_run(&self) -> bool {
+        self.inner.run.lock().unwrap().is_some()
+    }
+
     /// # Panics
     ///
     /// Panics if the `run` mutex is poisoned.
     pub fn abort(&self) {
         if let Some(run) = self.inner.run.lock().unwrap().as_ref() {
             run.controller.abort();
+        }
+    }
+
+    /// Reserve an idle boundary until the returned guard is dropped.
+    ///
+    /// Existing runs finish normally, including tools and internal follow-ups.
+    /// New run admission waits for this reservation; steering and follow-up
+    /// enqueue remain independent. Callers must not await model planning or
+    /// contended storage locks while holding the guard.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the active-run mutex is poisoned.
+    pub async fn reserve_idle(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        loop {
+            let admission = self.inner.admission.lock().await;
+            if self.inner.run.lock().unwrap().is_none() {
+                return admission;
+            }
+            drop(admission);
+            self.wait_for_idle().await;
         }
     }
 
@@ -1103,12 +1282,17 @@ impl Agent {
     /// Panics if the `run` mutex is poisoned.
     pub async fn prompt(&self, input: impl Into<AgentPromptInput>) -> anyhow::Result<()> {
         if self.inner.run.lock().unwrap().is_some() {
-            anyhow::bail!(
-                "Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion."
-            );
+            // The busy refusal is TYPED (the same message text): a caller
+            // that lost the run slot between its own check and this one
+            // classifies it instead of matching text.
+            return Err(anyhow::Error::new(AgentContinueError::new(
+                AgentContinueErrorCode::Busy,
+                "Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
+            )));
         }
         let messages = AgentInner::normalize_prompt_input(input.into());
-        self.inner.run_prompt_messages(messages, false).await
+        let claim = self.inner.claim_run().await?;
+        self.inner.run_prompt_messages(claim, messages, false).await
     }
 
     /// Admit the prompt, return once its run registers, and let the run
@@ -1126,18 +1310,26 @@ impl Agent {
         input: impl Into<AgentPromptInput>,
     ) -> anyhow::Result<()> {
         if self.inner.run.lock().unwrap().is_some() {
-            anyhow::bail!(
-                "Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion."
-            );
+            // The busy refusal is TYPED (the same message text): a caller
+            // that lost the run slot between its own check and this one
+            // classifies it instead of matching text.
+            return Err(anyhow::Error::new(AgentContinueError::new(
+                AgentContinueErrorCode::Busy,
+                "Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
+            )));
         }
         let messages = AgentInner::normalize_prompt_input(input.into());
         let inner = Arc::clone(&self.inner);
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (failed_tx, failed_rx) = tokio::sync::oneshot::channel::<anyhow::Error>();
         tokio::spawn(async move {
-            let result = inner
-                .run_prompt_messages_with_start_signal(messages, false, Some(started_tx))
-                .await;
+            let result = async {
+                let claim = inner.claim_run().await?;
+                inner
+                    .run_prompt_messages_with_start_signal(claim, messages, false, Some(started_tx))
+                    .await
+            }
+            .await;
             if let Err(error) = result {
                 let _ = failed_tx.send(error);
             }
@@ -1262,6 +1454,54 @@ mod tests {
         let removed = queue.remove_where(&|m| matches!(m, AgentMessage::Standard(crate::types::Message::User(u)) if matches!(&u.content, crate::types::UserContent::Text(t) if t.contains("drop"))));
         assert_eq!(removed.len(), 1);
         assert!(queue.has_items());
+    }
+
+    #[tokio::test]
+    async fn awaited_listeners_can_read_and_restore_state_before_the_next_listener() {
+        let agent = Agent::new(AgentOptions::default());
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let callback_agent = agent.clone();
+        let callback_entered = entered.clone();
+        let first = agent
+            .subscribe(move |_event, _signal| {
+                let agent = callback_agent.clone();
+                let entered = callback_entered.clone();
+                Box::pin(async move {
+                    entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let mut model = agent.state().await.model;
+                    model.id = "restored-primary".to_string();
+                    agent.set_model(model).await;
+                    Ok(())
+                })
+            })
+            .await;
+        let callback_agent = agent.clone();
+        let second = agent
+            .subscribe(move |_event, _signal| {
+                let agent = callback_agent.clone();
+                Box::pin(async move {
+                    assert_eq!(agent.state().await.model.id, "restored-primary");
+                    Ok(())
+                })
+            })
+            .await;
+        let inner = agent.inner.clone();
+        let claim = agent.inner.claim_run().await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent
+                .inner
+                .run_with_lifecycle(claim, move |_signal, _override| async move {
+                    inner.process_events(AgentEvent::AgentStart).await
+                }),
+        )
+        .await;
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+        result
+            .expect("awaited listener deadlocked on agent state")
+            .unwrap();
+        first.unsubscribe().await;
+        second.unsubscribe().await;
     }
 
     #[tokio::test]
@@ -1492,5 +1732,143 @@ mod tests {
             mixed, 0,
             "every snapshot carries a consistent (model, level) pair"
         );
+    }
+
+    #[tokio::test]
+    async fn a_run_claimed_while_continue_run_starts_leaves_the_queue_intact() {
+        fn poll_once<F: std::future::Future>(
+            future: std::pin::Pin<&mut F>,
+        ) -> std::task::Poll<F::Output> {
+            future.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+        }
+
+        let agent = Agent::new(AgentOptions::default());
+        agent.steer(AgentMessage::user("queued steer"));
+
+        // The tokio mutex hands the lock to waiters in arrival order, so holding it
+        // fixes the interleaving: continue_run parks first, the racing claim parks
+        // behind it while holding run admission.
+        let shared = agent.inner.shared.lock().await;
+        let mut continuing = std::pin::pin!(agent.continue_run());
+        assert!(poll_once(continuing.as_mut()).is_pending());
+        let mut claiming = std::pin::pin!(agent.inner.claim_run());
+        assert!(poll_once(claiming.as_mut()).is_pending());
+        drop(shared);
+
+        // continue_run passes its entry check and parks on admission; the racing
+        // claim then takes the run slot.
+        assert!(poll_once(continuing.as_mut()).is_pending());
+        let std::task::Poll::Ready(Ok(_claim)) = poll_once(claiming.as_mut()) else {
+            panic!("the racing claim takes the free run slot");
+        };
+
+        assert!(
+            continuing.await.is_err(),
+            "the racing claim owns the run slot"
+        );
+        assert!(
+            agent.has_queued_messages(),
+            "a continue_run that loses the run slot must leave the queued steer queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_or_dropped_run_frees_the_slot_for_the_next_prompt() {
+        type StreamFuture =
+            crate::BoxFut<'static, anyhow::Result<Box<dyn crate::stream::ModelStream>>>;
+        async fn assert_idle(agent: &Agent) {
+            assert!(!agent.has_active_run(), "the lost run left the slot taken");
+            assert!(
+                !agent.state().await.is_streaming,
+                "the lost run left is_streaming set"
+            );
+        }
+
+        // Call 1 panics inside the run, call 2 never answers (its run future
+        // is dropped), call 3 answers.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stream_fn: crate::stream::StreamFn = {
+            let calls = Arc::clone(&calls);
+            Arc::new(
+                move |requested: Model,
+                      _context: crate::stream::LlmContext,
+                      _options: crate::stream::StreamRequestOptions|
+                      -> StreamFuture {
+                    match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                        0 => panic!("provider panicked mid-run"),
+                        1 => Box::pin(std::future::pending()),
+                        _ => {
+                            let message = crate::types::AssistantMessage {
+                                content: vec![crate::types::AssistantContent::Text(
+                                    crate::types::TextContent {
+                                        text: "ok".to_string(),
+                                        text_signature: None,
+                                    },
+                                )],
+                                api: requested.api,
+                                provider: requested.provider,
+                                model: requested.id,
+                                response_model: None,
+                                response_id: None,
+                                diagnostics: None,
+                                usage: Usage::zero(),
+                                stop_reason: crate::types::StopReason::Stop,
+                                error_message: None,
+                                stop_reason_raw: None,
+                                timestamp: 0,
+                            };
+                            Box::pin(async move {
+                                let (handle, consumer) = crate::stream::event_stream();
+                                handle.push(crate::stream::AssistantMessageEvent::Done {
+                                    reason: crate::types::StopReason::Stop,
+                                    message: message.clone(),
+                                });
+                                handle.end(Some(message));
+                                Ok(Box::new(consumer) as Box<dyn crate::stream::ModelStream>)
+                            })
+                        }
+                    }
+                },
+            )
+        };
+        let agent = Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(Model {
+                    id: "m".to_string(),
+                    name: "m".to_string(),
+                    api: "anthropic-messages".to_string(),
+                    provider: "anthropic".to_string(),
+                    base_url: String::new(),
+                    reasoning: false,
+                    cost: crate::types::UsageCost::default(),
+                    context_window: 200_000,
+                    max_tokens: 8_192,
+                    max_tokens_explicit: false,
+                }),
+                ..Default::default()
+            },
+            stream_fn: Some(stream_fn),
+            ..Default::default()
+        });
+
+        let panicked = {
+            let agent = agent.clone();
+            tokio::spawn(async move { agent.prompt(AgentPromptInput::text("panics")).await })
+        };
+        assert!(panicked.await.unwrap_err().is_panic());
+        assert_idle(&agent).await;
+
+        let mut dropped = Box::pin(agent.prompt(AgentPromptInput::text("dropped")));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(dropped.as_mut(), &mut cx).is_pending());
+        assert!(agent.has_active_run() && agent.state().await.is_streaming);
+        drop(dropped);
+        assert_idle(&agent).await;
+
+        agent
+            .prompt(AgentPromptInput::text("runs"))
+            .await
+            .expect("the next prompt runs");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 }

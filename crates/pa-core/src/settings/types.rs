@@ -81,6 +81,15 @@ pub enum TransportSetting {
     WebSocketCached,
 }
 
+fn deserialize_threshold_percent<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value
+        .as_f64()
+        .filter(|percent| pa_types::compaction::is_valid_threshold_percent(*percent)))
+}
+
 /// `number | "unlimited"` autonomous limit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -93,6 +102,9 @@ pub enum AutonomousLimitSetting {
 #[serde(rename_all = "camelCase")]
 pub struct CompactionSettings {
     pub enabled: Option<bool>,
+    /// Percentage ceiling for automatic compaction; invalid values behave as unset.
+    #[serde(default, deserialize_with = "deserialize_threshold_percent")]
+    pub threshold_percent: Option<f64>,
     pub reserve_tokens: Option<u64>,
     pub keep_recent_tokens: Option<u64>,
     pub agent_callable: Option<bool>,
@@ -210,6 +222,37 @@ pub struct BundledSkillsSettings {
     pub websearch: Option<bool>,
 }
 
+/// `webSearchProvider`: the service the bundled websearch skill queries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSearchProvider {
+    #[default]
+    Serper,
+    /// You.com Eco Search.
+    Eco,
+}
+
+impl WebSearchProvider {
+    /// The provider's id: its settings value, its auth-store slot, and the
+    /// kernel's `PRIME_AGENT_WEBSEARCH_PROVIDER` value.
+    #[must_use]
+    pub fn id(self) -> &'static str {
+        match self {
+            WebSearchProvider::Serper => crate::auth::SERPER_CREDENTIAL_ID,
+            WebSearchProvider::Eco => crate::auth::ECO_CREDENTIAL_ID,
+        }
+    }
+
+    /// The environment variable whose nonblank value overrides the stored key.
+    #[must_use]
+    pub fn api_key_env(self) -> &'static str {
+        match self {
+            WebSearchProvider::Serper => "SERPER_API_KEY",
+            WebSearchProvider::Eco => "YOU_API_KEY",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WarningSettings {
@@ -232,6 +275,23 @@ pub struct FactorySettings {
     pub enabled: Option<bool>,
 }
 
+/// `agentInbox` (the machine-notification inbox): enabled by default;
+/// `enabled: false` is the kill switch that restores direct notice-row
+/// steering. `reminderIntervalMs` (default 10 minutes, `0` disables)
+/// repeats the waiting count while the inbox stays unread.
+/// `idleDebounceMs` (default 5 s) is the window an idle agent's wake
+/// waits to cover every notice that arrives in it. `successHoldMs`
+/// (default 30 s) is how long a wake caused only by successful bash
+/// completions is held before it delivers.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentInboxSettings {
+    pub enabled: Option<bool>,
+    pub reminder_interval_ms: Option<u64>,
+    pub idle_debounce_ms: Option<u64>,
+    pub success_hold_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TelemetrySettings {
@@ -242,49 +302,17 @@ pub struct TelemetrySettings {
     pub local_mirror: Option<bool>,
 }
 
-/// User-declared MCP server (settings `mcpServers` entry).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "kebab-case")]
-pub enum McpServerConfig {
-    Http {
-        url: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        headers: Option<serde_json::Map<String, serde_json::Value>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        bearer_token_env_var: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        oauth: Option<bool>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        enabled: Option<bool>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        enabled_tools: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        disabled_tools: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        startup_timeout_ms: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        call_timeout_ms: Option<u64>,
-    },
-    Stdio {
-        command: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        args: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cwd: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        env: Option<serde_json::Map<String, serde_json::Value>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        enabled: Option<bool>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        enabled_tools: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        disabled_tools: Option<Vec<String>>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        startup_timeout_ms: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        call_timeout_ms: Option<u64>,
-    },
-}
+/// The default time limit for user `python_repl` cells: 60 seconds.
+pub const DEFAULT_PYTHON_CELL_TIMEOUT_MS: u64 = 60_000;
+
+/// The default inbox reminder repeat interval: 10 minutes.
+pub const DEFAULT_AGENT_INBOX_REMINDER_INTERVAL_MS: u64 = 600_000;
+
+/// The default idle wake debounce window: 5 seconds.
+pub const DEFAULT_AGENT_INBOX_IDLE_DEBOUNCE_MS: u64 = 5_000;
+
+/// The default hold of a success-only idle wake: 30 seconds.
+pub const DEFAULT_AGENT_INBOX_SUCCESS_HOLD_MS: u64 = 30_000;
 
 /// The settings document: every known field optional; unknown keys preserved.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -303,21 +331,17 @@ pub struct Settings {
     pub rlm_max_depth: Option<u64>,
     /// `number | "off" | "none"`; raw JSON because the TS getter validates at access time.
     pub idle_eviction_minutes: Option<serde_json::Value>,
-    /// Session archiving age rule: sessions untouched for this many days are
-    /// moved to the daemon's archive directory. `number | "off" | "none"`; raw
-    /// JSON validated at access time (same grammar as `idleEvictionMinutes`).
-    pub session_archive_max_age_days: Option<serde_json::Value>,
-    /// Session archiving count rule: keep at most this many unarchived sessions (newest by mtime
-    /// win); `0 | "off" | "none"` disables. Raw JSON validated at access time.
-    pub session_archive_max_sessions: Option<serde_json::Value>,
     pub transport: Option<TransportSetting>,
     pub steering_mode: Option<QueueModeSetting>,
     pub follow_up_mode: Option<QueueModeSetting>,
     pub theme: Option<String>,
     pub compaction: Option<CompactionSettings>,
     pub auto_refine: Option<AutoRefineSettings>,
+    /// Master switch for harness creation and context loading; unset preserves enabled behavior.
+    pub harness_refinements: Option<bool>,
     pub agent_traces: Option<AgentTracesSettings>,
     pub factory: Option<FactorySettings>,
+    pub agent_inbox: Option<AgentInboxSettings>,
     pub telemetry: Option<TelemetrySettings>,
     pub branch_summary: Option<BranchSummarySettings>,
     pub retry: Option<RetrySettings>,
@@ -326,14 +350,31 @@ pub struct Settings {
     /// session model does not accept image input. Default: none - image turns on a text-only model
     /// fail with a configuration hint instead of silently dropping the images.
     pub image_model: Option<String>,
+    /// The Decision API's model reference ("provider/model-id" or a bare
+    /// id), resolved through the model registry exactly like `imageModel`.
+    /// Unset (or unresolvable): the Decision API stays off.
+    pub decision_model: Option<String>,
+    /// Default wait budget for user `python_repl` cells, in milliseconds
+    /// (default [`DEFAULT_PYTHON_CELL_TIMEOUT_MS`]; `0` disables). A cell
+    /// outliving it auto-backgrounds: the call returns early, the cell
+    /// keeps running, and its completion lands in the inbox (a full
+    /// session row when it carries rich output). The model can pass a
+    /// per-call `timeout` instead. Daemonless sessions never arm it.
+    pub python_cell_timeout_ms: Option<u64>,
     pub autonomous: Option<AutonomousSettings>,
+    /// Custom shell that runs every kernel `bash()` and user-bash command as
+    /// `<shell> -c <command>`: an absolute path to an existing executable,
+    /// validated once at session start (a bad value fails session creation
+    /// naming this setting). Only global settings can select this executable.
     pub shell_path: Option<String>,
     pub quiet_startup: Option<bool>,
     pub shell_command_prefix: Option<String>,
     pub npm_command: Option<Vec<String>>,
+    /// Execution reads this from global settings only; project overrides are ignored.
     pub mcp_servers: Option<serde_json::Map<String, serde_json::Value>>,
     /// Extra local MCP service-catalog files (~-relative allowed), merged after the
     /// compiled built-ins; first source wins per id, and no bundled id can be shadowed.
+    /// Read from global settings only, like executable MCP server configuration.
     pub mcp_catalog_sources: Option<Vec<String>>,
     pub packages: Option<Vec<serde_json::Value>>,
     pub skills: Option<Vec<String>>,
@@ -341,6 +382,8 @@ pub struct Settings {
     pub themes: Option<Vec<String>>,
     pub enable_skill_commands: Option<bool>,
     pub bundled_skills: Option<BundledSkillsSettings>,
+    /// Read from global settings only, like the stored keys it selects between.
+    pub web_search_provider: Option<WebSearchProvider>,
     pub enable_builtin_skills: Option<bool>,
     pub terminal: Option<TerminalSettings>,
     pub images: Option<ImageSettings>,
@@ -356,8 +399,12 @@ pub struct Settings {
     pub editor_padding_x: Option<u64>,
     pub autocomplete_max_visible: Option<u64>,
     pub show_hardware_cursor: Option<bool>,
+    /// Typing `:name` in the prompt editor suggests matching emoji (unset means on).
+    pub emoji_shortcodes: Option<bool>,
     pub markdown: Option<MarkdownSettings>,
     pub warnings: Option<WarningSettings>,
+    /// Session storage can restore executable kernel state, so only global
+    /// settings (or an explicit CLI/environment override) may select it.
     pub session_dir: Option<String>,
     /// Log per-request provider timing phases to the diagnostic log
     /// (unset means OFF, exactly the TS default).

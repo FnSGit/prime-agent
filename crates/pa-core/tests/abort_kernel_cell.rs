@@ -134,7 +134,7 @@ async fn abort_during_a_kernel_cell_settles_the_turn_immediately() {
         Some("running the wedge cell"),
         vec![(
             "call-1",
-            "ipython",
+            "python_repl",
             json!({ "code": wedge_cell(&started, &finished) }),
         )],
     );
@@ -142,6 +142,8 @@ async fn abort_during_a_kernel_cell_settles_the_turn_immediately() {
     provider.push_text_turn("the cell completed");
 
     let engine = create_session(SessionEngineConfig {
+        cell_wake: None,
+        on_background_cell: None,
         on_late_sent_agent_message: None,
         semantic_edges: None,
         cron_store: None,
@@ -155,8 +157,6 @@ async fn abort_during_a_kernel_cell_settles_the_turn_immediately() {
         tools: Vec::new(),
         custom_system_prompt: None,
         prompt_guidelines: Vec::new(),
-        generic_mcp_servers: Vec::new(),
-        allow_recursion: None,
         session_manager: Some(session),
         extra_host_handlers: None,
         conversation_log_path: None,
@@ -164,14 +164,23 @@ async fn abort_during_a_kernel_cell_settles_the_turn_immediately() {
         additional_prompt_paths: Vec::new(),
         extra_builtin_skill_overrides: Vec::new(),
         rlm_subagent_host: None,
+        rlm_usage_store: None,
+
+        inbox: None,
+        progress_note_emit: None,
         rlm_depth: None,
+        factory_child: false,
+        daemonless: true,
         telemetry: None,
         model_info: None,
         mcp_manager: None,
+        kernel_ready_gate: None,
         prewarm_ipython_kernel: None,
         on_background_work_settled: None,
+        bash_notice_wake: None,
         queued_goal_context_purge: None,
         queued_steering_probe: None,
+        should_stop_after_turn: None,
         image_model_router: None,
     })
     .await

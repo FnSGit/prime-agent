@@ -205,6 +205,9 @@ pub fn passive_child_summary(child: &PassiveRlmChild) -> Value {
     if let Some(spawn_code) = &metadata.spawn_code {
         object.insert("spawnCode".to_string(), json!(spawn_code));
     }
+    if edge.decision_child {
+        object.insert("decisionChild".to_string(), json!(true));
+    }
     // The persisted thinking level rides the passive-child row: the
     // agents-view Model column keeps rendering "model:level" for
     // passivated subagents.
@@ -264,6 +267,9 @@ mod tests {
                 name: "worker-a".to_string(),
                 deleted: None,
                 deleted_usage: None,
+                deleted_usage_by_model: None,
+                factory: None,
+                decision_child: false,
             },
             info,
             metadata: RlmChildMetadata::default(),
@@ -285,6 +291,9 @@ mod tests {
                 name: "worker-b".to_string(),
                 deleted: None,
                 deleted_usage: None,
+                deleted_usage_by_model: None,
+                factory: None,
+                decision_child: false,
             },
             info: plain_info,
             metadata: RlmChildMetadata::default(),
@@ -319,6 +328,9 @@ mod tests {
                 name: "worker-c".to_string(),
                 deleted: None,
                 deleted_usage: None,
+                deleted_usage_by_model: None,
+                factory: None,
+                decision_child: false,
             },
             info,
             metadata: RlmChildMetadata::default(),
@@ -365,6 +377,8 @@ mod tests {
                 child: child.to_string_lossy().into(),
                 depth: 1,
                 name: "w1".into(),
+                factory: None,
+                decision_child: false,
             })
             .unwrap();
         ledger
@@ -374,6 +388,8 @@ mod tests {
                 child: grandchild.to_string_lossy().into(),
                 depth: 2,
                 name: "w2".into(),
+                factory: None,
+                decision_child: false,
             })
             .unwrap();
         ledger
@@ -383,6 +399,8 @@ mod tests {
                 child: dead.to_string_lossy().into(),
                 depth: 1,
                 name: "gone".into(),
+                factory: None,
+                decision_child: false,
             })
             .unwrap();
         // A deleted child tombstones out of the walk.
@@ -456,6 +474,8 @@ mod tests {
                 child: child.to_string_lossy().into(),
                 depth: 1,
                 name: "worker".into(),
+                factory: None,
+                decision_child: false,
             })
             .unwrap();
         let walked = walk_passive_rlm_children(

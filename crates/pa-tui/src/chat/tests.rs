@@ -3,6 +3,7 @@
 use super::*;
 use crate::osc133::RowMarkers;
 use crate::theme::{ColorMode, Theme, ThemeColor};
+use ratatui::style::Modifier;
 
 fn theme() -> Theme {
     Theme::builtin("prime", ColorMode::TrueColor)
@@ -160,7 +161,7 @@ fn row_runs(row: &Line) -> Vec<(String, Style)> {
 
 #[test]
 fn user_block_keeps_the_link_affordance() {
-    crate::hyperlinks::set_hyperlinks_override(Some(true));
+    crate::hyperlinks::set_hyperlinks_override(Some(false));
     let (bg, body, _, _, _) = user_block_styles();
     let link_url = bg.patch(theme().fg_style(ThemeColor::MdLinkUrl));
     let rows = render_user_block("see [docs](https://x.dev/a)", &theme(), "  ", 60);
@@ -178,11 +179,34 @@ fn user_block_keeps_the_link_affordance() {
                 ),
                 body.add_modifier(ratatui::style::Modifier::UNDERLINED)
             ),
-            (" [https://x.dev/a]".to_string(), link_url),
+            (" (https://x.dev/a)".to_string(), link_url),
             (" ".repeat(60 - 28), bg),
         ]
     );
     crate::hyperlinks::set_hyperlinks_override(None);
+}
+
+#[test]
+fn user_block_preserves_markdown_styles_on_its_background() {
+    let theme = theme();
+    let (bg, body, _, _, _) = user_block_styles();
+    let code = bg.patch(theme.fg_style(ThemeColor::MdCode));
+    let rows = render_user_block("Plain **bold** *italic* `path.rs`.", &theme, "  ", 60);
+
+    assert_eq!(
+        row_runs(&rows[1]),
+        vec![
+            ("  ".to_string(), bg),
+            ("Plain ".to_string(), body),
+            ("bold".to_string(), body.add_modifier(Modifier::BOLD)),
+            (" ".to_string(), body),
+            ("italic".to_string(), body.add_modifier(Modifier::ITALIC)),
+            (" ".to_string(), body),
+            ("path.rs".to_string(), code),
+            (".".to_string(), body),
+            (" ".repeat(32), bg),
+        ]
+    );
 }
 
 #[test]
@@ -422,7 +446,15 @@ fn ipython_card_done_line() {
         result_partial: false,
         ..Default::default()
     };
-    let rows = render_tool_card(&card, 0, Detail::Overview, &theme(), 100, true);
+    let rows = render_tool_card(
+        &card,
+        0,
+        Detail::Overview,
+        Detail::Overview,
+        &theme(),
+        100,
+        true,
+    );
     let text = rows[0]
         .iter()
         .map(|s| s.content.as_str())

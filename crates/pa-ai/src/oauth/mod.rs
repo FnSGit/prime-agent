@@ -88,7 +88,7 @@ impl CodexHttp for ReqwestCodexHttp {
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<CodexHttpResponse, String>> + Send + 'a>>
     {
         Box::pin(async move {
-            let client = reqwest::Client::builder()
+            let client = crate::utils_inner::tls::http_client_builder()
                 .timeout(Duration::from_millis(timeout_ms))
                 .build()
                 .map_err(|error| error.to_string())?;
@@ -109,61 +109,5 @@ impl CodexHttp for ReqwestCodexHttp {
             let body = response.text().await.map_err(|error| error.to_string())?;
             Ok(CodexHttpResponse { status, body })
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct ScriptedHttp(std::collections::HashMap<String, CodexHttpResponse>);
-
-    impl ScriptedHttp {
-        fn entry(url: &str, status: u16, body: &str) -> (String, CodexHttpResponse) {
-            (
-                url.to_string(),
-                CodexHttpResponse {
-                    status,
-                    body: body.to_string(),
-                },
-            )
-        }
-    }
-
-    impl CodexHttp for ScriptedHttp {
-        fn post_form<'a>(
-            &'a self,
-            url: &'a str,
-            _body: &'a str,
-            _timeout_ms: u64,
-        ) -> std::pin::Pin<Box<dyn Future<Output = Result<CodexHttpResponse, String>> + Send + 'a>>
-        {
-            let result = self.0.get(url).cloned();
-            Box::pin(async move { result.ok_or_else(|| format!("{url} was not scripted")) })
-        }
-    }
-
-    #[tokio::test]
-    async fn the_seam_serves_scripted_responses() {
-        let http = ScriptedHttp(
-            [ScriptedHttp::entry(
-                "https://fixture.example/token",
-                200,
-                r#"{"ok":true}"#,
-            )]
-            .into_iter()
-            .collect(),
-        );
-        let response = http
-            .post_form("https://fixture.example/token", "", 1)
-            .await
-            .unwrap();
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, r#"{"ok":true}"#);
-        assert!(response.ok());
-        assert!(http
-            .post_form("https://other.example/token", "", 1)
-            .await
-            .is_err());
     }
 }

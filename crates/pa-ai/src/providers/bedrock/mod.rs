@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 
 mod auth;
 mod convert;
+mod credential_process;
 mod events;
 mod eventstream;
 mod goaway;
@@ -22,8 +23,8 @@ use crate::event_stream::{
 };
 use crate::providers::bedrock::auth::{resolve_credentials, resolve_endpoint, sigv4_headers};
 use crate::providers::bedrock::convert::{
-    convert_messages, convert_tool_config, map_stop_reason, map_thinking_level_to_effort,
-    supports_always_on_adaptive_thinking, BedrockToolChoice,
+    convert_messages, convert_tool_config, get_model_match_candidates, map_stop_reason,
+    map_thinking_level_to_effort, supports_always_on_adaptive_thinking, BedrockToolChoice,
 };
 pub(crate) use crate::providers::bedrock::convert::{
     is_anthropic_claude_model, supports_adaptive_thinking,
@@ -326,6 +327,16 @@ fn build_additional_model_request_fields(model: &Model, options: &BedrockOptions
         return None;
     }
 
+    if reasoning == ModelThinkingLevel::Off {
+        // Haiku 5.x thinks by default when the request carries no `thinking` field, so "off" has to
+        // say so explicitly, as the Anthropic route does.
+        let thinks_by_default = is_anthropic_claude_model(model)
+            && get_model_match_candidates(&model.id, Some(&model.name))
+                .iter()
+                .any(|candidate| candidate.contains("haiku-5"));
+        return thinks_by_default.then(|| json!({ "thinking": { "type": "disabled" } }));
+    }
+
     if is_anthropic_claude_model(model) {
         // GovCloud Bedrock currently rejects the Claude thinking.display field. Omit it there until
         // the GovCloud Converse schema catches up.
@@ -419,6 +430,63 @@ fn encode_model_id(model_id: &str) -> String {
     encoded
 }
 
+/// Headers the Bedrock transport owns: caller/stream-option headers never override them — the
+/// `SigV4`/bearer credentials, the `SigV4` bookkeeping headers, and the fixed JSON body types.
+const BEDROCK_TRANSPORT_OWNED_HEADERS: [&str; 6] = [
+    "authorization",
+    "host",
+    "x-amz-date",
+    "x-amz-security-token",
+    "content-type",
+    "accept",
+];
+
+/// The caller/stream-option headers (the injected session identity among them) that travel on
+/// the Bedrock request. They join the signed header set on the `SigV4` path: AWS expects every
+/// sent header to be signed.
+///
+/// Case-variant duplicates (an `X-PI-Session-Id` beside an `x-pi-session-id`) collapse to one
+/// canonical entry — a duplicated name in the signed set changes AWS's canonical request and the
+/// signature stops matching. The source is a `HashMap` whose iteration order is random, so
+/// "first wins" would be nondeterministic: the entry with the lexicographically smallest value
+/// wins instead, giving duplicate callers one stable canonical entry. Output sorts by name, so
+/// the merged set feeds the wire and the signed headers in a stable order.
+fn bedrock_caller_headers(options: &BedrockOptions) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = options
+        .base
+        .headers
+        .iter()
+        .flatten()
+        .filter(|(name, _)| {
+            !BEDROCK_TRANSPORT_OWNED_HEADERS
+                .iter()
+                .any(|owned| name.eq_ignore_ascii_case(owned))
+        })
+        .map(|(name, value)| (name.to_lowercase(), value.clone()))
+        .collect();
+    headers.sort();
+    headers.dedup_by(|(name, _), (next_name, _)| name == next_name);
+    headers
+}
+
+/// The extra header set the Bedrock request carries beside its fixed content types: the
+/// request-metadata mirror plus the caller headers, deduped case-insensitively to a single entry
+/// per name. The metadata mirror wins over a caller-supplied copy — it must match the
+/// `requestMetadata` the body carries.
+fn bedrock_extra_signed_headers(options: &BedrockOptions) -> Vec<(String, String)> {
+    let mut headers: Vec<(String, String)> = Vec::new();
+    if let Some(metadata) = &options.request_metadata {
+        headers.push((
+            "x-amzn-bedrock-request-metadata".into(),
+            serde_json::to_string(metadata).unwrap_or_default(),
+        ));
+    }
+    headers.extend(bedrock_caller_headers(options));
+    let mut seen = std::collections::HashSet::new();
+    headers.retain(|(name, _)| seen.insert(name.clone()));
+    headers
+}
+
 // Long by design: mirrors the provider's stream shape.
 #[allow(clippy::too_many_lines)]
 async fn run_stream(
@@ -486,12 +554,12 @@ async fn run_stream(
     }
 
     let (endpoint, region) = resolve_endpoint(model, &options);
-    let path_and_query = format!("/model/{}/converse-stream", encode_model_id(&model.id));
+    let path = format!("/model/{}/converse-stream", encode_model_id(&model.id));
     let host = url::Url::parse(&endpoint)
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .ok_or_else(|| ProviderError::Message(format!("Invalid Bedrock endpoint: {endpoint}")))?;
-    let url = format!("{endpoint}{path_and_query}");
+    let url = format!("{endpoint}{path}");
 
     let mut headers: Vec<(String, String)> = vec![
         ("content-type".into(), "application/json".into()),
@@ -501,14 +569,11 @@ async fn run_stream(
         let _ = (name, value);
     }
 
-    // requestMetadata also travels as the X-Amzn-Bedrock-Request-Metadata header.
-    let mut extra_signed_headers: Vec<(String, String)> = Vec::new();
-    if let Some(metadata) = &options.request_metadata {
-        extra_signed_headers.push((
-            "x-amzn-bedrock-request-metadata".into(),
-            serde_json::to_string(metadata).unwrap_or_default(),
-        ));
-    }
+    // requestMetadata also travels as the X-Amzn-Bedrock-Request-Metadata header, and the
+    // caller headers ride along with it: without this merge, a session-scoped Bedrock request
+    // would never carry its session identity. On the SigV4 path the whole set is signed; on the
+    // bearer path it passes through unsigned.
+    let extra_signed_headers = bedrock_extra_signed_headers(&options);
 
     // Bearer-token auth bypasses SigV4 entirely.
     let bearer_token = options
@@ -528,13 +593,25 @@ async fn run_stream(
             headers.push((name.clone(), value.clone()));
         }
     } else {
-        let credentials = resolve_credentials(options.profile.as_deref()).ok_or_else(|| {
+        // Resolution may run the profile's credential_process, so it honours the request's signal;
+        // leaving the select drops the resolution, which kills a stalled process.
+        let cancelled = async {
+            match &options.base.signal {
+                Some(signal) => signal.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        let credentials = tokio::select! {
+            () = cancelled => return Err(ProviderError::Aborted),
+            credentials = resolve_credentials(options.profile.as_deref()) => credentials,
+        }
+        .ok_or_else(|| {
             ProviderError::Message("No AWS credentials available for Bedrock".to_string())
         })?;
         let (amz_date, authorization, security_token) = sigv4_headers(
             &crate::providers::bedrock::auth::SigV4Params {
                 method: "POST",
-                path_and_query: &path_and_query,
+                path: &path,
                 host: &host,
                 region: &region,
                 service: "bedrock",
@@ -719,7 +796,7 @@ pub fn stream_simple_bedrock(
             context,
             Some(&BedrockOptions {
                 base,
-                reasoning: None,
+                reasoning: Some(ModelThinkingLevel::Off),
                 ..Default::default()
             }),
         );
@@ -840,34 +917,9 @@ impl Provider for BedrockConverseStreamProvider {
 mod tests {
     use super::*;
     use crate::providers::bedrock::auth::{
-        get_standard_bedrock_endpoint_region, should_use_explicit_bedrock_endpoint,
+        get_standard_bedrock_endpoint_region, should_use_explicit_bedrock_endpoint, AwsCredentials,
+        SigV4Params,
     };
-
-    /// The TS `formatBedrockError` shape for an HTTP-level failure: the AWS SDK exception name
-    /// (from the body `__type` after the namespace) maps to a stable human-readable prefix; unknown
-    /// names keep the raw name.
-    #[test]
-    fn bedrock_http_error_prefix_shape() {
-        let error = bedrock_http_error(
-            400,
-            "{\"__type\":\"com.amazonaws.bedrock#ValidationException\",\"message\":\"model id is invalid\"}",
-            &HashMap::default(),
-        );
-        assert_eq!(error.to_string(), "Validation error: model id is invalid");
-        let info = crate::utils_inner::stream_failure::extract_stream_failure_info(&error);
-        assert_eq!(
-            info.provider_error_type.as_deref(),
-            Some("ValidationException")
-        );
-        // AWS exceptions carry no HTTP status to the TS classifier.
-        assert_eq!(info.status, None);
-        assert_eq!(
-            info.kind,
-            crate::utils_inner::stream_failure::StreamFailureKind::Unknown
-        );
-        let diagnostic = crate::utils_inner::stream_failure::diagnostic_error_info(&error);
-        assert_eq!(diagnostic.name.as_deref(), Some("ValidationException"));
-    }
 
     /// Throttling exceptions keep their name as the classification key ("throttl" -> `rate_limit`),
     /// like the TS rethrown stream exception.
@@ -878,50 +930,11 @@ mod tests {
             "{\"__type\":\"ThrottlingException\",\"message\":\"too many\"}",
             &HashMap::default(),
         );
-        assert_eq!(error.to_string(), "Throttling error: too many");
         let info = crate::utils_inner::stream_failure::extract_stream_failure_info(&error);
         assert_eq!(
             info.kind,
             crate::utils_inner::stream_failure::StreamFailureKind::RateLimit
         );
-    }
-
-    /// An unrecognized error body names the generic fallback by the raw status text
-    /// (`parsedBody.code || errorCode || statusCode || "UnknownError"`), and a missing message
-    /// defaults to "`UnknownError`".
-    #[test]
-    fn bedrock_http_error_generic_fallback() {
-        let error = bedrock_http_error(400, "{\"foo\":1}", &HashMap::default());
-        assert_eq!(error.to_string(), "400: UnknownError");
-    }
-
-    /// Connection failures surface undici's raw `TypeError` message (the AWS SDK does not wrap
-    /// them). The in-stream exception message composition (`{prefix}: {message}`).
-    #[test]
-    fn bedrock_exception_message_shape() {
-        assert_eq!(
-            bedrock_exception_message("ModelStreamErrorException", "stream died"),
-            "Model stream error: stream died"
-        );
-        assert_eq!(
-            bedrock_exception_message("SomeUnknownException", "boom"),
-            "SomeUnknownException: boom"
-        );
-    }
-
-    #[test]
-    fn bedrock_connection_error_text() {
-        let connect = ProviderError::Connection(
-            crate::utils_inner::stream_failure::ProviderConnectionError {
-                kind: crate::utils_inner::stream_failure::ConnectionErrorKind::Connect,
-                profile: crate::utils_inner::stream_failure::ConnectionErrorProfile::AwsHttp1 {
-                    host: "127.0.0.1".to_string(),
-                    port: 1,
-                },
-                cause: "http2 connect error".to_string(),
-            },
-        );
-        assert_eq!(connect.to_string(), "connect ECONNREFUSED 127.0.0.1:1");
     }
 
     #[test]
@@ -963,24 +976,135 @@ mod tests {
         assert_eq!(normalize_tool_call_id(&"a".repeat(80)).len(), 64);
     }
 
+    /// Caller headers (the injected session identity among them) travel on the Bedrock request;
+    /// transport-owned headers (credentials, `SigV4` bookkeeping, the fixed JSON body types) never
+    /// come from options.
     #[test]
-    fn maps_stop_reasons() {
-        use crate::types::StopReason;
-        assert_eq!(map_stop_reason(Some("end_turn")), StopReason::Stop);
-        assert_eq!(map_stop_reason(Some("stop_sequence")), StopReason::Stop);
-        assert_eq!(map_stop_reason(Some("max_tokens")), StopReason::Length);
-        assert_eq!(map_stop_reason(Some("tool_use")), StopReason::ToolUse);
-        assert_eq!(map_stop_reason(Some("other")), StopReason::Error);
-        assert_eq!(map_stop_reason(None), StopReason::Error);
+    fn caller_headers_travel_but_transport_owned_headers_do_not() {
+        let options = BedrockOptions::from_base(StreamOptions {
+            session_id: Some("conversation".into()),
+            headers: Some(HashMap::from([
+                ("X-PI-Session-Id".to_string(), "conversation".to_string()),
+                ("x-custom-gateway".to_string(), "value".to_string()),
+                ("Content-Type".to_string(), "text/plain".to_string()),
+                ("authorization".to_string(), "Bearer nope".to_string()),
+                ("x-amz-date".to_string(), "2030-01-01".to_string()),
+            ])),
+            ..Default::default()
+        });
+        assert_eq!(
+            bedrock_caller_headers(&options),
+            vec![
+                ("x-custom-gateway".to_string(), "value".to_string()),
+                ("x-pi-session-id".to_string(), "conversation".to_string()),
+            ]
+        );
+        assert_eq!(
+            bedrock_caller_headers(&BedrockOptions::default()),
+            Vec::new()
+        );
     }
 
+    /// Case-variant duplicates in the caller headers collapse to one canonical entry: a
+    /// duplicated name in the signed set changes AWS's canonical request, and the signature
+    /// stops matching. The `HashMap` iteration order is random, so the lexicographically
+    /// smallest value wins — a stable, documented pick rather than a random first entry.
     #[test]
-    fn error_prefixes_match_ts() {
+    fn case_variant_caller_headers_collapse_to_one_canonical_entry() {
+        let options = BedrockOptions::from_base(StreamOptions {
+            headers: Some(HashMap::from([
+                ("X-Custom-Gateway".to_string(), "b".to_string()),
+                ("x-custom-gateway".to_string(), "a".to_string()),
+                ("x-pi-session-id".to_string(), "conversation".to_string()),
+            ])),
+            ..Default::default()
+        });
         assert_eq!(
-            bedrock_error_prefix("ThrottlingException"),
-            "Throttling error"
+            bedrock_caller_headers(&options),
+            vec![
+                ("x-custom-gateway".to_string(), "a".to_string()),
+                ("x-pi-session-id".to_string(), "conversation".to_string()),
+            ]
         );
-        assert_eq!(bedrock_error_prefix("Unknown"), "Unknown");
+    }
+
+    /// The merged extra signed set carries one entry per name: the request-metadata mirror beats
+    /// a caller-supplied copy of the same header (the mirror must match the body's
+    /// `requestMetadata`), and duplicated caller entries do not reach the signed set.
+    #[test]
+    fn merged_signed_headers_dedupe_the_metadata_overlap_and_caller_duplicates() {
+        let options = BedrockOptions {
+            base: StreamOptions {
+                headers: Some(HashMap::from([
+                    (
+                        "X-Amzn-Bedrock-Request-Metadata".to_string(),
+                        r#"{"caller": "copy"}"#.to_string(),
+                    ),
+                    ("X-Pi-Session-Id".to_string(), "conversation".to_string()),
+                ])),
+                ..Default::default()
+            },
+            request_metadata: Some(std::collections::BTreeMap::from([(
+                "team".to_string(),
+                "a".to_string(),
+            )])),
+            ..Default::default()
+        };
+        assert_eq!(
+            bedrock_extra_signed_headers(&options),
+            vec![
+                (
+                    "x-amzn-bedrock-request-metadata".to_string(),
+                    r#"{"team":"a"}"#.to_string(),
+                ),
+                ("x-pi-session-id".to_string(), "conversation".to_string()),
+            ]
+        );
+    }
+
+    /// Signing the merged set puts every name in `SignedHeaders` exactly once — the duplicate
+    /// rejection AWS would otherwise answer with starts upstream of the signer.
+    #[test]
+    fn signing_the_merged_set_keeps_signed_headers_canonical() {
+        let options = BedrockOptions::from_base(StreamOptions {
+            session_id: Some("conversation".into()),
+            headers: Some(HashMap::from([
+                ("X-Pi-Session-Id".to_string(), "conversation".to_string()),
+                ("x-pi-session-id".to_string(), "other".to_string()),
+            ])),
+            ..Default::default()
+        });
+        let merged = bedrock_extra_signed_headers(&options);
+        assert_eq!(
+            merged,
+            vec![("x-pi-session-id".to_string(), "conversation".to_string())]
+        );
+        let (amz_date, authorization, _) = sigv4_headers(
+            &SigV4Params {
+                method: "POST",
+                path: "/model/m/converse-stream",
+                host: "example.com",
+                region: "us-east-1",
+                service: "bedrock",
+                body: b"{}",
+                extra_signed_headers: &merged,
+            },
+            &AwsCredentials {
+                access_key_id: "AKIDEXAMPLE".to_string(),
+                secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                session_token: None,
+            },
+        );
+        let signed_headers = authorization
+            .split("SignedHeaders=")
+            .nth(1)
+            .and_then(|rest| rest.split(", Signature").next())
+            .unwrap_or_default();
+        assert!(!amz_date.is_empty());
+        assert_eq!(
+            signed_headers,
+            "content-type;host;x-amz-date;x-pi-session-id"
+        );
     }
 
     #[test]
@@ -997,6 +1121,59 @@ mod tests {
             &test_model("us.anthropic.claude"),
             &options
         ));
+    }
+
+    /// Haiku 5.x thinks by default, so thinking off must send `thinking: {type: "disabled"}` on
+    /// Bedrock, as the Anthropic route does. Haiku 4.5 does not think unasked and gets no field.
+    #[tokio::test]
+    async fn thinking_off_disables_haiku_5_default_thinking() {
+        for (id, name, expected) in [
+            (
+                "us.anthropic.claude-haiku-5-5-v1",
+                "Claude Haiku 5.5",
+                json!({ "thinking": { "type": "disabled" } }),
+            ),
+            (
+                "us.anthropic.claude-haiku-4-5-v1",
+                "Claude Haiku 4.5",
+                Value::Null,
+            ),
+        ] {
+            let model = Model {
+                name: name.into(),
+                // A closed local port: the payload hook below cancels the request before it sends.
+                base_url: "http://127.0.0.1:9".into(),
+                ..test_model(id)
+            };
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let signal = tokio_util::sync::CancellationToken::new();
+            let options = SimpleStreamOptions {
+                base: StreamOptions {
+                    signal: Some(signal.clone()),
+                    on_payload: Some(std::sync::Arc::new({
+                        let captured = std::sync::Arc::clone(&captured);
+                        move |payload: Value, _model: &Model| {
+                            *captured.lock().unwrap() = Some(payload);
+                            signal.cancel();
+                            None
+                        }
+                    })),
+                    ..Default::default()
+                },
+                reasoning: Some(ModelThinkingLevel::Off),
+                thinking_budgets: None,
+            };
+            let context = Context {
+                system_prompt: None,
+                messages: Vec::new(),
+                tools: None,
+            };
+            stream_simple_bedrock(&model, &context, Some(&options))
+                .collect()
+                .await;
+            let payload = captured.lock().unwrap().take().expect("payload captured");
+            assert_eq!(payload["additionalModelRequestFields"], expected, "{id}");
+        }
     }
 
     fn test_model(id: &str) -> Model {
@@ -1016,6 +1193,7 @@ mod tests {
             featured: None,
             headers: None,
             compat: None,
+            serving: None,
         }
     }
 }

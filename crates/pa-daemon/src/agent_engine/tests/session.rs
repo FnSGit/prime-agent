@@ -4,15 +4,11 @@ use crate::engine::PromptBatchRow;
 
 /// `get_commands` enumerates the session's skills as `skill:<name>`
 /// commands, including before the first prompt (the read seam demand-builds
-/// the core session). The faux provider registers under `FAUX_TEST_LOCK`
-/// on a blocking thread (the lock is std, so it never rides an await).
+/// the core session).
 #[tokio::test]
 async fn get_commands_enumerates_skills_before_the_first_prompt() {
     use crate::engine::SessionEngine as _;
     let (engine, _dir) = tokio::task::spawn_blocking(|| {
-        let _faux = FAUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::TempDir::new().unwrap();
         let agent_dir = dir.path().join("agent");
         let skill_dir = agent_dir.join("skills").join("demo-skill");
@@ -42,7 +38,7 @@ async fn get_commands_enumerates_skills_before_the_first_prompt() {
         .unwrap();
         let engine = std::sync::Arc::new(engine);
         engine.register_arc();
-        // Register under the lock; the async section resolves the cached model.
+        // Register here; the async section resolves the cached model.
         let model = engine.resolve_model().expect("faux model");
         drop(model);
         (engine, dir)
@@ -87,6 +83,120 @@ async fn get_commands_enumerates_skills_before_the_first_prompt() {
     }
 }
 
+/// The built engine carries the durable file's header id, not the in-memory
+/// manager's fresh one, and keeps it across a replacement build (#3618). The
+/// test drives the async seams on the engine's own runtime.
+#[test]
+fn the_built_session_carries_the_durable_header_id_across_rebuilds() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut store =
+        crate::session_store::SessionFile::create(dir.path().to_str().unwrap_or("/tmp"), None, 0);
+    let durable_id = store.session_id().to_string();
+    let path = dir
+        .path()
+        .join(crate::session_store::session_file_name(&durable_id));
+    store.set_path(path.clone());
+    store.rewrite().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: Some(path),
+        faux_script: Some(json!({ "engine": "faux", "responses": [{ "text": "ok" }] }).to_string()),
+        supervisor_link: None,
+        telemetry_disabled: Some(true),
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    let model = engine.resolve_model().expect("faux model");
+    for _ in 0..2 {
+        engine.runtime.block_on(async {
+            engine
+                .ensure_core_session_async(&model)
+                .await
+                .expect("build");
+            {
+                let session = engine.session.lock().await;
+                let built = session.as_deref().expect("built session");
+                assert_eq!(built.session.session_id().await, durable_id);
+                assert_eq!(
+                    built.session.agent().session_id(),
+                    Some(durable_id.as_str())
+                );
+            }
+            engine.retire_session_runtime().await;
+        });
+    }
+}
+
+/// A side question bills the session it ran on: one `side_question` usage
+/// row carrying the run's tokens.
+#[test]
+fn a_side_question_bills_the_session_it_ran_on() {
+    use crate::engine::SessionEngine as _;
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (engine, _dir) = faux_engine_with_settings(
+        &json!({ "responses": [{ "text": "warm ok" }, { "text": "the aside" }] }),
+        u64::MAX,
+    );
+    admit(&engine, "warm".to_string(), &mut Vec::new());
+    let built = engine
+        .session
+        .blocking_lock()
+        .clone()
+        .expect("built session");
+    let sink: pa_core::session_engine::side_question::SideQuestionSink =
+        std::sync::Arc::new(|_| true);
+    let outcome = engine.run_side_question(
+        crate::engine::SideQuestionRequest {
+            side_question_id: "sq".to_string(),
+            question: "why?".to_string(),
+            previous_turns: Vec::new(),
+        },
+        &pa_agent::abort::AbortController::new().signal(),
+        &sink,
+    );
+    assert!(
+        matches!(outcome, crate::engine::SideQuestionOutcome::Complete { .. }),
+        "{outcome:?}"
+    );
+    let entries = engine.runtime.block_on(async {
+        built
+            .session
+            .shared_persistence()
+            .lock()
+            .await
+            .get_entries()
+    });
+    let bills: Vec<(String, u64)> = serde_json::to_value(entries)
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["customType"] == "model_usage")
+        .map(|row| {
+            (
+                row["data"]["source"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                row["data"]["usage"]["totalTokens"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    assert!(
+        matches!(bills.as_slice(), [(source, tokens)] if source == "side_question" && *tokens > 0),
+        "one billed side-question row, got {bills:?}"
+    );
+}
+
 #[tokio::test]
 async fn replacement_teardown_retires_the_session_and_the_funnel_adopts_the_branch() {
     let engine = {
@@ -105,11 +215,7 @@ async fn replacement_teardown_retires_the_session_and_the_funnel_adopts_the_bran
     // Retire: the built session drops with its mirrored goal handles.
     engine.retire_session_runtime().await;
     assert!(engine.session.lock().await.is_none());
-    assert!(engine
-        .goal_runtime
-        .lock()
-        .expect("goal runtime lock")
-        .is_none());
+    assert!(engine.built_handles().is_none());
 
     // Park the moved branch on the unbuilt engine (the worker parks it on a blocking thread).
     let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
@@ -209,12 +315,7 @@ async fn live_branch_rebuild_reloads_the_goal_state_from_the_moved_branch() {
     let goal_branch = {
         let engine = std::sync::Arc::clone(&engine);
         tokio::task::spawn_blocking(move || {
-            let handles = engine
-                .goal_runtime
-                .lock()
-                .expect("goal runtime lock")
-                .clone()
-                .expect("goal handles");
+            let handles = engine.live_handles().expect("goal handles").goal.clone();
             let entries = engine
                 .runtime
                 .block_on(async { handles.session.lock().await })
@@ -318,9 +419,6 @@ fn run_skill_prompt_body(
     prompt: &str,
     batch: &[&str],
 ) -> (std::sync::Arc<AgentSessionEngine>, Vec<EngineEvent>) {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::TempDir::new().unwrap();
     let skill_dir = dir.path().join("agent").join("skills").join("demo-skill");
     std::fs::create_dir_all(&skill_dir).unwrap();
@@ -490,4 +588,229 @@ fn a_bare_invocation_of_a_close_tagged_body_still_floors() {
         "the bare invocation floors even when the body's own close-tag tail misparses: {row:?}"
     );
     assert_eq!(assistant_texts(&events), vec!["ok"]);
+}
+
+/// The branch summary call carries the request's durable session id even
+/// when no core session is built (a `/tree` summary right after a resume
+/// races the create's background build). The recorder registration
+/// replaces the script's provider for the summary call.
+#[test]
+fn an_unbuilt_engine_branch_summary_carries_the_request_session_id() {
+    use crate::engine::SessionEngine as _;
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(json!({ "engine": "faux", "responses": [{ "text": "ok" }] }).to_string()),
+        supervisor_link: None,
+        telemetry_disabled: Some(true),
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    let model = engine.resolve_model().expect("faux model");
+    assert!(engine.session.blocking_lock().is_none(), "no session built");
+    let recorder = pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+        api: Some(model.api),
+        provider: Some("faux".to_string()),
+        ..Default::default()
+    });
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&seen);
+    recorder.set_responses(vec![pa_ai::faux::FauxResponseStep::Factory(
+        std::sync::Arc::new(
+            move |_context: &pa_types::ai::Context,
+                  options: Option<&pa_ai::types::StreamOptions>,
+                  _call: u64,
+                  _model: &pa_types::ai::Model| {
+                sink.lock()
+                    .unwrap()
+                    .push(options.and_then(|options| options.session_id.clone()));
+                Ok(pa_ai::faux::faux_assistant_text_message(
+                    "## Goal\nexplore the tree",
+                    pa_ai::faux::FauxAssistantMessageOptions::default(),
+                ))
+            },
+        ),
+    )]);
+    let outcome = engine.run_branch_summary(
+        crate::engine::BranchSummaryRequest {
+            entries: vec![pa_types::session::FileEntry::Message {
+                message: pa_types::session::AgentMessage::User(pa_types::ai::UserMessage {
+                    content: pa_types::ai::UserContent::Text("explore the widget".to_string()),
+                    timestamp: 0,
+                    rest: Map::default(),
+                }),
+                base: pa_types::session::EntryBase {
+                    id: Some("e0".to_string()),
+                    parent_id: None,
+                    timestamp: Some("2024-01-01T00:00:00.000Z".to_string()),
+                    rest: Map::default(),
+                },
+            }],
+            custom_instructions: None,
+            replace_instructions: false,
+            session_id: "durable-session".to_string(),
+        },
+        &pa_agent::abort::AbortController::new().signal(),
+    );
+    recorder.unregister();
+    assert!(
+        matches!(
+            outcome,
+            crate::engine::BranchSummaryOutcome::Complete { .. }
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(*seen.lock().unwrap(), [Some("durable-session".to_string())]);
+}
+
+/// An injected custom row without a timestamp admits the turn (the type's
+/// serde default fills the clock at parse) — the regression for the live
+/// `injected custom message parse failed: missing field timestamp`
+/// failures, whose sender the dropped payload could not identify.
+#[test]
+fn an_injected_custom_row_without_a_timestamp_admits_the_turn() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (engine, _dir) = faux_engine_with_settings(
+        &serde_json::json!({ "responses": [{"text": "notice acknowledged"}] }),
+        1,
+    );
+    let notice_text = "[child-exited: no-reply child:lane]";
+    // No "timestamp" field: the external-sender shape.
+    let notice = serde_json::json!({
+        "role": "custom",
+        "customType": "rlm_child_terminal_notice",
+        "content": notice_text,
+        "display": true,
+        "details": {
+            "kind": "completed_without_reply",
+            "childId": "sub-1",
+            "sessionName": "lane",
+        },
+    });
+    let mut events: Vec<EngineEvent> = Vec::new();
+    engine.run_prompt(
+        0,
+        PromptRequest {
+            batch: Vec::new(),
+            images: Vec::new(),
+            message: notice_text.to_string(),
+            source: "user".to_string(),
+            agent_message_id: None,
+            custom_message: Some(notice),
+        },
+        &|| false,
+        &mut |event| {
+            events.push(event);
+            true
+        },
+    );
+    // THE PIN: the turn ADMITS (no parse-failed Done) and the turn RUNS to
+    // its model response — the injected parse never refused the delivery
+    // over the missing clock. The accepted row IS the parsed row: the
+    // default-filled clock rides it, so the frames clients get and the
+    // model context hold one representation (the frame/context pair is
+    // pinned end to end at the worker delivery seam; the default itself at
+    // the pa-types seam).
+    let parse_failed = events.iter().any(|event| {
+        matches!(event, EngineEvent::Done(Err(message)) if message.contains("parse failed"))
+    });
+    assert!(
+        !parse_failed,
+        "the missing timestamp must not kill the turn"
+    );
+    let accepted = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::CustomMessage(row) => Some(row.clone()),
+            _ => None,
+        })
+        .expect("the accepted row emitted");
+    assert_eq!(accepted["customType"], "rlm_child_terminal_notice");
+    assert!(
+        accepted["timestamp"]
+            .as_u64()
+            .is_some_and(|millis| millis > 0),
+        "the accepted row carries the default-filled clock: {accepted}"
+    );
+    let done = events
+        .iter()
+        .any(|event| matches!(event, EngineEvent::Done(Ok(()))));
+    assert!(done, "the turn completed: {:?}", events.len());
+}
+
+/// The parse-failure diagnostic line: the requesting turn's identity plus
+/// a summary of the row (`customType`, top-level keys, byte length) — never
+/// the raw payload, which can carry base64 image blocks and private
+/// prompt text.
+#[test]
+fn the_parse_failure_log_line_carries_the_senders_identity_not_the_payload() {
+    use crate::agent_engine::session_engine_impl::injected_custom_parse_failed_log_line;
+    let secret = "private-prompt-text-and-a-base64-blob";
+    let payload = serde_json::json!({
+        "role": "custom",
+        "customType": "queued.note",
+        "content": secret,
+        "display": true,
+        "details": { "image": secret },
+    });
+    // A real seam-shaped parse failure (content is the wrong shape for
+    // UserContent), exactly the kind the diagnostic logs.
+    let error = serde_json::from_value::<pa_types::session::AgentMessage>(serde_json::json!({
+        "role": "custom",
+        "customType": "queued.note",
+        "content": 123,
+        "display": true,
+    }))
+    .expect_err("the wrong-typed content fails the parse");
+    let line = injected_custom_parse_failed_log_line(
+        "user",
+        Some("agentmsg-1"),
+        "/tmp/sessions/chief.jsonl",
+        &payload,
+        &error,
+    );
+    // The identity: where the row came from.
+    assert!(
+        line.contains("agentmsg-1"),
+        "the message id must ride the line: {line}"
+    );
+    assert!(
+        line.contains("/tmp/sessions/chief.jsonl"),
+        "the session file must ride the line: {line}"
+    );
+    assert!(
+        line.contains(r#"source="user""#),
+        "the source must ride the line: {line}"
+    );
+    assert!(line.contains("parse failed"), "the line names the failure");
+    // The summary: what the row was — never its raw payload.
+    assert!(
+        line.contains(r#"customType="queued.note""#),
+        "the customType identifies the row: {line}"
+    );
+    assert!(
+        line.contains(r#"keys=["role", "customType", "content", "display", "details"]"#),
+        "the top-level keys ride the line: {line}"
+    );
+    assert!(
+        line.contains(&format!(
+            "bytes={}",
+            serde_json::to_vec(&payload).unwrap().len()
+        )),
+        "the byte length rides the line: {line}"
+    );
+    assert!(
+        !line.contains(secret),
+        "the raw payload must not ride the log line: {line}"
+    );
 }

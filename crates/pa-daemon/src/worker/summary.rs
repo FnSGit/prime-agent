@@ -2,10 +2,11 @@
 //! roster push, and the event emission family.
 use super::lifecycle::active_lifecycle;
 use super::{
-    checkpoint_queue_recovery, create_daemon_event_meta, is_injected_prompt_item,
-    is_rlm_child_status_item, json, AgentConnectionState, Arc, DaemonOutbound,
-    DaemonSessionClosedReason, EventPump, Map, Mutex, OutboundFrame, QueueCheckpoint, QueueLanes,
-    QueuedItem, Result, SessionActionSnapshot, SessionCore, SessionEngine, Value, Worker,
+    checkpoint_queue_recovery, create_daemon_event_meta, is_inbox_notice_item,
+    is_injected_prompt_item, is_rlm_child_status_item, json, AgentConnectionState, Arc,
+    DaemonOutbound, DaemonSessionClosedReason, EventPump, Map, Mutex, OutboundFrame,
+    QueueCheckpoint, QueueLanes, QueuedItem, Result, SessionActionSnapshot, SessionCore,
+    SessionEngine, Value, Worker,
 };
 
 use crate::types::SessionSummary;
@@ -142,12 +143,22 @@ impl Worker {
     /// Persist the queue lanes to the recovery journal. Call after
     /// releasing the core lock: `record_recovery` takes the locks in
     /// the opposite order.
-    pub(crate) fn persist_queue_snapshot(&self, active_session_id: &str, lanes: &QueueLanes) {
+    pub(crate) fn persist_queue_snapshot(
+        &self,
+        active_session_id: &str,
+        suspended: bool,
+        lanes: &QueueLanes,
+    ) {
         let mut guard = self.recovery.lock().unwrap();
         let Some(journal) = guard.as_mut() else {
             return;
         };
-        let _ = journal.record_queue_snapshot(active_session_id, &lanes.steering, &lanes.follow_up);
+        let _ = journal.record_queue_snapshot(
+            active_session_id,
+            &lanes.steering,
+            &lanes.follow_up,
+            suspended,
+        );
     }
 
     /// One queue-lane recovery checkpoint: the lane snapshot and the
@@ -183,49 +194,14 @@ impl Worker {
     /// Record one durable custom row and broadcast its `message_start`/`message_end`
     /// pair (rows the session appends outside a turn).
     pub(crate) fn emit_custom_row(&self, message: &Value) {
-        {
-            let mut core = self.core.lock().unwrap();
-            persist_custom_row(&mut core, message);
-        }
-        self.broadcast_custom_row(message);
-    }
-
-    /// Broadcast one recorded custom row's `message_start`/`message_end`
-    /// pair (the frames attached clients render for it). Runs OUTSIDE
-    /// the `core` lock: a caller that persisted the row under its own
-    /// lock scope broadcasts after releasing it.
-    pub(crate) fn broadcast_custom_row(&self, message: &Value) {
-        self.emit_worker_event(json!({ "type": "message_start", "message": message }));
-        self.emit_worker_event(json!({ "type": "message_end", "message": message }));
+        let mut core = self.core.lock().unwrap();
+        persist_custom_row(&mut core, message);
+        broadcast_custom_row_locked(&mut core, &self.events, message);
     }
 
     /// Sequence and broadcast one `session_event` for the queue projection.
     pub(crate) fn emit_action_update(&self, snapshot: &SessionActionSnapshot) -> Result<()> {
-        let mut core = self.core.lock().unwrap();
-        // TS `_emitQueueUpdate`: an unchanged projection stays silent (an
-        // empty queue before and after a turn is not an update).
-        if core.last_action_snapshot.as_ref() == Some(snapshot) {
-            return Ok(());
-        }
-        core.last_action_snapshot = Some(snapshot.clone());
-        let sequence = core.last_event_sequence + 1;
-        core.last_event_sequence = sequence;
-        let meta = create_daemon_event_meta(
-            &core.active_session_id,
-            sequence,
-            None,
-            Some(&core.generation),
-        );
-        let outbound = DaemonOutbound::SessionEvent {
-            active_session_id: core.active_session_id.clone(),
-            event: json!({ "type": "session_action_update", "actions": snapshot }),
-            meta: Some(meta),
-            rest: Map::default(),
-        };
-        let payload = serde_json::to_vec(&outbound)?;
-        drop(core);
-        self.events.send(OutboundFrame::session_event(payload));
-        Ok(())
+        emit_action_update_raw(&self.core, &self.events, snapshot)
     }
 
     pub(crate) fn emit_session_closed(
@@ -279,12 +255,33 @@ pub(crate) fn persist_custom_row(
     }
 }
 
+/// Broadcast a persisted custom row without releasing its store lock: a
+/// compaction replacement cannot include the row before its live frames.
+pub(crate) fn broadcast_custom_row_locked(
+    core: &mut SessionCore,
+    events: &EventPump,
+    message: &Value,
+) {
+    for event_type in ["message_start", "message_end"] {
+        emit_worker_event_locked(
+            core,
+            events,
+            json!({ "type": event_type, "message": message }),
+        );
+    }
+}
+
 pub(crate) fn emit_worker_event_with(
     core: &Arc<Mutex<SessionCore>>,
     events: &Arc<EventPump>,
     event: Value,
 ) {
     let mut core = core.lock().unwrap();
+    emit_worker_event_locked(&mut core, events, event);
+}
+
+/// Sequence and enqueue an event while its caller still owns the session store lock.
+pub(crate) fn emit_worker_event_locked(core: &mut SessionCore, events: &EventPump, event: Value) {
     let sequence = core.last_event_sequence + 1;
     core.last_event_sequence = sequence;
     let meta = create_daemon_event_meta(
@@ -301,7 +298,6 @@ pub(crate) fn emit_worker_event_with(
         rest: Map::default(),
     };
     let payload = serde_json::to_vec(&outbound).unwrap_or_default();
-    drop(core);
     events.send(OutboundFrame::session_event(payload));
 }
 
@@ -341,6 +337,7 @@ pub(crate) async fn push_roster_delta(context: &RosterPushContext) {
                 .roster_delta_sequence
                 .load(std::sync::atomic::Ordering::SeqCst),
         );
+        summary.worker_instance_id = Some(context.worker_instance_id.clone());
         let summary = serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
         let sequence_value = context
             .roster_delta_sequence
@@ -412,6 +409,7 @@ pub(crate) struct SummaryInputs {
     pub(crate) bash_running: bool,
     pub(crate) quota_parked: bool,
     pub(crate) subagents_running: bool,
+    pub(crate) progress_note: Option<String>,
 }
 
 impl SummaryInputs {
@@ -447,6 +445,7 @@ impl SummaryInputs {
             bash_running: user_bash.is_running(),
             quota_parked: engine.is_quota_parked(),
             subagents_running: engine.has_running_subagents(),
+            progress_note: engine.progress_note(),
         }
     }
 }
@@ -577,6 +576,8 @@ pub(crate) fn session_summary(core: &SessionCore, inputs: SummaryInputs) -> Sess
         created: store.map(|s| s.header.timestamp.clone()),
         modified,
         first_message: store.and_then(crate::session_store::SessionFile::first_message),
+        progress_note: inputs.progress_note,
+        tool_use_count: (core.tool_use_count > 0).then_some(core.tool_use_count),
         parent_session_path: store.and_then(|store| store.header.parent_session.clone()),
         parent_active_session_id: core.parent_active_session_id.clone(),
         parent_session_id: core.parent_session_id.clone(),
@@ -591,6 +592,7 @@ pub(crate) fn session_summary(core: &SessionCore, inputs: SummaryInputs) -> Sess
         model: inputs.model,
         model_fallback_message: inputs.model_fallback_message,
         runtime_kind: Some(core.runtime_kind.clone()),
+        decision_child: core.decision_child.then_some(true),
         unfinished_action_count: Some(0),
         anthropic_warning_shown: store
             .map(crate::session_store::SessionFile::anthropic_warning_shown),
@@ -630,6 +632,10 @@ pub(crate) fn session_snapshot(core: &SessionCore) -> SessionActionSnapshot {
     // 2026-09-28), unlike TS's filtered-out projection.
     let injected_prompts =
         |items: &std::collections::VecDeque<QueuedItem>| indices(items, is_injected_prompt_item);
+    // The daemon inbox notices fold by their own typed provenance: the
+    // arrival/reminder rows never render as browsable steering previews.
+    let inbox_notice =
+        |items: &std::collections::VecDeque<QueuedItem>| indices(items, is_inbox_notice_item);
     SessionActionSnapshot {
         queued_count: (core.steering.len() + core.follow_up.len()) as u32,
         steering: lane(&core.steering),
@@ -641,6 +647,10 @@ pub(crate) fn session_snapshot(core: &SessionCore) -> SessionActionSnapshot {
         injected_prompts: crate::types::QueueLaneIndices {
             steering: injected_prompts(&core.steering),
             follow_up: injected_prompts(&core.follow_up),
+        },
+        inbox_notice: crate::types::QueueLaneIndices {
+            steering: inbox_notice(&core.steering),
+            follow_up: inbox_notice(&core.follow_up),
         },
         active: core.active_action.clone(),
     }
@@ -656,4 +666,67 @@ pub(crate) fn compact_action_label(text: &str) -> String {
     }
     let kept: String = compact.chars().take(MAX_CHARS - 3).collect();
     format!("{}...", kept.trim_end())
+}
+
+/// The queue-projection broadcast over raw handles: the pre-construction
+/// read-hook seam (the worker's post-drain refresh) shares this body.
+pub(crate) fn emit_action_update_raw(
+    core: &Arc<std::sync::Mutex<SessionCore>>,
+    events: &Arc<EventPump>,
+    snapshot: &SessionActionSnapshot,
+) -> Result<()> {
+    let mut core_guard = core.lock().unwrap();
+    // TS `_emitQueueUpdate`: an unchanged projection stays silent (an
+    // empty queue before and after a turn is not an update).
+    if core_guard.last_action_snapshot.as_ref() == Some(snapshot) {
+        return Ok(());
+    }
+    // The send stays under the guard: broadcast ORDER must follow the
+    // projection order (a release before the send lets a concurrent
+    // emission overtake this one and suppress the corrective update).
+    let payload = build_action_snapshot_payload_locked(&mut core_guard, snapshot)?;
+    events.send(OutboundFrame::session_event(payload));
+    drop(core_guard);
+    Ok(())
+}
+
+/// The queue projection recomputed and broadcast under ONE lock: the
+/// post-drain hook's refresh can race an admission's own emission, and a
+/// copy snapshotted outside the emission lock could overwrite the newer
+/// strip state.
+pub(crate) fn emit_action_update_fresh(
+    core: &Arc<std::sync::Mutex<SessionCore>>,
+    events: &Arc<EventPump>,
+) -> Result<()> {
+    let mut core_guard = core.lock().unwrap();
+    let snapshot = Worker::snapshot_locked(&core_guard);
+    if core_guard.last_action_snapshot.as_ref() == Some(&snapshot) {
+        return Ok(());
+    }
+    let payload = build_action_snapshot_payload_locked(&mut core_guard, &snapshot)?;
+    events.send(OutboundFrame::session_event(payload));
+    drop(core_guard);
+    Ok(())
+}
+
+fn build_action_snapshot_payload_locked(
+    core: &mut SessionCore,
+    snapshot: &SessionActionSnapshot,
+) -> Result<Vec<u8>> {
+    core.last_action_snapshot = Some(snapshot.clone());
+    let sequence = core.last_event_sequence + 1;
+    core.last_event_sequence = sequence;
+    let meta = create_daemon_event_meta(
+        &core.active_session_id,
+        sequence,
+        None,
+        Some(&core.generation),
+    );
+    let outbound = DaemonOutbound::SessionEvent {
+        active_session_id: core.active_session_id.clone(),
+        event: json!({ "type": "session_action_update", "actions": snapshot }),
+        meta: Some(meta),
+        rest: Map::default(),
+    };
+    Ok(serde_json::to_vec(&outbound)?)
 }

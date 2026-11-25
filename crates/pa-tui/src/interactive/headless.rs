@@ -63,6 +63,12 @@ pub enum HeadlessStep {
     /// A raw mouse sequence: decoded by the same parser the terminal's SGR reports flow
     /// through, so the verifier drives the wheel dispatch with byte-identical sequences.
     Mouse(String),
+    /// Record when the UI consumes this step, after the preceding headless step's frame,
+    /// with the renderer's headless render invocation count at that moment. Bracket input
+    /// sequences without including attach, initial rendering, or teardown: the render count
+    /// witnesses renders that the frame capture's plain-text dedupe cannot express (a
+    /// selection restyle changes styles, not text).
+    Timestamp(std::sync::mpsc::Sender<(std::time::Instant, usize)>),
     /// One raw key event: the verifier's window into the selector/picker surfaces (arrows, escape),
     /// which typed text cannot express.
     Key(crossterm::event::KeyEvent),
@@ -112,7 +118,7 @@ impl HeadlessSettle {
             share_pending: session.share_pending(),
             reload_pending: session.reload_pending(),
             traces_upload_pending: session.traces_upload_pending(),
-            auth_panel_open: view.auth_panel.is_some(),
+            auth_panel_open: matches!(view.overlay, Some(crate::view::Overlay::AuthPanel(_))),
             traces_login_pending: session.pending_traces_login(),
             mcp_auth_pending: session.pending_mcp_auth(),
             anthropic_warning_mark_pending: session.anthropic_warning_mark_pending(),

@@ -21,6 +21,8 @@ pub const SELF_UPDATE_INTERACTIVE_CHILD_ENV: &str = "PRIME_AGENT_INTERACTIVE_SEL
 pub const DAEMON_UPDATE_RESTART_COORDINATOR_FLAG: &str = "--internal-update-restart-coordinator";
 pub const DAEMON_UPDATE_RESTART_STATUS_FLAG: &str = "--internal-update-restart-status";
 pub const DAEMON_UPDATE_RESTART_ORIGIN_FLAG: &str = "--internal-update-restart-origin";
+/// The installer's daemon restart: `update --internal-update-restart-daemon --daemon-socket <path>`.
+pub const DAEMON_UPDATE_RESTART_DAEMON_FLAG: &str = "--internal-update-restart-daemon";
 
 /// The outcome of routing the argv through the public command layer.
 #[derive(Debug, Clone)]
@@ -124,12 +126,16 @@ pub fn handle_public_command(args: &[String]) -> PublicCommandResult {
         return continue_with(args.clone());
     }
     if command == "update"
-        && args
-            .iter()
-            .any(|a| a == DAEMON_UPDATE_RESTART_COORDINATOR_FLAG)
+        && args.iter().any(|a| {
+            a == DAEMON_UPDATE_RESTART_COORDINATOR_FLAG || a == DAEMON_UPDATE_RESTART_DAEMON_FLAG
+        })
     {
-        handle_package_command(&args);
-        return handled();
+        if let Err(error) = crate::config::require_agent_dir() {
+            eprintln!("Error: {error}");
+            return handled_failed();
+        }
+        let result = handle_package_command(&args);
+        return handled_with_exit(result.exit_code.unwrap_or(0));
     }
 
     let separator_index = args.iter().position(|a| a == "--");
@@ -140,6 +146,11 @@ pub fn handle_public_command(args: &[String]) -> PublicCommandResult {
     });
     if let Some(help_index) = help_index {
         return print_requested_help(&get_command_path(&args[..help_index]));
+    }
+
+    if let Err(error) = crate::config::require_agent_dir() {
+        eprintln!("Error: {error}");
+        return handled_failed();
     }
 
     let rest: Vec<String> = args[1..].to_vec();
@@ -179,6 +190,7 @@ pub fn handle_public_command(args: &[String]) -> PublicCommandResult {
         "model" => rewrite_nested_command("model", "list", "--list-models", &rest),
         "session" => rewrite_nested_command("session", "export", "--export", &rest),
         "prompt" => handled_with_exit(crate::prompt_command::run_prompt_command(&rest)),
+        "skills" => handled_with_exit(crate::skills_command::run_skills_command(&rest)),
         "factory" => handled_with_exit(crate::factory_command::run_factory_command(&rest)),
         "config" => {
             if !rest.is_empty() {
@@ -244,6 +256,16 @@ fn reject_removed_command(args: &[String]) -> PublicCommandResult {
         ("install", _) => Some("Use \"prime-agent package install\".".to_string()),
         ("remove" | "uninstall", _) => Some("Use \"prime-agent package remove\".".to_string()),
         ("manage", _) => Some("Use \"prime-agent agents\".".to_string()),
+        ("machine", Some("validate")) => Some(
+            "Use \"prime-agent factory import <path>\"; it validates the machine before importing it."
+                .to_string(),
+        ),
+        ("machine", Some(name))
+            if crate::command_registry::get_command_spec(&["factory", name]).is_some() =>
+        {
+            Some(format!("Use \"prime-agent factory {name}\"."))
+        }
+        ("machine", _) => Some("Use \"prime-agent factory\".".to_string()),
         _ => None,
     };
     let joined: Vec<&str> = args.iter().take(2).map(String::as_str).collect();
@@ -725,10 +747,14 @@ fn run_update(args: &[String]) -> PublicCommandResult {
     ) {
         return handled_with_exit(abort_code);
     }
-    // The installer funnel serves the bare update and the channel flags:
-    // the channel is the flag, else the saved `updateChannel` setting
-    // (`/nightly on|off`), else the installed one.
-    if !options.rollback && options.archive.is_none() {
+    // A Rust archive activated by a historical TS installer still belongs
+    // to that managed root. Keep using its atomic launcher activation so a
+    // custom root/public-bin pair is not silently replaced by ~/.local.
+    let managed_install = std::env::current_exe()
+        .ok()
+        .and_then(|exe| pa_core::update::install::install_root_of(&exe))
+        .is_some();
+    if !managed_install && !options.rollback && options.archive.is_none() {
         let update = crate::installer_update::UpdateOptions {
             check: false,
             channel: options.channel,
@@ -1020,6 +1046,17 @@ mod update_options_tests {
         assert_eq!(channel(&["--check", "--nightly", "--stable"]), None);
         assert_eq!(channel(&["--check", "--force"]), None);
         assert_eq!(channel(&["--check", "--rollback"]), None);
+    }
+
+    #[test]
+    fn invalid_restart_coordinator_preserves_the_failure_exit_code() {
+        let args = vec![
+            "update".to_string(),
+            DAEMON_UPDATE_RESTART_COORDINATOR_FLAG.to_string(),
+        ];
+        let result = handle_public_command(&args);
+        assert!(result.handled);
+        assert_eq!(result.exit_code, Some(1));
     }
 
     #[test]

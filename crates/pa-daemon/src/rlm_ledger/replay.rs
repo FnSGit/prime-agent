@@ -5,8 +5,8 @@
 use anyhow::Context as _;
 
 use super::{
-    bail, canonical_session_path, fs, json, HashMap, Path, PathBuf, Result, RlmLedgerDeleteReason,
-    RlmLedgerEdge, Value,
+    bail, canonical_session_path, fs, json, Arc, HashMap, Mutex, OnceLock, Path, PathBuf, Result,
+    RlmLedgerDeleteReason, RlmLedgerEdge, Value,
 };
 
 /// One replayed ledger record (`meta` records carry no edge and are skipped).
@@ -18,6 +18,8 @@ pub(super) enum LedgerRecord {
         child: String,
         depth: u32,
         name: String,
+        factory: Option<super::RlmFactoryTag>,
+        decision_child: bool,
     },
     Rename {
         child_id: String,
@@ -29,6 +31,7 @@ pub(super) enum LedgerRecord {
         child: String,
         reason: RlmLedgerDeleteReason,
         usage: Option<crate::session_usage::SessionUsageSummary>,
+        usage_by_model: Option<Vec<crate::session_usage::ModelUsageSummary>>,
     },
 }
 
@@ -103,12 +106,20 @@ pub(super) fn parse_ledger_line(line: &str, index: usize) -> Result<Option<Ledge
             if depth < 1 || depth > u64::from(u32::MAX) {
                 bail!("malformed RLM ledger line {line_no}: invalid spawn record");
             }
+            // The optional run tag: a malformed one reads as untagged, so
+            // the edge itself survives.
+            let factory = record
+                .get("factory")
+                .and_then(|factory| serde_json::from_value(factory.clone()).ok());
+            let decision_child = record.get("decisionChild") == Some(&json!(true));
             Ok(Some(LedgerRecord::Spawn {
                 child_id,
                 parent,
                 child,
                 depth: depth as u32,
                 name,
+                factory,
+                decision_child,
             }))
         }
         "rename" => {
@@ -140,11 +151,18 @@ pub(super) fn parse_ledger_line(line: &str, index: usize) -> Result<Option<Ledge
                 None => None,
                 Some(usage) => Some(parse_deleted_usage(usage, line_no)?),
             };
+            // The snapshot's optional per-model split: a malformed one reads
+            // as unsplit, so the billed snapshot itself survives.
+            let usage_by_model = record
+                .get("usage")
+                .and_then(|usage| usage.get("byModel"))
+                .and_then(|by_model| serde_json::from_value(by_model.clone()).ok());
             Ok(Some(LedgerRecord::Delete {
                 child_id,
                 child,
                 reason,
                 usage,
+                usage_by_model,
             }))
         }
         _ => Ok(None),
@@ -152,10 +170,23 @@ pub(super) fn parse_ledger_line(line: &str, index: usize) -> Result<Option<Ledge
 }
 
 /// The replayed edge set: replay order plus a key index for record joins.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub(super) struct ReplayState {
     pub(super) edges: Vec<RlmLedgerEdge>,
     pub(super) index: HashMap<String, usize>,
+    pub(super) artifact_index: OnceLock<Mutex<ArtifactIndex>>,
+    pub(super) deleted_bucket: Mutex<Option<DeletedBucket>>,
+    /// Live edges by the durable session id (file-name stem) of their
+    /// recorded parent: the family walk's entry into the replay.
+    pub(super) children_by_parent_id: HashMap<String, Vec<usize>>,
+}
+
+/// Ledger rows are immutable within a replay, but file moves and transcript
+/// edits can change the inputs of the deleted-spend fold without any append.
+#[derive(Debug)]
+pub(super) struct DeletedBucket {
+    pub(super) inputs: Vec<Option<FileIdentity>>,
+    pub(super) children: super::DeletedChildrenByParent,
 }
 
 pub(super) fn edge_key(child_id: &str, child: &str) -> String {
@@ -167,69 +198,116 @@ pub(super) fn edge_key(child_id: &str, child: &str) -> String {
 
 /// One `live_edges` liveness pass: a recorded path that stats resolves
 /// as itself; a moved file resolves through its durable session id (the
-/// file-name stem) against the sessions dir and the artifacts tree. The
-/// per-pass cache keeps the artifact walk to one pass per read.
-pub(super) struct LivePathResolver {
+/// file-name stem) against the sessions dir and the artifacts tree.
+pub(super) struct LivePathResolver<'a> {
     agent_dir: PathBuf,
     sessions_dir: PathBuf,
-    resolved: HashMap<String, Option<PathBuf>>,
-    artifact_index: Option<HashMap<String, PathBuf>>,
+    pub(super) resolved: HashMap<String, Option<PathBuf>>,
+    artifact_index: &'a OnceLock<Mutex<ArtifactIndex>>,
+    artifact_checked: bool,
 }
 
-impl LivePathResolver {
-    pub(super) fn new(agent_dir: PathBuf, sessions_dir: PathBuf) -> Self {
+impl<'a> LivePathResolver<'a> {
+    pub(super) fn new(
+        agent_dir: PathBuf,
+        sessions_dir: PathBuf,
+        artifact_index: &'a OnceLock<Mutex<ArtifactIndex>>,
+    ) -> Self {
         LivePathResolver {
             agent_dir,
             sessions_dir,
             resolved: HashMap::new(),
-            artifact_index: None,
+            artifact_index,
+            artifact_checked: false,
         }
     }
 
     /// The live session file for one recorded edge path, `None` when the
     /// session is gone everywhere (the edge endpoint is dead).
-    pub(super) fn resolve(&mut self, recorded: &str) -> Option<PathBuf> {
+    pub(super) fn resolve(&mut self, recorded: &str) -> Result<Option<PathBuf>> {
         if let Some(hit) = self.resolved.get(recorded) {
-            return hit.clone();
+            return Ok(hit.clone());
         }
-        let live = self.resolve_uncached(recorded);
+        let live = self.resolve_uncached(recorded)?;
         self.resolved.insert(recorded.to_string(), live.clone());
-        live
+        Ok(live)
     }
 
-    fn resolve_uncached(&mut self, recorded: &str) -> Option<PathBuf> {
+    fn resolve_uncached(&mut self, recorded: &str) -> Result<Option<PathBuf>> {
         let recorded_path = Path::new(recorded);
         if is_file(recorded_path) {
-            return Some(recorded_path.to_path_buf());
+            return Ok(Some(recorded_path.to_path_buf()));
         }
-        let id = recorded_path.file_stem()?.to_string_lossy().to_string();
+        let Some(stem) = recorded_path.file_stem() else {
+            return Ok(None);
+        };
+        let id = stem.to_string_lossy();
         if id.is_empty() {
-            return None;
+            return Ok(None);
         }
         let sessions_candidate = self.sessions_dir.join(format!("{id}.jsonl"));
         if is_file(&sessions_candidate) {
-            return Some(sessions_candidate);
+            return Ok(Some(sessions_candidate));
         }
-        let index = self
+        let mut index = self
             .artifact_index
-            .get_or_insert_with(|| artifact_session_index(&self.agent_dir));
-        index.get(&id).cloned()
+            .get_or_init(|| Mutex::new(artifact_session_index(&self.agent_dir)))
+            .lock()
+            .map_err(|_| anyhow::anyhow!("artifact index cache lock poisoned"))?;
+        // Directory identities cover additions, deletion and relocation, including
+        // new partitions. Check once per read; unchanged misses retain the shared
+        // negative result instead of enumerating every artifact file again.
+        if !self.artifact_checked {
+            if index
+                .directories
+                .iter()
+                .any(|(path, identity)| path_identity(path) != *identity)
+            {
+                *index = artifact_session_index(&self.agent_dir);
+            }
+            self.artifact_checked = true;
+        }
+        Ok(index
+            .paths
+            .get(id.as_ref())
+            .filter(|path| is_file(path))
+            .cloned())
     }
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ArtifactIndex {
+    paths: HashMap<String, PathBuf>,
+    directories: Vec<(PathBuf, Option<FileIdentity>)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static ARTIFACT_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The session files under the artifacts tree, keyed by their durable session id (the file-name
 /// stem); non-session `.jsonl` sidecars key by their own stems and never collide.
-fn artifact_session_index(agent_dir: &Path) -> HashMap<String, PathBuf> {
-    let mut index = HashMap::new();
+fn artifact_session_index(agent_dir: &Path) -> ArtifactIndex {
+    #[cfg(test)]
+    ARTIFACT_SCANS.with(|count| count.set(count.get() + 1));
+    let mut index = ArtifactIndex::default();
     let root = agent_dir.join(crate::context_tree_children::RLM_SESSION_ARTIFACTS_DIR);
+    index.directories.push((root.clone(), path_identity(&root)));
     let Ok(parents) = std::fs::read_dir(&root) else {
         return index;
     };
     for parent in parents.flatten() {
+        index
+            .directories
+            .push((parent.path(), path_identity(&parent.path())));
         let Ok(subs) = std::fs::read_dir(parent.path()) else {
             continue;
         };
         for sub in subs.flatten() {
+            index
+                .directories
+                .push((sub.path(), path_identity(&sub.path())));
             let Ok(files) = std::fs::read_dir(sub.path()) else {
                 continue;
             };
@@ -237,7 +315,7 @@ fn artifact_session_index(agent_dir: &Path) -> HashMap<String, PathBuf> {
                 let path = file.path();
                 if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
                     if let Some(stem) = path.file_stem() {
-                        index.insert(stem.to_string_lossy().to_string(), path);
+                        index.paths.insert(stem.to_string_lossy().to_string(), path);
                     }
                 }
             }
@@ -249,7 +327,7 @@ fn artifact_session_index(agent_dir: &Path) -> HashMap<String, PathBuf> {
 #[derive(Debug)]
 pub(super) struct ReplaySnapshot {
     pub(super) identity: FileIdentity,
-    pub(super) state: ReplayState,
+    pub(super) state: Arc<ReplayState>,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -307,10 +385,14 @@ pub(super) fn sole_edge_by_child_id(state: &ReplayState, child_id: &str) -> Opti
 }
 
 pub(super) fn file_identity(path: &Path) -> Result<Option<FileIdentity>> {
+    Ok(path_identity(path))
+}
+
+fn path_identity(path: &Path) -> Option<FileIdentity> {
     let Ok(metadata) = fs::metadata(path) else {
-        return Ok(None);
+        return None;
     };
-    Ok(Some(FileIdentity {
+    Some(FileIdentity {
         size: metadata.len(),
         mtime: metadata.modified().ok(),
         #[cfg(unix)]
@@ -318,7 +400,7 @@ pub(super) fn file_identity(path: &Path) -> Result<Option<FileIdentity>> {
             use std::os::unix::fs::MetadataExt;
             Some(metadata.ino())
         },
-    }))
+    })
 }
 
 pub(super) fn is_file(path: &Path) -> bool {

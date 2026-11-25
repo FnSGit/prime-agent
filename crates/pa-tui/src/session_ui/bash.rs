@@ -2,7 +2,7 @@
 //! flush, the kernel-bash registry, and the bash view.
 use super::{
     already_running_warning, key_event_to_id, picker_viewport_rows, AgentView, BashView,
-    BashViewAction, ChatEntry, DaemonCommand, Duration, KeyEvent, Map, Result, SessionUi,
+    BashViewAction, ChatEntry, DaemonCommand, Duration, KeyEvent, Map, Overlay, Result, SessionUi,
     StatusKind, Value, UI_REQUEST_TIMEOUT_MS,
 };
 
@@ -247,16 +247,11 @@ impl SessionUi {
                 }
                 // A landed REGISTRY update supersedes a shown error — but only when the registry's
                 // rows actually moved; the running rows' duration ticks never clear anything.
-                let row_signature = |data: &Value| -> Vec<(String, String, Option<i64>)> {
-                    crate::bash_view::parse_bash_activities(data)
-                        .into_iter()
-                        .map(|row| (row.id, row.status, row.exit_code))
-                        .collect()
-                };
-                let rows_settled = row_signature(&self.bash_activities) != row_signature(&data);
+                let rows_settled =
+                    crate::bash_view::registry_rows_moved(&self.bash_activities, &data);
                 self.bash_activities = data;
                 if rows_settled {
-                    if let Some(bash_view) = view.bash_view.as_mut() {
+                    if let Some(Overlay::Bash(bash_view)) = view.overlay.as_mut() {
                         bash_view.clear_error();
                     }
                 }
@@ -268,7 +263,7 @@ impl SessionUi {
                 generation,
                 ..
             } => {
-                if let Some(bash_view) = view.bash_view.as_mut() {
+                if let Some(Overlay::Bash(bash_view)) = view.overlay.as_mut() {
                     bash_view.set_output(&activity_id, &tail, generation);
                 }
             }
@@ -282,16 +277,15 @@ impl SessionUi {
                 // An in-view action's failure surfaces in the open bash view only when the failed
                 // request's row is the open detail; with no view open the transcript row carries
                 // it.
-                let detail_matches = match (&view.bash_view, &activity_id) {
-                    (Some(bash_view), Some(id)) => bash_view.detail_id().as_deref() == Some(id),
-                    _ => true,
-                };
-                if view.bash_view.is_some() && detail_matches {
-                    if let Some(bash_view) = view.bash_view.as_mut() {
+                match view.overlay.as_mut() {
+                    Some(Overlay::Bash(bash_view))
+                        if activity_id
+                            .as_ref()
+                            .is_none_or(|id| bash_view.detail_id().as_deref() == Some(id)) =>
+                    {
                         bash_view.set_error(message, fetch, generation);
                     }
-                } else {
-                    self.error_row(&message, view);
+                    _ => self.error_row(&message, view),
                 }
             }
             BashActivityUpdate::Refresh { .. } => {
@@ -306,10 +300,10 @@ impl SessionUi {
     /// Bash group's destination).
     pub(super) fn open_bash_view(&mut self, view: &mut AgentView) {
         self.spawn_bash_activity_refresh();
-        view.bash_view = Some(BashView::new(
+        view.overlay = Some(Overlay::Bash(BashView::new(
             crate::bash_view::parse_bash_activities(&self.bash_activities),
             picker_viewport_rows(view.terminal_rows()),
-        ));
+        )));
         self.subagents_focused = false;
         self.update_subagent_summary(view);
         self.dirty = true;
@@ -366,19 +360,20 @@ impl SessionUi {
         let Some(id) = key_event_to_id(&key) else {
             return Ok(());
         };
-        if id == "ctrl+c" {
-            self.exit_guard.note_ctrl_c_handled();
-        }
-        let action = view
-            .bash_view
-            .as_mut()
-            .map(|bash_view| bash_view.handle_key(&id, view.editor.keybindings()));
+        let action = match view.overlay.as_mut() {
+            Some(Overlay::Bash(bash_view)) => {
+                Some(bash_view.handle_key(&id, view.editor.keybindings()))
+            }
+            _ => None,
+        };
         match action {
             Some(BashViewAction::Close) => {
-                view.bash_view = None;
+                view.overlay = None;
                 // The exit restores the dock's own group (the operator's 2026-09-26 panel-exit
                 // ruling): ESC/left lands back on the Shells item, not the prompt bar.
-                self.focus_activity_dock(view);
+                if !self.close_panel_to_agents_view() {
+                    self.focus_activity_dock(view);
+                }
             }
             Some(BashViewAction::OpenDetail { id, generation }) => {
                 // The open asks for the first window only; the detail's upward scroll
@@ -479,7 +474,10 @@ impl SessionUi {
         let id = format!("user-bash-{}", self.user_bash_counter);
         let mut card =
             crate::bash_card::BashExecutionCard::new_running(&id, command, exclude_from_context);
-        card.suppress_leading_space = matches!(view.chat.last(), Some(ChatEntry::AgentMessage(_)));
+        card.suppress_leading_space = matches!(
+            view.chat.last(),
+            Some(ChatEntry::AgentMessage(_) | ChatEntry::InboxNotice(_))
+        );
         if self.turn_active {
             view.pending_bash.push(card);
         } else {

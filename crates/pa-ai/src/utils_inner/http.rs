@@ -17,9 +17,18 @@ static H2_ALPN_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// The HTTP/1.1 client every provider shares, pinned with `http1_only()` so that enabling the
 /// reqwest `http2` feature (bedrock) cannot change the transport of any other provider.
-fn client() -> &'static reqwest::Client {
+/// Caller-owned transports outside the providers (pa-core's decision path) ride it too, reusing
+/// one pool and one TLS handshake instead of paying a `ClientBuilder::build`'s trust-store reload
+/// per call.
+///
+/// # Panics
+///
+/// Never: the builder sets only transport/pool options, and its certificate
+/// roots were already filtered on load.
+pub fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            .tls_backend_preconfigured(crate::utils_inner::tls::tls_config(&[b"http/1.1"]))
             .http1_only()
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()
@@ -31,7 +40,7 @@ fn client() -> &'static reqwest::Client {
 /// default transport; cleartext bedrock endpoints go through `providers/bedrock/h2.rs` instead.
 fn h2_alpn_client() -> &'static reqwest::Client {
     H2_ALPN_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        crate::utils_inner::tls::http_client_builder()
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()
             .expect("reqwest h2 client")
@@ -388,48 +397,79 @@ mod tests {
     }
 
     /// A multi-byte character split across two body chunks decodes once, whole: the first chunk
-    /// ends inside 你, and the server sends the rest only after that chunk was read.
+    /// ends inside 你, and the server sends the rest only after that chunk was read. A body that
+    /// ends inside a multi-byte character yields the valid text plus exactly one U+FFFD.
     #[tokio::test]
     async fn next_text_rejoins_a_multi_byte_character_split_across_body_chunks() {
-        let (hold_tx, hold_rx) = tokio::sync::oneshot::channel();
-        let addr = serve_split_body(b"hi \xE4".to_vec(), b"\xBD\xA0!".to_vec(), hold_rx).await;
-        let mut response = send(RequestOptions::new(
-            reqwest::Method::GET,
-            format!("http://{addr}/"),
-        ))
-        .await
-        .unwrap();
-        let mut text = String::new();
-        if let Some(chunk) = response.next_text().await.unwrap() {
-            text.push_str(&chunk);
-            let _ = hold_tx.send(());
+        for (first, rest, expected) in [
+            (&b"hi \xE4"[..], &b"\xBD\xA0!"[..], "hi 你!"),
+            (&b"cut \xE4"[..], &b"\xBD"[..], "cut \u{FFFD}"),
+        ] {
+            let (hold_tx, hold_rx) = tokio::sync::oneshot::channel();
+            let addr = serve_split_body(first.to_vec(), rest.to_vec(), hold_rx).await;
+            let mut response = send(RequestOptions::new(
+                reqwest::Method::GET,
+                format!("http://{addr}/"),
+            ))
+            .await
+            .unwrap();
+            let mut text = String::new();
+            if let Some(chunk) = response.next_text().await.unwrap() {
+                text.push_str(&chunk);
+                let _ = hold_tx.send(());
+            }
+            while let Some(chunk) = response.next_text().await.unwrap() {
+                text.push_str(&chunk);
+            }
+            assert_eq!(text, expected);
         }
-        while let Some(chunk) = response.next_text().await.unwrap() {
-            text.push_str(&chunk);
-        }
-        assert_eq!(text, "hi 你!");
     }
 
-    /// A body that ends inside a multi-byte character yields the valid text plus exactly one
-    /// U+FFFD at end of stream.
+    /// Each shared client offers exactly its own ALPN protocols: reqwest uses the preconfigured
+    /// TLS configuration as-is, so the client builders set them.
     #[tokio::test]
-    async fn next_text_ends_a_torn_body_with_one_replacement_character() {
-        let (hold_tx, hold_rx) = tokio::sync::oneshot::channel();
-        let addr = serve_split_body(b"cut \xE4".to_vec(), b"\xBD".to_vec(), hold_rx).await;
-        let mut response = send(RequestOptions::new(
-            reqwest::Method::GET,
-            format!("http://{addr}/"),
-        ))
-        .await
-        .unwrap();
-        let mut text = String::new();
-        if let Some(chunk) = response.next_text().await.unwrap() {
-            text.push_str(&chunk);
-            let _ = hold_tx.send(());
+    async fn each_transport_offers_its_own_alpn_protocols() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut offered = Vec::new();
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let start = tokio_rustls::LazyConfigAcceptor::new(
+                    rustls::server::Acceptor::default(),
+                    socket,
+                )
+                .await
+                .unwrap();
+                let alpn = start
+                    .client_hello()
+                    .alpn()
+                    .map(|protocols| protocols.map(<[u8]>::to_vec).collect::<Vec<_>>());
+                offered.push(alpn);
+            }
+            offered
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        for transport in [Transport::Http1, Transport::H2Alpn] {
+            let mut request = RequestOptions::new(reqwest::Method::GET, url.clone());
+            request.transport = transport;
+            assert!(
+                tokio::time::timeout_at(deadline, send(request))
+                    .await
+                    .expect("request did not finish before the ALPN test deadline")
+                    .is_err(),
+                "the server never finishes the handshake"
+            );
         }
-        while let Some(chunk) = response.next_text().await.unwrap() {
-            text.push_str(&chunk);
-        }
-        assert_eq!(text, "cut \u{FFFD}");
+        assert_eq!(
+            tokio::time::timeout_at(deadline, server)
+                .await
+                .expect("server did not receive both ClientHellos before the ALPN test deadline")
+                .unwrap(),
+            vec![
+                Some(vec![b"http/1.1".to_vec()]),
+                Some(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+            ]
+        );
     }
 }

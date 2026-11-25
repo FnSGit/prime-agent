@@ -1,18 +1,31 @@
 //! The goal/max-depth runtime core: the durable `rlm_max_depth_state`
-//! writes, the goal-runtime mirror adopted onto each built session, and
-//! the `goal_update` emission family.
-use super::{json, AgentSessionEngine, CoreSessionEngine, EngineEvent, GoalRuntimeHandles, Value};
+//! writes, the pending-continuation guard, and the `goal_update` emission
+//! family.
+use super::{json, AgentSessionEngine, EngineEvent, Value};
+
+/// Which boundary outcome armed a goal wake: the no-progress backoff's
+/// retry window, or the fallback that bounds how long live background work
+/// can hold an owed continuation silently. One pending-wake slot
+/// serves both — the consult outcomes are mutually exclusive, and a
+/// successful mint retires whichever is armed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GoalWakeKind {
+    /// The no-progress backoff retry window.
+    Backoff,
+    /// The background-work skip window (hung work must not stall the goal
+    /// silently; the work's own completion notice is the normal wake).
+    BackgroundSkip,
+}
 
 impl AgentSessionEngine {
     /// Write the durable `rlm_max_depth_state` entry: straight into the
     /// built session's persistence handle, or parked for the build.
     pub(super) fn persist_max_depth_state(&self, max_depth: u64) {
-        let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
-        match handles {
+        match self.live_handles() {
             Some(handles) => {
                 let mut manager = self
                     .runtime
-                    .block_on(async { handles.session.lock().await });
+                    .block_on(async { handles.goal.session.lock().await });
                 if let Err(error) = manager.append_custom_entry(
                     "rlm_max_depth_state",
                     Some(json!({ "maxDepth": max_depth })),
@@ -61,78 +74,158 @@ impl AgentSessionEngine {
         }
     }
 
-    /// Arm the no-progress backoff's one-shot wake: a durable cron job at
-    /// `wake_at_ms` whose prompt is the wake marker. Without it the advertised
-    /// 10s/20s/40s retry would never run. Best effort: `None` outside a
-    /// daemon worker.
-    pub(crate) async fn schedule_goal_backoff_wake(&self, wake_at_ms: u64) -> Option<String> {
+    /// Arm the background-skip fallback wake one window out, once per
+    /// deferral: the deferred mint sites share the arming, and a later
+    /// boundary of the same deferral (a user prompt, a steering notice, the
+    /// fired wake's own marker turn) arms nothing. Work that is still
+    /// running after the one marker turn holds the goal until it ends; the
+    /// next deferral (after a mint, or after a goal transition retired the
+    /// wake) arms again. The check and the store write run under the goal
+    /// driver lock, which the mint and the goal's transitions hold: a
+    /// deferral a mint already consumed, or a goal that left the active
+    /// state, arms no stale wake.
+    pub(crate) async fn arm_background_skip_wake(&self) {
+        let Some(live) = self.live_handles() else {
+            return;
+        };
+        let job = {
+            let driver = live.goal.driver.lock().await;
+            // The work probe repeats under the lock: work that settled after
+            // the caller's probe already retried the continuation
+            // (and may have armed its backoff wake), so it arms nothing.
+            if !driver.owes_continuation()
+                || !driver.owns_continuation_wakeup()
+                || self.background_work_count() == 0
+                || self
+                    .background_skip_wake_armed
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            let job = self.create_goal_wake_job(
+                GoalWakeKind::BackgroundSkip,
+                crate::util::now_ms()
+                    + pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WINDOW_MS,
+            );
+            // Only a written job counts as armed: a failed write leaves the
+            // next boundary of this deferral free to arm again.
+            if job.is_some() {
+                self.background_skip_wake_armed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            job
+        };
+        if let Some(job) = job {
+            self.wake_goal_scheduler(job).await;
+        }
+    }
+
+    /// Arm a goal wake: a durable one-shot cron job at `wake_at_ms` whose
+    /// prompt is the kind's wake marker. The backoff kind serves the
+    /// no-progress retry (without it the advertised 10s/20s/40s window would
+    /// never run); the background-skip kind bounds how long live
+    /// background work can hold an owed continuation silently. Best
+    /// effort: `None` outside a daemon worker.
+    pub(crate) async fn schedule_goal_wake(
+        &self,
+        kind: GoalWakeKind,
+        wake_at_ms: u64,
+    ) -> Option<String> {
+        let job = self.create_goal_wake_job(kind, wake_at_ms)?;
+        let id = job.id.clone();
+        self.wake_goal_scheduler(job).await;
+        Some(id)
+    }
+
+    /// The store half of arming a goal wake: retire the prior wake, then
+    /// write the replacement job.
+    fn create_goal_wake_job(
+        &self,
+        kind: GoalWakeKind,
+        wake_at_ms: u64,
+    ) -> Option<pa_core::cron::AgentCronJob> {
         // Exactly one wake per window: the prior job retires before the
         // replacement arms — repeated boundaries must never stack marker
         // turns.
-        self.cancel_goal_backoff_wake();
+        self.cancel_goal_wake();
         let wiring = self.cron_wiring()?;
         let binding = self.kernel_cron_binding()?;
         let schedule_text = format!(
             "at {}",
             pa_core::session::manager::format_iso(wake_at_ms as i64)
         );
-        let job = wiring
+        let (source, label, marker) = match kind {
+            GoalWakeKind::Backoff => (
+                "goal_backoff_wake",
+                pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_CRON_LABEL,
+                pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_MARKER_TEXT,
+            ),
+            GoalWakeKind::BackgroundSkip => (
+                "goal_background_skip_wake",
+                pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WAKE_CRON_LABEL,
+                pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WAKE_MARKER_TEXT,
+            ),
+        };
+        wiring
             .store
             .create(&pa_core::cron::store::CreateAgentCronJobInput {
                 active_session_id: binding.active_session_id.clone(),
                 session_id: binding.session_id.clone(),
                 session_file: binding.session_file.clone(),
-                cwd: binding.cwd.clone(),
-                source: Some("goal_backoff_wake".to_string()),
-                label: Some(
-                    pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_CRON_LABEL.to_string(),
-                ),
-                prompt: pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_MARKER_TEXT
-                    .to_string(),
+                cwd: binding.cwd,
+                source: Some(source.to_string()),
+                label: Some(label.to_string()),
+                prompt: marker.to_string(),
                 schedule_text,
                 now: Some(crate::util::now_ms()),
                 ..Default::default()
             })
-            .ok()?;
-        // Re-arm the scheduler so the armed job gets a live timer
-        // (`drop_queued: false` keeps the queued-fire withdrawal a no-op).
+            .ok()
+    }
+
+    /// Re-arm the scheduler so an armed goal wake gets a live timer
+    /// (`drop_queued: false` keeps the queued-fire withdrawal a no-op).
+    async fn wake_goal_scheduler(&self, job: pa_core::cron::AgentCronJob) {
+        let Some(wiring) = self.cron_wiring() else {
+            return;
+        };
         if let Some(hook) = &wiring.mutation_hook {
             let mutation = pa_core::session_engine::host_requests::RlmHeartbeatMutation {
-                job: job.clone(),
+                job,
                 drop_queued: false,
             };
             hook(mutation).await;
         }
-        *self
-            .goal_backoff_wake_job_id
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(job.id.clone());
-        Some(job.id)
     }
 
-    /// Cancel the pending backoff wake: the successful mint and the goal's
-    /// terminal transitions retire the stale wake. A fired job stays
-    /// untouched.
-    pub(crate) fn cancel_goal_backoff_wake(&self) {
-        self.goal_backoff_wake_job_id
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+    /// Cancel the pending goal wake: the successful mint and the goal's
+    /// terminal transitions retire the stale wake (either kind — the
+    /// no-progress backoff or the background-skip fallback). A fired job
+    /// stays untouched. Retiring the wake ends the deferral's one
+    /// background-skip arming, so the next deferral arms again.
+    pub(crate) fn cancel_goal_wake(&self) {
+        self.background_skip_wake_armed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         let Some(wiring) = self.cron_wiring() else {
             return;
         };
-        // The cancel is DURABLE-JOB-RECOVERING: a worker rebuild loses the
-        // in-memory slot, so the store itself is scanned for the session's
-        // still-Active goal-backoff-wake jobs (a fired job stays untouched);
-        // the scan needs the session binding, else it would match EVERY
+        // The cron store is the only record of the wake, so the cancel
+        // scans it for the session's still-Active wake jobs of both labels
+        // (a rebuilt worker finds the wakes its predecessor armed); the
+        // scan needs the session binding, else it would match EVERY
         // session's jobs.
         let Some(binding) = self.kernel_cron_binding() else {
             return;
         };
         for job in wiring.store.list() {
             if job.status != pa_core::cron::JobStatus::Active
-                || job.label.as_deref()
-                    != Some(pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_CRON_LABEL)
+                || !matches!(
+                    job.label.as_deref(),
+                    Some(
+                        pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_CRON_LABEL
+                            | pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WAKE_CRON_LABEL,
+                    )
+                )
                 || job.session_id != binding.session_id
             {
                 continue;
@@ -143,32 +236,13 @@ impl AgentSessionEngine {
         }
     }
 
-    /// Mirror the built session's goal handles: the core session's mutex
-    /// stays held across a turn's admission, so goal checks in emit callbacks
-    /// read the mirror.
-    pub(super) async fn mirror_goal_runtime(&self, core: &CoreSessionEngine) {
-        let pending = core.goal_driver.lock().await.pending_continuation_handle();
-        *self
-            .pending_goal_continuation
-            .lock()
-            .expect("pending goal continuation lock") = Some(pending);
-        *self.goal_runtime.lock().expect("goal runtime lock") = Some(GoalRuntimeHandles {
-            driver: core.goal_driver.clone(),
-            session: core.session.shared_persistence(),
-        });
-    }
-
     /// The current goal state for a wire emission, when the driver is free
     /// to read (the next emitted event re-checks). The served state reads the
     /// creation-based age fresh from `created_at` (no anchor, no
     /// compounding).
     pub(super) fn current_goal_state(&self) -> Option<pa_core::goals::GoalState> {
-        let handles = self
-            .goal_runtime
-            .lock()
-            .expect("goal runtime lock")
-            .clone()?;
-        let driver = handles.driver.try_lock().ok()?;
+        let handles = self.live_handles()?;
+        let driver = handles.goal.driver.try_lock().ok()?;
         Some(driver.state_with_creation_elapsed())
     }
 
@@ -176,18 +250,11 @@ impl AgentSessionEngine {
     /// admitted (or withdrew) the minted goal continuation, so the next
     /// boundary may mint again (the pending-never-re-arms contract).
     /// Lock-free: the callers cannot take the async driver lock.
-    ///
-    /// # Panics
-    ///
-    /// Panics when the pending-handle mirror's mutex is poisoned.
     pub(crate) fn clear_pending_goal_continuation(&self) {
-        let handle = self
-            .pending_goal_continuation
-            .lock()
-            .expect("pending goal continuation lock")
-            .clone();
-        if let Some(pending) = handle {
-            pending.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handles) = self.built_handles() {
+            handles
+                .pending_goal_continuation
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -224,22 +291,35 @@ impl AgentSessionEngine {
     pub(crate) fn goal_pending_handle(
         &self,
     ) -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
-        self.pending_goal_continuation
-            .lock()
-            .expect("pending goal continuation lock")
-            .clone()
+        self.built_handles()
+            .map(|handles| std::sync::Arc::clone(&handles.pending_goal_continuation))
     }
 
     /// Emit the `goal_update` event when the session's goal state changed
     /// since the last emission (per-session dedupe). A session without a
-    /// goal seeds the baseline silently.
-    pub(crate) fn goal_update_if_changed(&self, emit: &mut dyn FnMut(EngineEvent) -> bool) -> bool {
-        let Some(goal) = self.current_goal_state() else {
-            // No session yet, or the driver is mid-mutation: a later event re-checks.
+    /// goal seeds the baseline silently. `wait_for_driver` waits out a
+    /// driver-lock holder instead of skipping the check.
+    pub(crate) fn goal_update_if_changed(
+        &self,
+        emit: &mut dyn FnMut(EngineEvent) -> bool,
+        wait_for_driver: bool,
+    ) -> bool {
+        let Some(handles) = self.live_handles() else {
             return true;
         };
+        let goal = if wait_for_driver {
+            self.runtime
+                .block_on(handles.goal.driver.lock())
+                .state_with_creation_elapsed()
+        } else {
+            // The driver is mid-mutation: a later event re-checks.
+            let Ok(driver) = handles.goal.driver.try_lock() else {
+                return true;
+            };
+            driver.state_with_creation_elapsed()
+        };
         {
-            let mut published = self.published_goal.lock().expect("published goal lock");
+            let mut published = handles.published_goal.lock().expect("published goal lock");
             // The dedupe is age-invariant (the age ticks with the wall clock).
             if published.as_ref().is_some_and(|last| {
                 pa_core::goals::goal_update_dedupe_projection(last)
@@ -260,7 +340,7 @@ impl AgentSessionEngine {
             // REPLACEMENT goal retires it too — the old goal's wake would
             // fire its marker into the new goal.
             if goal.status != pa_core::goals::GoalStatus::Active || replaced {
-                self.cancel_goal_backoff_wake();
+                self.cancel_goal_wake();
             }
         }
         emit(EngineEvent::GoalUpdate {
@@ -277,10 +357,15 @@ impl AgentSessionEngine {
         emit: &'a mut dyn FnMut(EngineEvent) -> bool,
     ) -> impl FnMut(EngineEvent) -> bool + 'a {
         move |event: EngineEvent| {
+            // The run's last event: no later event re-checks, so the check
+            // waits out a driver-lock holder. Safe here: the terminal events
+            // emit from the turn's synchronous frame, which holds no goal or
+            // session guard; mid-turn events can emit inside async contexts.
+            let terminal = matches!(event, EngineEvent::Done(_) | EngineEvent::DoneAborted);
             if !emit(event) {
                 return false;
             }
-            self.goal_update_if_changed(emit)
+            self.goal_update_if_changed(emit, terminal)
         }
     }
 }

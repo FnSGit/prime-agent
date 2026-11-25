@@ -15,12 +15,15 @@ use crate::{Line, Span};
 
 mod render;
 
-#[cfg(test)]
-use render::format_duration;
+pub(crate) use render::format_duration;
 use render::{
     action_row, clean_line, error_line, hint_line, marker_line, metadata_row, pane_header_lines,
     Columns,
 };
+
+// A tail response may outlive its entire pane, so tokens belong to the process,
+// not one BashView instance. Relaxed ordering only allocates distinct tokens.
+static NEXT_DETAIL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 const PREFERRED_VISIBLE: usize = 8;
 
@@ -47,6 +50,8 @@ pub struct BashActivity {
     pub status: String,
     pub exit_code: Option<i64>,
     pub duration_ms: Option<u64>,
+    /// A persistent shell outlives its session's kernel (absent on the wire: false).
+    pub persistent: bool,
 }
 
 impl BashActivity {
@@ -92,11 +97,71 @@ pub fn parse_bash_activities(data: &Value) -> Vec<BashActivity> {
                     .map_or_else(|| "unknown".to_string(), crate::menu_panel::scrub_controls),
                 exit_code: row.get("exitCode").and_then(Value::as_i64),
                 duration_ms: row.get("durationMs").and_then(Value::as_u64),
+                persistent: row.get("persistent").and_then(Value::as_bool) == Some(true),
             })
         })
         .collect();
     activities.sort_by_key(|activity| !activity.running());
     activities
+}
+
+/// The command's cell budget inside one activity-dock shell item.
+const DOCK_COMMAND_CELLS: usize = 32;
+
+/// The activity dock's shells row: the running shells only, one item each.
+pub(crate) fn dock_shell_items(activities: &[BashActivity]) -> Vec<String> {
+    activities
+        .iter()
+        .filter(|activity| activity.running())
+        .map(dock_shell_item)
+        .collect()
+}
+
+/// One running shell in the activity dock: `<command, truncated> · <elapsed>`.
+fn dock_shell_item(activity: &BashActivity) -> String {
+    let command = crate::heartbeats_picker::single_line(&activity.command);
+    format!(
+        "{} · {}",
+        crate::width::truncate_to_width(&command, DOCK_COMMAND_CELLS, "\u{2026}"),
+        format_duration(activity.duration_ms)
+    )
+}
+
+/// Whether a registry update moved a row (its id, status or exit code): the running rows'
+/// duration ticks alone never count.
+pub(crate) fn registry_rows_moved(old: &Value, new: &Value) -> bool {
+    let signature = |data: &Value| -> Vec<(String, String, Option<i64>)> {
+        parse_bash_activities(data)
+            .into_iter()
+            .map(|row| (row.id, row.status, row.exit_code))
+            .collect()
+    };
+    signature(old) != signature(new)
+}
+
+/// The running shells and the persistent ones among them: finished shells stay in the bash view
+/// only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShellCounts {
+    pub running: usize,
+    pub persistent: usize,
+}
+
+impl ShellCounts {
+    #[must_use]
+    pub fn of(activities: &[BashActivity]) -> Self {
+        let running = activities.iter().filter(|activity| activity.running());
+        Self {
+            running: running.clone().count(),
+            persistent: running.filter(|activity| activity.persistent).count(),
+        }
+    }
+}
+
+/// The shell counts of a `list_kernel_bash` reply (or a bare row array).
+#[must_use]
+pub fn running_shell_counts(data: &Value) -> ShellCounts {
+    ShellCounts::of(&parse_bash_activities(data))
 }
 
 /// The pane's interactive mode: the columned list, or a row's detail
@@ -135,8 +200,8 @@ pub enum BashViewAction {
 pub struct BashView {
     /// The latest registry snapshot (kept current by the host's refresh).
     activities: Vec<BashActivity>,
-    /// Each open increments it; the host stamps tail requests with the open's
-    /// generation, so a late response never overwrites the newer open's output.
+    /// A process-unique token for this open; tail requests retain it even when
+    /// the host replaces the entire view before their responses arrive.
     detail_generation: u64,
     selected_id: Option<String>,
     mode: Mode,
@@ -166,6 +231,7 @@ pub struct BashView {
     /// keeps the registry-refresh lifecycle, [`BashView::clear_error`]).
     fetch_error: bool,
     viewport_rows: usize,
+    subtitle: Option<String>,
 }
 
 impl BashView {
@@ -186,9 +252,28 @@ impl BashView {
             error: None,
             fetch_error: false,
             viewport_rows,
+            subtitle: None,
         };
         view.selected_id = view.activities.first().map(|row| row.id.clone());
         view
+    }
+
+    /// The rows the view lays out in: a host whose frame resizes sets it before each render.
+    pub fn set_viewport_rows(&mut self, rows: usize) {
+        self.viewport_rows = rows;
+    }
+
+    /// The list's muted line under its title.
+    #[must_use]
+    pub fn with_subtitle(mut self, subtitle: &str) -> Self {
+        self.subtitle = Some(subtitle.to_string());
+        self
+    }
+
+    /// Select row `id` in the list; an empty registry keeps the selection for the rows that land
+    /// later.
+    pub fn select(&mut self, id: &str) {
+        self.selected_id = Some(id.to_string());
     }
 
     /// Reset the open detail's fetched-output state (new open, back, or
@@ -203,20 +288,25 @@ impl BashView {
     }
 
     /// A landed registry refresh: replace the rows, keep the selection on
-    /// the surviving id, and drop a detail pane whose row vanished.
+    /// the surviving id (an empty registry keeps it), and drop a detail pane whose row vanished.
     pub fn apply_activities(&mut self, activities: Vec<BashActivity>) {
         self.activities = activities;
         let selected = self.selected_id.clone();
         let exists = selected
             .as_deref()
             .is_some_and(|id| self.activities.iter().any(|row| row.id == id));
-        if !exists {
-            self.selected_id = self.activities.first().map(|row| row.id.clone());
+        if let Some(first) = self.activities.first().filter(|_| !exists) {
+            self.selected_id = Some(first.id.clone());
         }
         if let Mode::Detail { id } = self.mode.clone() {
             if !self.activities.iter().any(|row| row.id == id) {
                 self.mode = Mode::List;
                 self.reset_detail_output();
+                // The dropped detail's fetch error goes with it; a kill error keeps its lifecycle.
+                if self.fetch_error {
+                    self.error = None;
+                    self.fetch_error = false;
+                }
             }
         }
         self.output_tail = self
@@ -291,11 +381,13 @@ impl BashView {
         self.fetch_error = fetch;
     }
 
-    /// A landed registry update supersedes a shown error; the host calls
-    /// this only when the registry itself changed.
+    /// A changed registry supersedes a kill error. A fetch error keeps its
+    /// retry state until output lands; metadata alone cannot satisfy a fetch.
     pub fn clear_error(&mut self) {
-        self.error = None;
-        self.fetch_error = false;
+        if !self.fetch_error || matches!(self.mode, Mode::List) {
+            self.error = None;
+            self.fetch_error = false;
+        }
     }
 
     /// The selected row's index (first when unset).
@@ -345,7 +437,9 @@ impl BashView {
             };
             return self.move_selection(delta);
         }
-        if kb.matches(key, "tui.select.confirm") {
+        if kb.matches(key, "tui.select.confirm")
+            || (self.mode == Mode::List && kb.matches(key, "app.modal.open"))
+        {
             return self.confirm_selection();
         }
         BashViewAction::None
@@ -370,7 +464,7 @@ impl BashView {
 
     /// Scroll the detail's output region: up lifts the window off the newest lines,
     /// down lowers it back; at the loaded top, load more or stop.
-    fn scroll_output(&mut self, delta: isize) -> BashViewAction {
+    pub(crate) fn scroll_output(&mut self, delta: isize) -> BashViewAction {
         let Mode::Detail { id } = self.mode.clone() else {
             return BashViewAction::None;
         };
@@ -436,7 +530,8 @@ impl BashView {
                 };
                 if self.find_activity(&id).is_some() {
                     self.mode = Mode::Detail { id: id.clone() };
-                    self.detail_generation = self.detail_generation.wrapping_add(1);
+                    self.detail_generation =
+                        NEXT_DETAIL_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.reset_detail_output();
                     return BashViewAction::OpenDetail {
                         id,
@@ -461,7 +556,9 @@ impl BashView {
     }
 
     fn visible_items(&self) -> usize {
-        let reserved = LIST_FRAME_ROWS + if self.error.is_some() { 2 } else { 0 };
+        let reserved = LIST_FRAME_ROWS
+            + usize::from(self.subtitle.is_some())
+            + if self.error.is_some() { 2 } else { 0 };
         // The shared layout floors at one row so a picker never reads empty; this view
         // never renders past its viewport, so a frame too short for any row renders none.
         if self.viewport_rows <= reserved {
@@ -492,7 +589,7 @@ impl BashView {
             .filter(|activity| activity.running())
             .count();
         let counts = vec![(ThemeColor::Success, format!("{running} running"))];
-        let mut lines = pane_header_lines(theme, width, "Bash", &counts, None);
+        let mut lines = pane_header_lines(theme, width, "Bash", &counts, self.subtitle.as_deref());
         if self.activities.is_empty() {
             lines.push(vec![
                 Span::raw("  "),
@@ -668,26 +765,27 @@ impl BashView {
         self.detail_region_rows.set(rendered);
         lines
     }
-    /// The list's bottom hint: an override that empties the back binding drops
-    /// its key (the hint never advertises a key the handler does not take).
+    /// The list's bottom hint: an override that empties the open or back
+    /// binding drops its key (the hint never advertises a key the handler
+    /// does not take).
     fn list_hint(kb: &KeybindingsManager) -> String {
         let key = |binding: &str, fallback: &str| {
             kb.first_key(binding)
                 .map_or_else(|| fallback.to_string(), |key| format_key_text(&key))
         };
-        let close = match kb.first_key("app.modal.back") {
-            Some(back) => format!(
-                "{}/{}",
-                format_key_text(&back),
-                key("tui.select.cancel", "Esc")
-            ),
+        let bound = |binding: &str| kb.first_key(binding).map(|key| format_key_text(&key));
+        let open = match bound("app.modal.open") {
+            Some(open) => format!("{}/{open}", key("tui.select.confirm", "Enter")),
+            None => key("tui.select.confirm", "Enter"),
+        };
+        let close = match bound("app.modal.back") {
+            Some(back) => format!("{back}/{}", key("tui.select.cancel", "Esc")),
             None => key("tui.select.cancel", "Esc"),
         };
         format!(
-            "{}/{} move \u{b7} {} open \u{b7} {close} close",
+            "{}/{} move \u{b7} {open} open \u{b7} {close} close",
             key("tui.select.up", "\u{2191}"),
             key("tui.select.down", "\u{2193}"),
-            key("tui.select.confirm", "Enter"),
         )
     }
 

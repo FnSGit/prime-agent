@@ -58,7 +58,7 @@ pub struct SupervisorLinkConfig {
 pub(crate) type AutonomousAdmission = std::sync::Arc<dyn Fn(String) + Send + Sync>;
 
 /// The goal driver and session-manager handles mirrored from the core
-/// session (see `AgentSessionEngine::goal_runtime`).
+/// session (see `core_state::BuiltHandles`).
 #[derive(Clone)]
 pub(crate) struct GoalRuntimeHandles {
     pub(crate) driver:
@@ -78,6 +78,15 @@ pub(super) struct RestoredSessionModel {
     pub(super) fallback_message: Option<String>,
 }
 
+/// The flagged selection's latest resolution warning and the last one a turn
+/// emitted as a row: a row goes out only for a warning other than the last
+/// emitted one, never per resolve call.
+#[derive(Default)]
+pub(super) struct ModelResolutionWarning {
+    pub(super) latest: Option<String>,
+    pub(super) shown: Option<String>,
+}
+
 /// A create command's session flags, under the TS `AgentSessionRuntimeConfig` names.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -95,9 +104,10 @@ pub(crate) struct CreateSessionResources {
 /// The create command's `--models` scope inputs: the startup chain picks
 /// the first scoped model (or the saved default when in scope) for a
 /// fresh session; a continuing session keeps its own model.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct StartupScope {
     pub(super) scoped_models: Vec<pa_core::models::ScopedModel>,
+    pub(super) patterns: Vec<String>,
     pub(super) is_continuing: bool,
 }
 
@@ -112,11 +122,9 @@ impl pa_core::session_engine::rlm_usage::RlmChildUsageSink for ProducerUsageSink
     fn record(
         &self,
         report: pa_core::session_engine::rlm_usage::RlmChildUsageReport,
-    ) -> std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    ) -> std::pin::Pin<std::boxed::Box<dyn std::future::Future<Output = bool> + Send + '_>> {
         let producer = std::sync::Arc::clone(&self.0);
-        Box::pin(async move {
-            producer.record_child_usage(report).await;
-        })
+        Box::pin(async move { producer.record_child_usage(report).await })
     }
 
     fn forget(

@@ -3,9 +3,6 @@ use super::*;
 
 #[test]
 fn recovery_rebuild_rehydrates_the_goal_from_the_session_file() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::TempDir::new().unwrap();
     let agent_dir = dir.path().join("agent");
     std::fs::create_dir_all(&agent_dir).unwrap();
@@ -48,6 +45,9 @@ fn recovery_rebuild_rehydrates_the_goal_from_the_session_file() {
         })
         .unwrap(),
     );
+    // The worker registers the engine's own arc: the live-auth resolver
+    // upgrades it per provider call.
+    engine.register_arc();
     // The turn-end seam: the engine has no worker, so a collector
     // stands in for the queue-lane admission sink.
     let goal_work = goal_admission_collector(&engine);
@@ -91,6 +91,78 @@ fn recovery_rebuild_rehydrates_the_goal_from_the_session_file() {
     assert_eq!(
         minted.goal_update.expect("mint moved the state")["continuationsUsed"],
         4
+    );
+}
+
+/// The `/goal` objective start keeps the prompt's attached images on the
+/// injected context row (TS `createGoalContextMessage`: text first, images
+/// after) — the row is the turn's only image carrier, session commands
+/// never admit a user row.
+#[test]
+fn goal_start_keeps_the_prompt_images_on_the_context_row() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = std::sync::Arc::new(
+        AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: None,
+            faux_script: Some(r#"{"responses": [{"text": "goal reply"}]}"#.to_string()),
+            supervisor_link: None,
+            telemetry_disabled: None,
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap(),
+    );
+    // The worker registers the engine's own arc: the live-auth resolver
+    // upgrades it per provider call.
+    engine.register_arc();
+    let mut events: Vec<EngineEvent> = Vec::new();
+    engine.run_prompt(
+        0,
+        PromptRequest {
+            batch: Vec::new(),
+            images: vec![pa_agent::types::ImageContent {
+                data: "aGVsbG8gZ29hbA==".to_string(),
+                mime_type: "image/png".to_string(),
+            }],
+            message: "/goal describe the attachment".to_string(),
+            source: "user".to_string(),
+            agent_message_id: None,
+            custom_message: None,
+        },
+        &|| false,
+        &mut |event| {
+            events.push(event);
+            true
+        },
+    );
+    let context = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::CustomMessage(value) if value["customType"] == "goal_context" => {
+                Some(value.clone())
+            }
+            _ => None,
+        })
+        .expect("the goal start emitted its context row");
+    let blocks = context["content"]
+        .as_array()
+        .expect("the context row carries the attached image as content blocks");
+    assert_eq!(blocks[0]["type"], "text");
+    let text = blocks[0]["text"].as_str().expect("text block content");
+    assert!(
+        text.contains("[goal: continuation]") && text.contains("describe the attachment"),
+        "the continuation prompt names the objective: {text}"
+    );
+    assert_eq!(
+        blocks[1],
+        json!({ "type": "image", "data": "aGVsbG8gZ29hbA==", "mimeType": "image/png" })
     );
 }
 
@@ -139,9 +211,6 @@ fn wire_assistant_message(text: String) -> Value {
 /// post-recovery compact runs over it — never a skip on the empty branch.
 #[test]
 fn recovered_engine_compaction_walk_sees_the_durable_history() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::TempDir::new().unwrap();
     write_compaction_settings(dir.path(), 1);
     // The durable store a killed worker leaves behind: a long
@@ -174,6 +243,10 @@ fn recovered_engine_compaction_walk_sees_the_durable_history() {
         queued_steering_probe: None,
     })
     .unwrap();
+    let engine = std::sync::Arc::new(engine);
+    // The worker registers the engine's own arc: the live-auth resolver
+    // upgrades it per provider call.
+    engine.register_arc();
     let mut events: Vec<EngineEvent> = Vec::new();
     admit(
         &engine,
@@ -214,9 +287,6 @@ fn recovered_engine_compaction_walk_sees_the_durable_history() {
 
 #[test]
 fn post_compaction_goal_continuation_mint() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (engine, _engine_dir) = faux_engine_with_settings(
         &serde_json::json!({ "responses": [{"text": "goal turn reply"}] }),
         1,
@@ -271,22 +341,17 @@ fn post_compaction_goal_continuation_mint() {
     // Admission releases the pending guard: the item's OWN handle,
     // never the mutable mirror.
     AgentSessionEngine::release_goal_continuation_handle(minted.pending_handle.as_ref());
-    // TS #2465: a live background bash handle holds the post-compaction
-    // mint the same way: the mint defers (owed, not consumed) until the
-    // handle settles.
-    let live_probe: std::sync::Arc<dyn Fn() -> bool + Send + Sync> = std::sync::Arc::new(|| true);
-    *engine.background_bash_probe.lock().unwrap() = Some(live_probe);
+    // TS #2465: live background kernel work holds the post-compaction
+    // mint the same way: the mint defers (owed, not consumed) until it
+    // settles.
+    let live_probe: std::sync::Arc<dyn Fn() -> usize + Send + Sync> = std::sync::Arc::new(|| 1);
+    engine.set_test_probes(Some(live_probe), None);
     assert!(
         engine.mint_post_compaction_goal_continuation().is_none(),
         "a live handle minted the post-compaction continuation"
     );
     {
-        let handles = engine
-            .goal_runtime
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("goal runtime");
+        let handles = engine.live_handles().expect("goal runtime").goal.clone();
         assert!(
             engine
                 .runtime
@@ -294,9 +359,8 @@ fn post_compaction_goal_continuation_mint() {
             "the deferred mint must be owed"
         );
     }
-    let settled_probe: std::sync::Arc<dyn Fn() -> bool + Send + Sync> =
-        std::sync::Arc::new(|| false);
-    *engine.background_bash_probe.lock().unwrap() = Some(settled_probe);
+    let settled_probe: std::sync::Arc<dyn Fn() -> usize + Send + Sync> = std::sync::Arc::new(|| 0);
+    engine.set_test_probes(Some(settled_probe), None);
     assert!(
         engine.mint_post_compaction_goal_continuation().is_some(),
         "the settled handle releases the post-compaction mint"
@@ -317,9 +381,6 @@ fn post_compaction_goal_continuation_mint() {
 /// armed flag behind and the settle sites deliver a second one.
 #[test]
 fn post_compaction_mint_delivers_the_armed_deferral_once() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (engine, _engine_dir) = faux_engine_with_settings(
         &serde_json::json!({ "responses": [{"text": "goal turn reply"}] }),
         1,
@@ -334,12 +395,7 @@ fn post_compaction_mint_delivers_the_armed_deferral_once() {
     );
     assert_eq!(engine.goal_state_value()["status"], "active");
     assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
-    let handles = engine
-        .goal_runtime
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("goal runtime");
+    let handles = engine.live_handles().expect("goal runtime").goal.clone();
     engine
         .runtime
         .block_on(async { handles.driver.lock().await.mark_continuation_owed() });
@@ -394,9 +450,6 @@ pub(crate) fn admit_request(
 
 #[test]
 fn goal_turn_end_mints_the_loop_until_the_goal_completes() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::TempDir::new().unwrap();
     let engine = std::sync::Arc::new(
         AgentSessionEngine::new(AgentEngineConfig {
@@ -424,6 +477,9 @@ fn goal_turn_end_mints_the_loop_until_the_goal_completes() {
         })
         .unwrap(),
     );
+    // The worker registers the engine's own arc: the live-auth resolver
+    // upgrades it per provider call.
+    engine.register_arc();
     let goal_work = goal_admission_collector(&engine);
     let mut events: Vec<EngineEvent> = Vec::new();
     admit(&engine, "/goal ship the goal loop".to_string(), &mut events);
@@ -474,12 +530,7 @@ fn goal_turn_end_mints_the_loop_until_the_goal_completes() {
             serde_json::json!(expected_count)
         );
     }
-    let handles = engine
-        .goal_runtime
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("goal runtime");
+    let handles = engine.live_handles().expect("goal runtime").goal.clone();
     engine.runtime.block_on(async {
         let mut driver = handles.driver.lock().await;
         let mut session = handles.session.lock().await;
@@ -498,9 +549,6 @@ fn goal_turn_end_mints_the_loop_until_the_goal_completes() {
 
 #[test]
 fn paused_goal_mints_no_turn_end_continuation() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (engine, _engine_dir) = faux_engine_with_settings(
         &serde_json::json!({ "responses": [
             {"text": "start turn reply"},
@@ -539,9 +587,6 @@ fn paused_goal_mints_no_turn_end_continuation() {
 
 #[test]
 fn budget_exhausted_stops_with_the_ts_budget_steer() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (engine, _engine_dir) = faux_engine_with_settings(
         &serde_json::json!({ "responses": [{"text": "crossing turn reply"}] }),
         1,
@@ -599,9 +644,6 @@ fn budget_exhausted_stops_with_the_ts_budget_steer() {
 
 #[test]
 fn queued_input_defers_the_turn_end_mint() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (engine, _engine_dir) = faux_engine_with_settings(
         &serde_json::json!({ "responses": [{"text": "first"}, {"text": "second"}] }),
         1,
@@ -644,9 +686,6 @@ fn queued_input_defers_the_turn_end_mint() {
 
 #[test]
 fn running_children_owe_the_continuation_and_settle_delivers_it() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::TempDir::new().unwrap();
     let engine = std::sync::Arc::new(
         AgentSessionEngine::new(AgentEngineConfig {
@@ -672,6 +711,9 @@ fn running_children_owe_the_continuation_and_settle_delivers_it() {
         })
         .unwrap(),
     );
+    // The worker registers the engine's own arc: the live-auth resolver
+    // upgrades it per provider call.
+    engine.register_arc();
     let goal_work = goal_admission_collector(&engine);
     let children = engine.children.clone().expect("children registry");
     // A running child (the test seam): the quiescence gate holds.
@@ -695,18 +737,18 @@ fn running_children_owe_the_continuation_and_settle_delivers_it() {
     assert_eq!(events.last(), Some(&EngineEvent::Done(Ok(()))));
     assert_eq!(engine.goal_state_value()["status"], "active");
     assert_eq!(engine.goal_state_value()["continuationsUsed"], 0);
-    let handles = engine
-        .goal_runtime
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("goal runtime");
+    let handles = engine.live_handles().expect("goal runtime").goal.clone();
     assert!(engine
         .runtime
         .block_on(async { handles.driver.lock().await.owes_continuation() }));
+    // Settle the child through the settle funnel: a user cancel only settles
+    // a child whose abort is confirmed, and this synthetic child has no live
+    // supervisor, so the cancel could never confirm (PR #3680 review; the
+    // seam change that fires the funnel lives in #3715). The continuation is
+    // owed until the child SETTLES, which is what this drives.
     engine
         .runtime
-        .block_on(async { children.cancel_child_run("child-1").await });
+        .block_on(async { children.settle_test_child("child-session").await });
     for _ in 0..200 {
         if !goal_work.lock().unwrap().is_empty() {
             break;
@@ -733,6 +775,274 @@ fn running_children_owe_the_continuation_and_settle_delivers_it() {
     assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
 }
 
+/// T-0012: a live background `bash()` handle defers the goal continuation
+/// (owed, not consumed) and arms the fallback wake - a durable one-shot
+/// cron one skip-window out - once per deferral: a shell that never
+/// completes gets exactly one marker turn. The shell's settle path (the
+/// `[bash-done]` sibling) delivers the owed continuation and retires the
+/// armed wake.
+#[test]
+fn background_shell_owes_the_continuation_and_arms_the_fallback_wake() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::TempDir::new().unwrap();
+    let session_file = dir.path().join("session.jsonl");
+    std::fs::write(
+        &session_file,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session",
+                "version": 3,
+                "id": "bg-skip-session",
+                "timestamp": "2026-01-01T00:00:00.000Z",
+                "cwd": dir.path().display().to_string(),
+            })
+        ),
+    )
+    .unwrap();
+    let store =
+        std::sync::Arc::new(pa_core::cron::store::AgentCronJobStore::for_session_artifacts());
+    store.register_session_artifact("bg-skip-session", &dir.path().join("artifacts"));
+    let cron_store = pa_core::session_engine::runtime_wiring::KernelCronWiring {
+        store: std::sync::Arc::clone(&store),
+        binding: None,
+        mutation_hook: None,
+    };
+    let engine = std::sync::Arc::new(
+        AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: Some(session_file),
+            faux_script: Some(
+                serde_json::json!({
+                    "responses": [
+                        {"text": "warm ok"},
+                        {"text": "goal turn reply"},
+                        {"text": "user turn reply"},
+                        {"text": "marker turn reply"},
+                    ]
+                })
+                .to_string(),
+            ),
+            supervisor_link: Some(crate::agent_engine::SupervisorLinkConfig {
+                socket_path: dir.path().join("supervisor.sock"),
+                active_session_id: "active-bg-skip".to_string(),
+                worker_token: "token".to_string(),
+            }),
+            telemetry_disabled: None,
+            cron_store: Some(cron_store),
+            queued_steering_probe: None,
+        })
+        .unwrap(),
+    );
+    // The worker registers the engine's own arc: the live-auth resolver
+    // upgrades it per provider call.
+    engine.register_arc();
+    let goal_work = goal_admission_collector(&engine);
+    // The first prompt builds the session (the build installs the real
+    // provisioner probe); the live-handle probe is meaningful from here on.
+    let mut events: Vec<EngineEvent> = Vec::new();
+    admit(&engine, "warm".to_string(), &mut events);
+    engine.set_test_probes(Some(std::sync::Arc::new(|| 1)), None);
+    // The goal start behind a live handle: its natural end holds the
+    // continuation (owed, not consumed) and arms the fallback wake.
+    admit(
+        &engine,
+        "/goal ship behind the shell".to_string(),
+        &mut events,
+    );
+    {
+        let work = goal_work.lock().unwrap();
+        assert!(
+            work.is_empty(),
+            "work minted behind a live handle: {work:?}"
+        );
+    }
+    assert_eq!(engine.goal_state_value()["status"], "active");
+    assert_eq!(engine.goal_state_value()["continuationsUsed"], 0);
+    // THE FALLBACK WAKE: exactly one Active background-skip job, armed for
+    // this session with the honest marker prompt and a fire time.
+    let wakes: Vec<pa_core::cron::AgentCronJob> = store
+        .list()
+        .into_iter()
+        .filter(|job| {
+            job.label.as_deref()
+                == Some(pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WAKE_CRON_LABEL)
+        })
+        .collect();
+    let [wake] = wakes.as_slice() else {
+        panic!("expected exactly one background-skip wake: {wakes:?}");
+    };
+    assert_eq!(wake.status, pa_core::cron::JobStatus::Active);
+    assert_eq!(wake.session_id, "bg-skip-session");
+    assert_eq!(wake.active_session_id, "active-bg-skip");
+    assert_eq!(
+        wake.prompt,
+        pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WAKE_MARKER_TEXT
+    );
+    let armed_before_ms = crate::util::now_ms();
+    let fire_at_ms = pa_core::cron::parse_iso_millis(
+        wake.next_run_at
+            .as_deref()
+            .expect("the wake carries a fire time"),
+    )
+    .expect("the fire time parses");
+    let window = pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WINDOW_MS;
+    assert!(
+        fire_at_ms >= armed_before_ms.saturating_sub(60_000) + window
+            && fire_at_ms <= armed_before_ms + window + 60_000,
+        "the wake fires one skip window out: {fire_at_ms} vs {armed_before_ms}+{window}"
+    );
+    let first_wake_id = wake.id.clone();
+    // The settle consult (the [bash-done] sibling) while the handle is
+    // STILL live: the deferral stays owed and the armed wake stays put.
+    engine
+        .runtime
+        .block_on(async { engine.goal_children_settled().await });
+    {
+        let handles = engine.live_handles().expect("goal runtime").goal.clone();
+        assert!(
+            engine
+                .runtime
+                .block_on(async { handles.driver.lock().await.owes_continuation() }),
+            "a live handle must keep the deferral owed"
+        );
+    }
+    assert!(
+        goal_work.lock().unwrap().is_empty(),
+        "the settle consult delivered behind a live handle"
+    );
+    assert!(
+        store.list().into_iter().any(|job| {
+            job.label.as_deref()
+                == Some(pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WAKE_CRON_LABEL)
+                && job.status == pa_core::cron::JobStatus::Active
+        }),
+        "the still-live handle must keep the fallback wake armed"
+    );
+    // A turn inside the window leaves the waiting wake in place: its end
+    // re-defers behind the live handle, but the bound must not move out.
+    let mut user_events: Vec<EngineEvent> = Vec::new();
+    admit(&engine, "a user turn".to_string(), &mut user_events);
+    let waiting: Vec<_> = store
+        .list()
+        .into_iter()
+        .filter(|job| {
+            job.label.as_deref()
+                == Some(pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WAKE_CRON_LABEL)
+                && job.status == pa_core::cron::JobStatus::Active
+        })
+        .collect();
+    let [still_waiting] = waiting.as_slice() else {
+        panic!("a turn inside the window must keep exactly one wake: {waiting:?}");
+    };
+    assert_eq!(
+        (
+            still_waiting.id.as_str(),
+            still_waiting.next_run_at.as_deref()
+        ),
+        (first_wake_id.as_str(), wake.next_run_at.as_deref()),
+        "a turn inside the window must not push the wake out"
+    );
+    let active_wakes = || -> Vec<pa_core::cron::AgentCronJob> {
+        store
+            .list()
+            .into_iter()
+            .filter(|job| {
+                job.label.as_deref()
+                    == Some(
+                        pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WAKE_CRON_LABEL,
+                    )
+                    && job.status == pa_core::cron::JobStatus::Active
+            })
+            .collect()
+    };
+    let complete_dispatch = |dispatch: &pa_core::cron::store::AgentCronDispatch| {
+        store
+            .record_dispatch_result(
+                &dispatch.id,
+                &pa_core::cron::store::DispatchResultOptions {
+                    now: Some(crate::util::now_ms()),
+                    outcome: "ran",
+                    error: None,
+                },
+            )
+            .expect("the scheduler records the fire");
+    };
+    // ONE FALLBACK TURN PER DEFERRAL: the scheduler claims the due wake and
+    // its marker turn runs behind the still-live shell; that turn's end
+    // re-defers but arms nothing, so no later window fires another marker.
+    let claimed = store
+        .claim_due(fire_at_ms, crate::util::now_ms())
+        .expect("the scheduler claims the due wake");
+    let [first_fire] = claimed.as_slice() else {
+        panic!("the scheduler claims exactly the due wake: {claimed:?}");
+    };
+    let mut marker_events: Vec<EngineEvent> = Vec::new();
+    admit(
+        &engine,
+        pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WAKE_MARKER_TEXT.to_string(),
+        &mut marker_events,
+    );
+    complete_dispatch(first_fire);
+    assert!(
+        active_wakes().is_empty(),
+        "the marker turn must not re-arm the fallback wake: {:?}",
+        active_wakes()
+    );
+    let later = store
+        .claim_due(fire_at_ms + 10 * window, crate::util::now_ms())
+        .expect("the scheduler scans later windows");
+    assert!(
+        later.is_empty(),
+        "a never-ending shell gets exactly one fallback turn: {later:?}"
+    );
+    // A settle consult behind the still-live shell arms nothing either.
+    engine
+        .runtime
+        .block_on(async { engine.goal_children_settled().await });
+    assert!(active_wakes().is_empty());
+    // The shell settles: the same consult delivers the owed continuation
+    // and the successful mint retires the armed wake.
+    engine.set_test_probes(Some(std::sync::Arc::new(|| 0)), None);
+    engine
+        .runtime
+        .block_on(async { engine.goal_children_settled().await });
+    let work = goal_work.lock().unwrap();
+    let [crate::engine::GoalTurnEndWork::Continuation(delivered)] = work.as_slice() else {
+        panic!("the settled shell never delivered the owed continuation: {work:?}");
+    };
+    assert!(delivered.request.message.contains("[goal: continuation]"));
+    assert_eq!(engine.goal_state_value()["continuationsUsed"], 1);
+    drop(work);
+    assert!(
+        !store.list().into_iter().any(|job| {
+            job.label.as_deref()
+                == Some(pa_core::session_engine::goal_driver::GOAL_BACKGROUND_SKIP_WAKE_CRON_LABEL)
+                && job.status == pa_core::cron::JobStatus::Active
+        }),
+        "the successful mint retired the armed wake"
+    );
+    // A stale arming that runs after the mint consumed the deferral (it
+    // raced the mint) must not leave a wake that would fire an unsolicited
+    // marker turn.
+    engine.set_test_probes(Some(std::sync::Arc::new(|| 1)), None);
+    engine
+        .runtime
+        .block_on(async { engine.arm_background_skip_wake().await });
+    assert!(
+        active_wakes().is_empty(),
+        "an arming behind a consumed deferral must arm nothing"
+    );
+}
+
 /// The engine session's entries as their persisted wire shapes (the
 /// hydrating snapshot: a windowed manager holds only the suffix).
 fn engine_session_entries(engine: &AgentSessionEngine) -> Vec<pa_types::session::FileEntry> {
@@ -747,9 +1057,6 @@ fn engine_session_entries(engine: &AgentSessionEngine) -> Vec<pa_types::session:
 
 #[test]
 fn injected_custom_turn_holds_one_representation() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (engine, _dir) = faux_engine_with_settings(
         &serde_json::json!({ "responses": [{"text": "notice acknowledged"}] }),
         1,
@@ -845,9 +1152,6 @@ fn injected_custom_turn_holds_one_representation() {
 
 #[test]
 fn goal_start_continuation_holds_one_representation() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (engine, _dir) = faux_engine_with_settings(
         &serde_json::json!({ "responses": [{"text": "goal turn reply"}] }),
         1,
@@ -905,9 +1209,6 @@ fn goal_start_continuation_holds_one_representation() {
 
 #[test]
 fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
-    let _faux = FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::TempDir::new().unwrap();
     let engine = AgentSessionEngine::new(AgentEngineConfig {
         cwd: dir.path().to_path_buf(),
@@ -935,6 +1236,9 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
     })
     .unwrap();
     let engine = std::sync::Arc::new(engine);
+    // The worker registers the engine's own arc: the live-auth resolver
+    // upgrades it per provider call.
+    engine.register_arc();
     // No worker owns the queue here: minted continuation work collects
     // instead of running, so the held turn below is the only live one.
     let _goal_work = goal_admission_collector(&engine);
@@ -976,7 +1280,9 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let agent = engine.turn_agent.lock().expect("turn agent lock").clone();
+        let agent = engine
+            .built_handles()
+            .map(|handles| handles.turn_agent.clone());
         if let Some(agent) = agent {
             let state = engine.runtime.block_on(agent.state());
             if state.is_streaming {
@@ -1042,6 +1348,163 @@ fn active_goal_aborted_turn_row_broadcasts_and_goal_accounting_skips_it() {
     assert_eq!(after["objective"], before["objective"]);
     assert_eq!(after["tokensUsed"], before["tokensUsed"]);
     assert_eq!(after["continuationsUsed"], before["continuationsUsed"]);
+}
+
+#[test]
+fn a_goal_change_made_under_a_held_driver_lock_reaches_the_turn_end_update() {
+    // `DoneAborted`: a turn cancelled at admission.
+    assert_turn_end_publishes_a_held_goal_change("cancelled at admission", true);
+    // `Done`: a session command turn, the terminal path of `/goal pause`.
+    assert_turn_end_publishes_a_held_goal_change("/autonomous status", false);
+}
+
+fn assert_turn_end_publishes_a_held_goal_change(message: &str, aborted: bool) {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(
+            json!({ "engine": "faux", "responses": [{ "text": "goal start reply" }] }).to_string(),
+        ),
+        supervisor_link: None,
+        telemetry_disabled: None,
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    let engine = std::sync::Arc::new(engine);
+    engine.register_arc();
+    let _goal_work = goal_admission_collector(&engine);
+    let mut events: Vec<EngineEvent> = Vec::new();
+    admit(
+        &engine,
+        "/goal publish every change".to_string(),
+        &mut events,
+    );
+    assert_eq!(engine.goal_state_value()["status"], json!("active"));
+    // Another task pauses the goal and still holds the driver lock while
+    // the next turn ends (a short holder like the owed-continuation retry).
+    let handles = engine.live_handles().expect("live session").goal.clone();
+    let mut driver = engine.runtime.block_on(handles.driver.lock());
+    {
+        let mut session = engine.runtime.block_on(handles.session.lock());
+        driver.pause(&mut session, "Paused by user").unwrap();
+    }
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let turn_engine = std::sync::Arc::clone(&engine);
+    let message = message.to_string();
+    let turn = std::thread::spawn(move || {
+        let mut events: Vec<EngineEvent> = Vec::new();
+        turn_engine.run_prompt(
+            0,
+            PromptRequest {
+                batch: Vec::new(),
+                images: Vec::new(),
+                message,
+                source: "user".to_string(),
+                agent_message_id: None,
+                custom_message: None,
+            },
+            &|| aborted,
+            &mut |event| {
+                if matches!(event, EngineEvent::Done(_) | EngineEvent::DoneAborted) {
+                    done_tx.send(()).unwrap();
+                }
+                events.push(event);
+                true
+            },
+        );
+        events
+    });
+    done_rx.recv().expect("the turn ends");
+    drop(driver);
+    let events = turn.join().expect("the turn settles");
+    let update = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::GoalUpdate { goal } => Some(goal.clone()),
+            _ => None,
+        })
+        .expect("the turn end publishes the paused goal");
+    assert_eq!(update["status"], json!("paused"), "events: {events:?}");
+    assert_eq!(engine.goal_state_value()["status"], json!("paused"));
+}
+
+#[test]
+fn active_goal_survives_an_abort_that_lands_before_the_provider_stream() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let engine = AgentSessionEngine::new(AgentEngineConfig {
+        cwd: dir.path().to_path_buf(),
+        agent_dir: dir.path().join("agent"),
+        provider: None,
+        model: None,
+        api_key: None,
+        thinking: None,
+        session_dir: None,
+        session_file: None,
+        faux_script: Some(
+            json!({
+                "engine": "faux",
+                "responses": [{ "text": "goal start reply" }, { "text": "never served" }],
+            })
+            .to_string(),
+        ),
+        supervisor_link: None,
+        telemetry_disabled: None,
+        cron_store: None,
+        queued_steering_probe: None,
+    })
+    .unwrap();
+    let engine = std::sync::Arc::new(engine);
+    engine.register_arc();
+    let _goal_work = goal_admission_collector(&engine);
+    let mut events: Vec<EngineEvent> = Vec::new();
+    admit(
+        &engine,
+        "/goal survive the early abort".to_string(),
+        &mut events,
+    );
+    assert_eq!(engine.goal_state_value()["status"], json!("active"));
+    // The Stop lands while the run persists its user row: after the run
+    // started, before the loop reaches the provider.
+    let agent = engine
+        .built_handles()
+        .map(|handles| handles.turn_agent.clone())
+        .expect("the goal start built the session");
+    let abort_target = std::sync::Arc::downgrade(&agent);
+    let _abort_at_user_row = engine
+        .runtime
+        .block_on(agent.subscribe(move |event, _signal| {
+            if let pa_agent::types::AgentEvent::MessageEnd {
+                message: pa_agent::types::AgentMessage::Standard(pa_agent::types::Message::User(_)),
+            } = &event
+            {
+                if let Some(agent) = abort_target.upgrade() {
+                    agent.abort();
+                }
+            }
+            Box::pin(async { Ok(()) })
+        }));
+    let mut events: Vec<EngineEvent> = Vec::new();
+    admit(
+        &engine,
+        "aborted before the stream".to_string(),
+        &mut events,
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, EngineEvent::DoneAborted)),
+        "the turn settles as aborted: {events:?}"
+    );
+    let after = engine.goal_state_value();
+    assert_eq!(after["status"], json!("active"), "state: {after:?}");
 }
 
 #[test]

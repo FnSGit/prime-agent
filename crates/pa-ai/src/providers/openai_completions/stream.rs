@@ -20,6 +20,7 @@ use crate::providers::openai_completions::{
     REASONING_FIELDS,
 };
 use crate::providers::openai_responses_hooks::apply_service_tier_pricing;
+use crate::providers::transform_messages::repair_unnamed_tool_calls;
 use crate::types::{
     done_reason, error_reason, AssistantContent, AssistantMessage, CacheRetention, Context, Model,
     StopReason, TextContent, ThinkingContent, ToolCall, Usage,
@@ -40,7 +41,7 @@ struct StreamingState {
     tool_call_blocks_by_index: HashMap<u64, usize>,
     tool_call_blocks_by_id: HashMap<String, usize>,
     tool_call_partial_args: HashMap<usize, StreamingJsonAccumulator>,
-    reasoning_details_by_index: Vec<(u64, Map<String, Value>)>,
+    reasoning_details: Vec<(u64, Map<String, Value>)>,
     next_reasoning_details_index: u64,
     reasoning_details_block: Option<usize>,
     response_service_tier: Option<String>,
@@ -59,7 +60,7 @@ impl StreamingState {
             tool_call_blocks_by_index: HashMap::new(),
             tool_call_blocks_by_id: HashMap::new(),
             tool_call_partial_args: HashMap::new(),
-            reasoning_details_by_index: Vec::new(),
+            reasoning_details: Vec::new(),
             next_reasoning_details_index: 0,
             reasoning_details_block: None,
             response_service_tier: None,
@@ -264,20 +265,6 @@ fn handle_chunk(
         return;
     };
 
-    if let Some(content) = delta.get("content").and_then(|value| value.as_str()) {
-        if !content.is_empty() {
-            let index = state.ensure_text_block(writer);
-            if let Some(AssistantContent::Text(text)) = state.output.content.get_mut(index) {
-                text.text.push_str(content);
-            }
-            writer.push(AssistantMessageEvent::TextDelta {
-                content_index: index as u64,
-                delta: content.to_string(),
-                partial: state.output.clone(),
-            });
-        }
-    }
-
     // Some endpoints return reasoning in reasoning_content (llama.cpp), or reasoning (other openai
     // compatible endpoints). Use the first non-empty reasoning field to avoid duplication.
     let mut found_reasoning_field: Option<(&str, &str)> = None;
@@ -301,10 +288,28 @@ fn handle_chunk(
         });
     }
 
+    if let Some(content) = delta.get("content").and_then(|value| value.as_str()) {
+        if !content.is_empty() {
+            let index = state.ensure_text_block(writer);
+            if let Some(AssistantContent::Text(text)) = state.output.content.get_mut(index) {
+                text.text.push_str(content);
+            }
+            writer.push(AssistantMessageEvent::TextDelta {
+                content_index: index as u64,
+                delta: content.to_string(),
+                partial: state.output.clone(),
+            });
+        }
+    }
+
     if let Some(tool_calls) = delta.get("tool_calls").and_then(|value| value.as_array()) {
         for tool_call in tool_calls {
             let stream_index = tool_call.get("index").and_then(serde_json::Value::as_u64);
-            let id = tool_call.get("id").and_then(|value| value.as_str());
+            // An empty id counts as absent, as TS's truthiness check treats it.
+            let id = tool_call
+                .get("id")
+                .and_then(|value| value.as_str())
+                .filter(|id| !id.is_empty());
             let index = state.ensure_tool_call_block(stream_index, id, writer);
             if let Some(AssistantContent::ToolCall(block)) = state.output.content.get_mut(index) {
                 if block.id.is_empty() {
@@ -363,10 +368,22 @@ fn handle_chunk(
             let explicit_index = detail.get("index").and_then(serde_json::Value::as_u64);
             let index = explicit_index.unwrap_or(state.next_reasoning_details_index);
             state.next_reasoning_details_index = state.next_reasoning_details_index.max(index + 1);
-            if let Some((_, merged)) = state
-                .reasoning_details_by_index
-                .iter_mut()
-                .find(|(existing, _)| *existing == index)
+            // Details are keyed by (type, index): Gemini streams a `reasoning.text` and a
+            // `reasoning.encrypted` detail both at index 0, and they must replay as two records.
+            // A fragment without a `type` continues the latest detail at its index.
+            let detail_type = detail.get("type").and_then(Value::as_str);
+            if let Some((_, merged)) =
+                state
+                    .reasoning_details
+                    .iter_mut()
+                    .rev()
+                    .find(|(existing_index, existing)| {
+                        let existing_type = existing.get("type").and_then(Value::as_str);
+                        *existing_index == index
+                            && (detail_type.is_none()
+                                || existing_type.is_none()
+                                || detail_type == existing_type)
+                    })
             {
                 for (key, value) in detail_object {
                     if let (
@@ -381,12 +398,10 @@ fn handle_chunk(
                     }
                 }
             } else {
-                state
-                    .reasoning_details_by_index
-                    .push((index, detail_object.clone()));
+                state.reasoning_details.push((index, detail_object.clone()));
             }
 
-            if detail.get("type").and_then(|value| value.as_str()) == Some("reasoning.encrypted") {
+            if detail_type == Some("reasoning.encrypted") {
                 if let (Some(id), Some(data)) = (
                     detail.get("id").and_then(|value| value.as_str()),
                     detail.get("data").filter(|value| !value.is_null()),
@@ -404,7 +419,7 @@ fn handle_chunk(
         }
         // The signature is encoded once at stream end (and on the error path) by
         // `encode_reasoning_details_signature`, not per delta.
-        if !state.reasoning_details_by_index.is_empty() && state.reasoning_details_block.is_none() {
+        if !state.reasoning_details.is_empty() && state.reasoning_details_block.is_none() {
             state
                 .output
                 .content
@@ -430,7 +445,7 @@ fn encode_reasoning_details_signature(state: &mut StreamingState) {
     let Some(block_index) = state.reasoning_details_block else {
         return;
     };
-    let mut sorted = state.reasoning_details_by_index.clone();
+    let mut sorted = state.reasoning_details.clone();
     sorted.sort_by_key(|(index, _)| *index);
     let details: Vec<Value> = sorted
         .into_iter()
@@ -640,6 +655,7 @@ async fn run_stream(
                 // calls before the error event carries the message.
                 encode_reasoning_details_signature(&mut state);
                 settle_partial_tool_calls(&mut state);
+                repair_unnamed_tool_calls(&mut state.output);
                 *output = state.output;
                 return Err(error);
             }
@@ -681,6 +697,9 @@ async fn run_stream(
 
     encode_reasoning_details_signature(&mut state);
     finish_blocks(&mut state, writer);
+    // After the `*_end` events, so the content indices already streamed to
+    // the client stay valid; the final message is what the session stores.
+    repair_unnamed_tool_calls(&mut state.output);
     *output = state.output;
 
     if base_options
@@ -775,6 +794,11 @@ mod tests {
     // own child module with this file's test harness.
     #[path = "stream_wire.rs"]
     mod stream_wire;
+
+    // The nameless-tool-call pins (#3742): calls the provider streamed
+    // without a function name.
+    #[path = "stream_tool_call_name.rs"]
+    mod stream_tool_call_name;
 
     /// Serve one SSE response body for the provider's POST and return the
     /// bound address.

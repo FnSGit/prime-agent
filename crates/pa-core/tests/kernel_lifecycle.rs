@@ -65,6 +65,7 @@ fn test_options(snapshot_dir: Option<&std::path::Path>) -> Option<KernelManagerO
         host_handlers: HostRequestHandlers::new(),
         python_skills: Vec::new(),
         on_background_work_settled: None,
+        pending_detached_completions: None,
         snapshot: snapshot_dir.map(|dir| KernelSnapshotConfig {
             path: snapshot_path_in(dir),
             manifest_path: manifest_path_in(dir),
@@ -73,7 +74,7 @@ fn test_options(snapshot_dir: Option<&std::path::Path>) -> Option<KernelManagerO
             debounce_ms: None,
         }),
         // The TS provisioner always runs the RLM bootstrap after start; tests match that contract.
-        bootstrap_code: Some(build_rlm_bootstrap_code(&[])),
+        bootstrap_code: Some(build_rlm_bootstrap_code(&[], false)),
         stderr_log_path: None,
     })
 }
@@ -199,7 +200,7 @@ async fn rlm_bootstrap_injects_the_kernel_surface() {
         return;
     };
     let options = KernelManagerOptions {
-        bootstrap_code: Some(build_rlm_bootstrap_code(&[])),
+        bootstrap_code: Some(build_rlm_bootstrap_code(&[], false)),
         ..base
     };
     let manager = started_manager(options).await;
@@ -246,7 +247,7 @@ async fn host_requests_round_trip_to_registered_handlers() {
     };
     let options = KernelManagerOptions {
         host_handlers: handlers,
-        bootstrap_code: Some(build_rlm_bootstrap_code(&[])),
+        bootstrap_code: Some(build_rlm_bootstrap_code(&[], false)),
         ..base
     };
     let manager = started_manager(options).await;
@@ -280,6 +281,17 @@ async fn host_requests_round_trip_to_registered_handlers() {
         "expected the TS unavailable-handler error, got stderr {:?} error {:?}",
         error.stderr,
         error.error
+    );
+
+    // rlm.end_turn needs no registration: the manager answers it before the
+    // registry lookup (a reorder would fail the cell like `nope.custom`),
+    // marks the executing cell, and the flag rides the settled result.
+    let ended = execute(&manager, "result = await rlm.end_turn()\nresult").await;
+    assert_eq!(ended.status, ExecuteStatus::Ok, "cell: {:?}", ended.error);
+    assert_eq!(ended.result.as_deref(), Some("{'endedTurn': True}"));
+    assert!(
+        ended.ended_turn,
+        "the end-turn flag must ride the settled result"
     );
 
     manager

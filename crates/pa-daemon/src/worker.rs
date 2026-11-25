@@ -13,44 +13,56 @@ pub(crate) use config::WorkerConfig;
 use env::KillCloseReason;
 mod input;
 mod lifecycle;
+mod refinement;
 mod summary;
 
 mod connection;
 
 pub(crate) use connection::{AuthOutcome, ConnectionSink, EventPump, OutboundFrame};
+pub(crate) use summary::emit_action_update_fresh;
 
+mod inbox_router;
 mod queue;
 
+pub(crate) use queue::admit_inbox_notice_locked;
 pub use queue::Lane;
 pub use queue::QueuePriority;
 pub(crate) use queue::{
-    admit_autonomous_follow_up, admit_bash_completion_notice, admit_goal_follow_up,
-    checkpoint_queue_recovery, enqueue_priority, gather_delivery_batch, parse_custom_message,
-    parse_prompt_images, queue_lanes, restore_queue_snapshot, restored_turn_policy,
-    withdraw_bash_completion_notice, QueueCheckpoint, QueueLanes, QueuedItem, TurnPolicy,
-    TurnSettle, ABORTED_TURN_SETTLE_ERROR, PROMPT_ABORTED_BEFORE_DELIVERY, QUEUED_INPUT_SUSPENDED,
+    admit_autonomous_follow_up, admit_goal_follow_up, admit_inbox_notice, admit_inbox_reminder,
+    admit_kernel_notice, checkpoint_queue_recovery, clear_withdrawn_progress_note,
+    consume_shown_inbox_items_locked, deliver_inbox_arrival_row_locked, enqueue_priority,
+    gather_delivery_batch, parse_custom_message, parse_prompt_images, queue_lanes,
+    queued_bash_completion_notices, queued_cell_completion_deliveries,
+    refresh_inbox_wake_rows_locked, restore_queue_snapshot, restored_turn_policy, row_wakes_a_cell,
+    withdraw_bash_completion_notice, withdraw_drained_inbox_notice, QueueCheckpoint, QueueLanes,
+    QueuedItem, TurnPolicy, TurnSettle, ABORTED_TURN_SETTLE_ERROR, INBOX_ARRIVAL_QUEUE_KEY,
+    INBOX_REMINDER_QUEUE_KEY, PROMPT_ABORTED_BEFORE_DELIVERY, QUEUED_INPUT_SUSPENDED,
     QUEUED_PROMPT_DELETED, SIDE_QUESTION_SETTLE_TIMEOUT,
 };
 
 mod create;
 mod turn;
+mod work_notify;
+
+pub(crate) use work_notify::WorkNotify;
 
 use create::{active_session_id_of, worker_server_capabilities};
 // session_summary/SummaryInputs serve the in-crate test modules only, so allow the unused import.
 #[allow(unused_imports)]
 pub(crate) use summary::{
-    compact_action_label, emit_worker_event_with, persist_custom_row, push_roster_delta,
-    session_snapshot, session_summary, RosterPushContext, SummaryInputs,
+    broadcast_custom_row_locked, compact_action_label, emit_worker_event_locked,
+    emit_worker_event_with, persist_custom_row, push_roster_delta, session_snapshot,
+    session_summary, RosterPushContext, SummaryInputs,
 };
 use turn::TurnRunner;
 
 mod commands;
 
 pub use env::{
-    WORKER_ACTIVE_SESSION_ID_ENV, WORKER_CWD_ENV, WORKER_INSTANCE_ID_ENV,
-    WORKER_RECOVERY_JOURNAL_ENV, WORKER_ROLE_ENV, WORKER_SCRIPT_ENV, WORKER_SOCKET_ENV,
-    WORKER_SUPERVISOR_LOST_EXIT_MS_ENV, WORKER_SUPERVISOR_SOCKET_ENV,
-    WORKER_TELEMETRY_DISABLED_ENV, WORKER_TOKEN_ENV,
+    strip_inherited_worker_env, WORKER_ACTIVE_SESSION_ID_ENV, WORKER_CWD_ENV,
+    WORKER_DECISION_CHILD_ENV, WORKER_INSTANCE_ID_ENV, WORKER_RECOVERY_JOURNAL_ENV,
+    WORKER_ROLE_ENV, WORKER_SCRIPT_ENV, WORKER_SOCKET_ENV, WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
+    WORKER_SUPERVISOR_SOCKET_ENV, WORKER_TELEMETRY_DISABLED_ENV, WORKER_TOKEN_ENV,
 };
 use serde_json::Map;
 pub(crate) use session_core::SessionCore;
@@ -85,10 +97,10 @@ use crate::peer::{
     PEER_COMMAND_NOT_ALLOWED,
 };
 use crate::protocol::{
-    create_daemon_event_meta, create_daemon_replay_info, current_protocol_info,
+    app_version, create_daemon_event_meta, create_daemon_replay_info, current_protocol_info,
     default_client_capabilities, normalize_client_capabilities, response_failure, response_success,
     DaemonOutbound, DaemonResponse, DaemonResumeCursor, DaemonSessionClosedReason,
-    DAEMON_APP_VERSION, DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
+    DAEMON_SCHEMA_ID, DAEMON_SCHEMA_REVISION,
 };
 use crate::registration::RegistrationHandle;
 use crate::session_store::{session_file_name, SessionFile};
@@ -127,11 +139,13 @@ pub struct Worker {
     /// The concrete agent engine behind `engine` for the create command's
     /// eager session build (the kernel prewarm).
     pub(crate) agent_engine: Option<std::sync::Arc<crate::agent_engine::AgentSessionEngine>>,
+    /// The worker's supervisor link (roster pushes, passivation asks, bounces).
+    pub(crate) roster_link: std::sync::Arc<crate::supervisor_link::SupervisorLink>,
     /// The monotonic roster-delta counter the roster pushes stamp and the
     /// authoritative pulls embed: a push can race a fresher pull, so the
     /// supervisor's gate drops the stale snapshot.
     roster_delta_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub(crate) work_notify: Arc<Notify>,
+    pub(crate) work_notify: Arc<WorkNotify>,
     pub(crate) idle_notify: Arc<Notify>,
     /// The per-connection session-attach registry (the fresh bots'
     /// release findings): connection tokens -> the client ids their
@@ -144,6 +158,10 @@ pub struct Worker {
     /// Tokens whose attach guard already released: a late registration
     /// racing the close is rejected, not recreated as unowned.
     pub(crate) released_attach_tokens: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Every live connection's outbound sink (dead entries pruned at each
+    /// registration): the shutdown drains them before its reply unlocks
+    /// the process exit.
+    pub(crate) connection_sinks: std::sync::Mutex<Vec<std::sync::Weak<ConnectionSink>>>,
     pub(crate) events: Arc<EventPump>,
     /// The `/model` catalog background-refresh coalescing gate: at most
     /// one refresh plus one queued re-arm per burst.
@@ -171,6 +189,9 @@ pub struct Worker {
     pub(crate) agent_messages: crate::agent_message_ingest::AgentMessageIngest,
     /// Session input-pause leases: the admission gate the turn runner consults.
     pub(crate) input_pauses: crate::session_input_pause::InputPauseTable,
+    /// The inbox arrival batch the queued short notice covers: shared by
+    /// the kernel-notice sink and the agent-message delivery route.
+    pub(crate) inbox_arrivals: pa_core::session_engine::inbox::InboxArrivals,
     /// Session navigation: `new_session` / `switch_session` / `import_jsonl`,
     /// the shared replacement flow.
     pub(crate) navigation: crate::session_navigation::SessionNavigation,
@@ -276,6 +297,7 @@ impl Worker {
     /// # Panics
     ///
     /// The wired closures panic on a poisoned session-core mutex.
+    #[must_use]
     pub fn new(config: WorkerConfig, registration: Option<RegistrationHandle>) -> Self {
         let events = Arc::new(EventPump::new());
         let supervisor_claims = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -291,6 +313,8 @@ impl Worker {
             created: false,
             attached_client_ids: Vec::new(),
             abort_requested: false,
+            turn_cancelled: false,
+            turn_completed: false,
             suppress_aborted_row: false,
             shutdown_requested: false,
             last_activity_ms: 0,
@@ -301,6 +325,7 @@ impl Worker {
             last_action_snapshot: Some(SessionActionSnapshot::default()),
             rlm_depth: 0,
             runtime_kind: "top-level".to_string(),
+            decision_child: false,
             rlm_child_id: None,
             parent_active_session_id: None,
             parent_session_id: None,
@@ -315,8 +340,12 @@ impl Worker {
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
             active_action: None,
+            inbox_wake_due: None,
+            inbox_shown_unaccepted: std::collections::BTreeSet::new(),
+            run_cut_at_tool_boundary: false,
             running_tool_calls: std::collections::HashSet::new(),
             running_admission_ids: std::collections::HashSet::new(),
+            tool_use_count: 0,
         };
         let active_session_id = config.active_session_id.clone();
         let script = config.script.clone();
@@ -336,15 +365,31 @@ impl Worker {
         // Shared worker recovery journal: the turn runner persists queue
         // snapshots, `serve` opens the file, commands record busy state.
         let recovery = Arc::new(Mutex::new(None));
-        let work_notify = Arc::new(Notify::new());
+        // The worker's queue-backed cell wake: the pending predicate
+        // reads the live steering lane (wakeable rows only — a cell-done
+        // row never detaches a later cell), so an arrival that lands while
+        // the model is still streaming the tool call ends the cell's wait
+        // at once instead of waiting out the budget. Every work wake
+        // requests it; the agent engine installs it before it is shared.
+        let wake_core = Arc::clone(&core);
+        let cell_wake_pending: pa_core::kernel::cell_wake::CellWakePending =
+            std::sync::Arc::new(move || {
+                let core = wake_core
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                core.steering.iter().any(row_wakes_a_cell)
+            });
+        let worker_cell_wake = std::sync::Arc::new(
+            pa_core::kernel::cell_wake::CellWake::with_pending(cell_wake_pending),
+        );
+        let work_notify = Arc::new(WorkNotify::new(std::sync::Arc::clone(&worker_cell_wake)));
         let idle_notify = Arc::new(Notify::new());
         // The supervisor link and worker token for roster pushes: one
         // construction shared by the turn runner and the command arms
-        // (identical dial path).
+        // (identical dial path). The config field is the one supervisor-
+        // socket source.
         let roster_link = std::sync::Arc::new(crate::supervisor_link::SupervisorLink::new(
-            std::env::var_os(WORKER_SUPERVISOR_SOCKET_ENV)
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default(),
+            config.supervisor_socket_path.clone(),
         ));
         let worker_token = std::env::var(WORKER_TOKEN_ENV).unwrap_or_default();
         let roster_delta_sequence = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -371,11 +416,44 @@ impl Worker {
             Arc::clone(&events),
             Arc::clone(&recovery),
         ));
-        let (engine, agent_engine, roster_pushes): (
+        // The coalescing arrival batch the queued short notice covers:
+        // shared by the kernel-notice sink and the agent-message
+        // delivery route, so both classes extend the same batch.
+        let inbox_arrivals = pa_core::session_engine::inbox::InboxArrivals::default();
+        // The turn runner's passivation context: shared by both engine
+        // branches below (the roster context after them moves the worker
+        // token into its queue; the decision engine takes a clone).
+        let passivation = crate::worker::turn::PassivationContext {
+            agent_dir: config.agent_dir.clone(),
+            link: Arc::clone(&roster_link),
+            worker_token: worker_token.clone(),
+        };
+        // The Decision API child flag rides the worker's launch env (the
+        // durable create command's `decisionChild`): the worker runs the
+        // decision engine instead of the agent engine.
+        let decision_child =
+            std::env::var_os(WORKER_DECISION_CHILD_ENV).is_some_and(|value| value == "1");
+        // The flag reaches the summary (`decisionChild`): the agents view
+        // hides System 1 children from the user; costs still roll up.
+        if decision_child {
+            core.lock().unwrap().decision_child = true;
+        }
+        let (engine, agent_engine): (
             std::sync::Arc<dyn SessionEngine>,
             Option<std::sync::Arc<crate::agent_engine::AgentSessionEngine>>,
-            crate::roster_activity::RosterPushQueue,
-        ) = {
+        ) = if decision_child {
+            // The Decision API child runs the decision engine; every other
+            // session (scripted or not) runs the agent engine family.
+            let engine: std::sync::Arc<dyn SessionEngine> =
+                std::sync::Arc::new(crate::decision_engine::DecisionEngine::new(
+                    &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    &config.agent_dir,
+                    std::sync::Arc::clone(&roster_link),
+                    config.active_session_id.clone(),
+                    worker_token.clone(),
+                ));
+            (engine, None)
+        } else {
             // Scripted sessions serve the integration harness; sessions
             // without a script run the real agent engine.
             let mut agent_engine: Option<std::sync::Arc<crate::agent_engine::AgentSessionEngine>> =
@@ -401,7 +479,11 @@ impl Worker {
                         cron_store: Some(kernel_cron_wiring(&scheduled)),
                         queued_steering_probe: queued_steering_probe.clone(),
                     }) {
-                        Ok(engine) => {
+                        Ok(mut engine) => {
+                            // The queue-backed wake installs before the
+                            // engine is shared: its session builds then
+                            // hand the same wake to every provisioner.
+                            engine.set_worker_cell_wake(std::sync::Arc::clone(&worker_cell_wake));
                             let concrete = std::sync::Arc::new(engine);
                             agent_engine = Some(std::sync::Arc::clone(&concrete));
                             concrete
@@ -431,7 +513,8 @@ impl Worker {
                         cron_store: Some(kernel_cron_wiring(&scheduled)),
                         queued_steering_probe: queued_steering_probe.clone(),
                     }) {
-                        Ok(engine) => {
+                        Ok(mut engine) => {
+                            engine.set_worker_cell_wake(std::sync::Arc::clone(&worker_cell_wake));
                             let concrete = std::sync::Arc::new(engine);
                             agent_engine = Some(std::sync::Arc::clone(&concrete));
                             concrete
@@ -447,6 +530,8 @@ impl Worker {
                 // The in-run autonomous continuation seam: the hook holds
                 // itself weakly through the registered arc.
                 concrete.register_arc();
+                concrete
+                    .set_rlm_usage_store(std::sync::Arc::new(CoreUsageStore(Arc::clone(&core))));
                 let sink_core = Arc::clone(&core);
                 let sink_notify = Arc::clone(&work_notify);
                 let autonomous_sink: crate::agent_engine::AutonomousAdmission = {
@@ -460,6 +545,7 @@ impl Worker {
                 concrete.set_autonomous_admission(autonomous_sink);
                 let purge_core = Arc::clone(&core);
                 let purge_recovery = Arc::clone(&recovery);
+                let purge_engine = Arc::downgrade(concrete);
                 let autonomous_purge: std::sync::Arc<dyn Fn() + Send + Sync> =
                     std::sync::Arc::new(move || {
                         {
@@ -470,6 +556,9 @@ impl Worker {
                             core.steering.retain(|item| {
                                 item.queue_key.as_deref() != Some(AUTONOMOUS_QUEUE_KEY)
                             });
+                            if let Some(engine) = purge_engine.upgrade() {
+                                clear_withdrawn_progress_note(&core, engine.as_ref());
+                            }
                         }
                         // The withdraw settles the rows: dropping the last
                         // queued row must not leave busy=true promising a
@@ -525,11 +614,15 @@ impl Worker {
                 // goal-context turns.
                 let purge_core = Arc::clone(&core);
                 let purge_recovery = Arc::clone(&recovery);
+                let purge_engine = Arc::downgrade(concrete);
                 let queue_purge: std::sync::Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                     {
                         let mut core = purge_core.lock().unwrap();
                         core.steering.retain(|item| !is_goal_context_item(item));
                         core.follow_up.retain(|item| !is_goal_context_item(item));
+                        if let Some(engine) = purge_engine.upgrade() {
+                            clear_withdrawn_progress_note(&core, engine.as_ref());
+                        }
                     }
                     // Same settle as the autonomous withdraw: a pause/clear
                     // cannot leave busy=true.
@@ -595,84 +688,163 @@ impl Worker {
                         );
                     });
                 concrete.set_compaction_summary_sink(summary_sink);
-                // The bash-completion wake seam (TS `_promptInjectedMessage`
-                // for `bash.completed`): the handler validates, the sink
-                // admits/withdraws through the queue lanes.
+                // The worker's refinement completion sink: the background
+                // run's durable rows and completion events surface here,
+                // generation-fenced, once the run settles.
+                *concrete.refinement_completion_sink.lock().unwrap() = Some(
+                    refinement::completion_sink(Arc::clone(&core), Arc::clone(&events)),
+                );
+                // The kernel-notice wake seam (TS `_promptInjectedMessage`
+                // for `bash.completed` and `factory.progress`): the handlers
+                // validate, the sinks admit/withdraw through the queue lanes.
+                // With the agent inbox enabled (default), the notice's message
+                // lands in the session's durable inbox and ONE short steering
+                // notice wakes instead of the full row.
                 let notice_engine = std::sync::Arc::downgrade(concrete);
                 let notice_core = Arc::clone(&core);
                 let notice_notify = Arc::clone(&work_notify);
                 let notice_recovery = Arc::clone(&recovery);
-                let completion: crate::engine::BashCompletionSink = Arc::new(move |notice| {
+                let notice_agent_dir = config.agent_dir.clone();
+                // The coalescing batch the queued notice row covers (routing
+                // state, reset when the row delivers or clears). The
+                // consumed-bash withdrawal shares it: a collected handle
+                // trims the same batch its arrival grew. The worker field
+                // keeps the batch shared with the agent-message route too.
+                let arrivals_for_sink = std::sync::Arc::clone(&inbox_arrivals);
+                let arrivals_for_consumed = std::sync::Arc::clone(&arrivals_for_sink);
+                let notice_sink: crate::engine::KernelNoticeSink = Arc::new(move |notice| {
                     let Some(engine) = notice_engine.upgrade() else {
                         return;
                     };
                     if engine.session_is_closed() {
                         return;
                     }
-                    admit_bash_completion_notice(
+                    // Revalidated inside the admission's lock section: the
+                    // close paths mark the session BEFORE clearing the lanes.
+                    let closed = || engine.session_is_closed();
+                    if crate::agent_inbox::inbox_enabled(&engine.cwd(), &notice_agent_dir) {
+                        if let (Some(inbox), Some(fields)) = (
+                            engine.inbox(),
+                            pa_core::session_engine::inbox::inbox_notice_fields(&notice),
+                        ) {
+                            let admitted = admit_inbox_notice(
+                                &notice_recovery,
+                                &notice_core,
+                                &notice_notify,
+                                &inbox,
+                                &arrivals_for_sink,
+                                fields,
+                                Lane::Steering,
+                                closed,
+                                Some(engine.as_ref()),
+                            );
+                            if admitted.is_ok() {
+                                return;
+                            }
+                            // The store moved on between the capture and
+                            // the identity-checked push (a replacement
+                            // retired it): the notice must never vanish —
+                            // steer the full row like the inbox-off lane.
+                        }
+                    }
+                    admit_kernel_notice(
                         &notice_recovery,
                         &notice_core,
                         &notice_notify,
-                        &notice,
-                        // Revalidated inside the admission's lock section: the
-                        // close paths mark the session BEFORE clearing the lanes.
-                        || engine.session_is_closed(),
+                        notice,
+                        closed,
                     );
                 });
+                crate::agent_inbox::spawn_inbox_reminder(
+                    std::sync::Arc::downgrade(concrete),
+                    &core,
+                    &work_notify,
+                    &recovery,
+                    &config.agent_dir,
+                );
                 let withdraw_core = Arc::clone(&core);
                 let withdraw_recovery = Arc::clone(&recovery);
+                let withdraw_engine = Arc::downgrade(concrete);
                 let consumed: crate::engine::BashConsumedSink = Arc::new(move |notice| {
-                    withdraw_bash_completion_notice(&withdraw_recovery, &withdraw_core, &notice);
+                    let engine = withdraw_engine.upgrade();
+                    // The consumed collection drains the pushed inbox
+                    // message too (the auto-read-on-collection parity):
+                    // a handle collected through its result leaves no
+                    // waiting bash-done.
+                    let inbox = engine.as_ref().and_then(|engine| engine.inbox());
+                    withdraw_bash_completion_notice(
+                        &withdraw_recovery,
+                        &withdraw_core,
+                        inbox.as_ref().map(|store| (store, &arrivals_for_consumed)),
+                        &notice,
+                        engine.as_deref().map(|engine| engine as &dyn SessionEngine),
+                    );
                 });
-                concrete.set_bash_notice_sinks(completion, consumed);
+                concrete.set_kernel_notice_sinks(notice_sink, consumed);
+                // The accepted note frames as a session event on the pump.
+                let note_core = Arc::clone(&core);
+                let note_events = events.clone();
+                let note_emit: pa_core::session_engine::rlm_host::RlmProgressNoteEmit =
+                    Arc::new(move |message, timestamp| {
+                        emit_worker_event_with(
+                            &note_core,
+                            &note_events,
+                            json!({
+                                "type": "rlm_progress_note",
+                                "message": message,
+                                "timestamp": timestamp,
+                            }),
+                        );
+                    });
+                concrete.set_progress_note_emit(note_emit);
             }
-            // The live roster activity feed (TS `observeRosterEvent`): busy
-            // flips and trigger events coalesce into `worker_roster_delta`
-            // pushes.
-            let roster_pushes =
-                crate::roster_activity::RosterPushQueue::spawn(crate::worker::RosterPushContext {
-                    core: Arc::clone(&core),
-                    engine: std::sync::Arc::clone(&engine),
-                    user_bash: std::sync::Arc::clone(&user_bash),
-                    roster_link: Arc::clone(&roster_link),
-                    worker_token: worker_token.clone(),
-                    worker_instance_id: config.worker_instance_id.clone(),
-                    roster_delta_sequence: std::sync::Arc::clone(&roster_delta_sequence),
-                });
-            crate::roster_activity::spawn_roster_activity_watch(&events, roster_pushes.clone());
-            if let Some(children) = agent_engine
-                .as_ref()
-                .and_then(|engine| engine.children.as_ref())
-            {
-                crate::roster_activity::spawn_running_children_watch(
-                    children,
-                    roster_pushes.clone(),
-                );
-            }
-            let runner = TurnRunner {
-                recovery: Arc::clone(&recovery),
-                core: Arc::clone(&core),
-                input_pauses: input_pauses.clone(),
-                prompt_admissions: prompt_admissions.clone(),
-                work_notify: Arc::clone(&work_notify),
-                idle_notify: Arc::clone(&idle_notify),
-                events: events.clone(),
-                engine: std::sync::Arc::clone(&engine),
-                active_session_id,
-                roster_pushes: roster_pushes.clone(),
-                user_bash: std::sync::Arc::clone(&user_bash),
-                passivation: crate::worker::turn::PassivationContext {
-                    agent_dir: config.agent_dir.clone(),
-                    link: Arc::clone(&roster_link),
-                    worker_token,
-                },
-                herdr: std::sync::Arc::clone(&herdr_slot),
-            };
-            tokio::spawn(async move {
-                runner.run().await;
-            });
-            (engine, agent_engine, roster_pushes)
+            (engine, agent_engine)
         };
+        // The live roster activity feed (TS `observeRosterEvent`): busy
+        // flips and trigger events coalesce into `worker_roster_delta`
+        // pushes. Every engine family runs it — a decision child's busy
+        // and completion transitions publish to roster subscribers like
+        // any other session's.
+        let roster_pushes =
+            crate::roster_activity::RosterPushQueue::spawn(crate::worker::RosterPushContext {
+                core: Arc::clone(&core),
+                engine: std::sync::Arc::clone(&engine),
+                user_bash: std::sync::Arc::clone(&user_bash),
+                roster_link: Arc::clone(&roster_link),
+                worker_token,
+                worker_instance_id: config.worker_instance_id.clone(),
+                roster_delta_sequence: std::sync::Arc::clone(&roster_delta_sequence),
+            });
+        crate::roster_activity::spawn_roster_activity_watch(&events, roster_pushes.clone());
+        if let Some(children) = agent_engine
+            .as_ref()
+            .and_then(|engine| engine.children.as_ref())
+        {
+            crate::roster_activity::spawn_running_children_watch(children, roster_pushes.clone());
+        }
+        // The turn runner drives the engine's queued prompts; every engine
+        // needs it — a decision child without a runner never dequeues its
+        // first prompt.
+        let runner = TurnRunner {
+            recovery: Arc::clone(&recovery),
+            core: Arc::clone(&core),
+            input_pauses: input_pauses.clone(),
+            prompt_admissions: prompt_admissions.clone(),
+            work_notify: Arc::clone(&work_notify),
+            idle_notify: Arc::clone(&idle_notify),
+            events: events.clone(),
+            engine: std::sync::Arc::clone(&engine),
+            active_session_id,
+            roster_pushes: roster_pushes.clone(),
+            user_bash: std::sync::Arc::clone(&user_bash),
+            passivation,
+            herdr: std::sync::Arc::clone(&herdr_slot),
+            inbox_arrivals: std::sync::Arc::clone(&inbox_arrivals),
+            inbox_engine: agent_engine.as_ref().map(std::sync::Arc::downgrade),
+        };
+        tokio::spawn(async move {
+            runner.run().await;
+        });
         let side_questions = crate::side_question::SideQuestionManager::new(
             std::sync::Arc::clone(&engine),
             events.clone(),
@@ -711,6 +883,48 @@ impl Worker {
             std::sync::Arc::clone(&engine),
             Arc::clone(&core),
         );
+        // The scheduling seam: heartbeat fires route into the session's
+        // durable inbox (class `heartbeat`) instead of injecting the full
+        // delivery row, once the worker's engine exists.
+        if let Some(engine) = &agent_engine {
+            scheduled.set_inbox_seam(
+                std::sync::Arc::downgrade(engine),
+                std::sync::Arc::clone(&inbox_arrivals),
+                config.agent_dir.clone(),
+            );
+        }
+        // The worker's post-drain inbox seam: every session build copies
+        // it onto the freshly opened store, and the kernel's read handler
+        // runs it so drained wake rows retract or re-render (the drain
+        // sweep: the batch trim, the reminder re-render, the twin
+        // re-sync, the progress-note clear, the settled checkpoint) —
+        // and the queue strip refreshes for subscribed clients.
+        let hook_engine = std::sync::Arc::clone(&engine);
+        if let Some(engine) = &agent_engine {
+            let hook_core = Arc::clone(&core);
+            let hook_arrivals = std::sync::Arc::clone(&inbox_arrivals);
+            let hook_events = Arc::clone(&events);
+            let hook_recovery = Arc::clone(&recovery);
+            engine.set_inbox_read_hook(std::sync::Arc::new(
+                move |inbox: &std::sync::Arc<pa_core::session_engine::inbox::SessionInbox>| {
+                    if withdraw_drained_inbox_notice(
+                        &hook_recovery,
+                        &hook_core,
+                        &hook_arrivals,
+                        inbox,
+                        hook_engine.as_ref(),
+                    ) {
+                        // The projection recomputes under the emission
+                        // lock, so a concurrent admission's strip state
+                        // is never overwritten by a stale copy.
+                        let _ = crate::worker::summary::emit_action_update_fresh(
+                            &hook_core,
+                            &hook_events,
+                        );
+                    }
+                },
+            ));
+        }
         Worker {
             config,
             bound_socket_identity: std::sync::Mutex::new(None),
@@ -721,11 +935,13 @@ impl Worker {
             core,
             engine,
             agent_engine,
+            roster_link: Arc::clone(&roster_link),
             roster_delta_sequence,
             work_notify,
             idle_notify,
             session_attachments: std::sync::Mutex::new(std::collections::HashMap::new()),
             released_attach_tokens: std::sync::Mutex::new(std::collections::HashSet::new()),
+            connection_sinks: std::sync::Mutex::new(Vec::new()),
             events,
             model_catalog_refresh_gate: std::sync::Arc::new(
                 crate::model_catalog::RefreshGate::default(),
@@ -742,6 +958,7 @@ impl Worker {
             roster_pushes,
             agent_messages: crate::agent_message_ingest::AgentMessageIngest::new(),
             input_pauses,
+            inbox_arrivals,
             navigation,
             prompt_admissions,
             scheduled,
@@ -808,8 +1025,8 @@ impl Worker {
     /// no destructors, so the caller must have settled the close first).
     async fn exit_after_close(&self) -> ! {
         // Shutdown keeps the resume entry and exits the process (TS
-        // `closeKeepsResumeEntry("shutdown")`).
-        let _ = self.record_recovery(false, "shutdown");
+        // `closeKeepsResumeEntry("shutdown")`); `handle_shutdown` already
+        // recorded the recovery verdict.
         self.close_listener_then_cleanup_socket().await;
         std::process::exit(0)
     }
@@ -821,7 +1038,7 @@ impl Worker {
             "pa-daemon worker {}: registration refused (the supervisor no longer owns this identity); retiring",
             std::process::id()
         );
-        let _ = self.handle_shutdown().await;
+        let _ = self.handle_shutdown(&json!({})).await;
         self.exit_after_close().await;
     }
 }
@@ -850,7 +1067,26 @@ fn emit_refinement_event_for_session(
     review_session_id: &str,
     event: Value,
 ) -> bool {
+    emit_refinement_event_for_generation(
+        core,
+        events,
+        review_session_id,
+        /*expected_generation*/ None,
+        event,
+    )
+}
+
+pub(crate) fn emit_refinement_event_for_generation(
+    core: &Arc<Mutex<SessionCore>>,
+    events: &Arc<EventPump>,
+    review_session_id: &str,
+    expected_generation: Option<&str>,
+    event: Value,
+) -> bool {
     let mut core = core.lock().unwrap();
+    if expected_generation.is_some_and(|generation| core.generation != generation) {
+        return false;
+    }
     if core.store.as_ref().map(SessionFile::session_id) != Some(review_session_id) {
         return false;
     }
@@ -883,8 +1119,27 @@ fn emit_refinement_row(
     review_session_id: &str,
     message: &Value,
 ) -> bool {
+    emit_refinement_row_for_generation(
+        core,
+        events,
+        review_session_id,
+        /*expected_generation*/ None,
+        message,
+    )
+}
+
+pub(crate) fn emit_refinement_row_for_generation(
+    core: &Arc<Mutex<SessionCore>>,
+    events: &Arc<EventPump>,
+    review_session_id: &str,
+    expected_generation: Option<&str>,
+    message: &Value,
+) -> bool {
+    let mut core = core.lock().unwrap();
+    if expected_generation.is_some_and(|generation| core.generation != generation) {
+        return false;
+    }
     {
-        let mut core = core.lock().unwrap();
         let Some(store) = core.store.as_mut() else {
             return false;
         };
@@ -905,17 +1160,133 @@ fn emit_refinement_row(
             }),
         );
     }
-    emit_worker_event_with(
-        core,
-        events,
-        json!({ "type": "message_start", "message": message }),
-    );
-    emit_worker_event_with(
-        core,
-        events,
-        json!({ "type": "message_end", "message": message }),
-    );
+    #[cfg(test)]
+    tests::BEFORE_REFINEMENT_ROW_BROADCAST.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+    // Persistence and both frames belong to the same session generation. A
+    // navigation cannot replace the store between the check and either send.
+    broadcast_custom_row_locked(&mut core, events, message);
     true
+}
+
+struct CoreUsageStore(Arc<Mutex<SessionCore>>);
+
+fn missing_usage_target(target_id: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("Assistant message entry {target_id} not found"),
+    )
+}
+
+fn assistant_message(entry: &crate::session_store::SessionEntry) -> Option<&Value> {
+    if entry.type_ != "message" {
+        return None;
+    }
+    let message = entry.fields.get("message")?;
+    (crate::types::message_role(message) == Some("assistant")).then_some(message)
+}
+
+impl pa_core::session_engine::rlm_usage::RlmChildUsageStore for CoreUsageStore {
+    fn last_assistant(
+        &self,
+    ) -> pa_core::session_engine::rlm_usage::RlmChildUsageFuture<
+        '_,
+        Option<(String, pa_types::ai::Usage)>,
+    > {
+        let core = Arc::clone(&self.0);
+        Box::pin(async move {
+            let core = core.lock().unwrap();
+            let store = core.store.as_ref()?;
+            store.entries().iter().rev().find_map(|entry| {
+                let message = assistant_message(entry)?;
+                Some((
+                    entry.id.clone(),
+                    message
+                        .get("usage")
+                        .cloned()
+                        .and_then(|usage| serde_json::from_value(usage).ok())
+                        .unwrap_or_default(),
+                ))
+            })
+        })
+    }
+
+    fn append_attribution(
+        &self,
+        row_id: &str,
+        target_id: &str,
+        child_usage: pa_types::ai::Usage,
+        origin: Option<pa_types::session::ChildUsageOrigin>,
+    ) -> pa_core::session_engine::rlm_usage::RlmChildUsageFuture<
+        '_,
+        std::io::Result<pa_core::session_engine::rlm_usage::ChildUsageAppendResult>,
+    > {
+        let core = Arc::clone(&self.0);
+        let row_id = row_id.to_owned();
+        let target_id = target_id.to_owned();
+        Box::pin(async move {
+            let mut core = core.lock().unwrap();
+            let Some(store) = core.store.as_mut() else {
+                return Err(missing_usage_target(&target_id));
+            };
+            store
+                .append_child_usage_once(&row_id, &target_id, child_usage, origin)
+                .map_err(|error| std::io::Error::other(format!("{error:#}")))
+        })
+    }
+
+    /// The worker swaps `core.store` on a session replace, so a bill made
+    /// before the swap lands only if its session is still the open one
+    /// (the fence `emit_refinement_event_for_session` applies to events).
+    fn append_model_usage(
+        &self,
+        session_id: String,
+        usage: pa_core::session_engine::model_usage::ModelUsage,
+    ) -> pa_core::session_engine::rlm_usage::RlmChildUsageFuture<'_, std::io::Result<()>> {
+        let core = Arc::clone(&self.0);
+        Box::pin(async move {
+            let data = serde_json::to_value(&usage)?;
+            let mut core = core.lock().unwrap();
+            let Some(store) = core.store.as_mut() else {
+                return Err(std::io::Error::other("session store not created"));
+            };
+            // A pathless store's id is not the engine's (lifecycle.rs keeps the in-memory
+            // manager's own id), so only path-backed sessions are fenced.
+            if !store.path.as_os_str().is_empty() && store.session_id() != session_id {
+                return Err(std::io::Error::other(format!(
+                    "bill for session {session_id} dropped: the worker moved to session {}",
+                    store.session_id()
+                )));
+            }
+            store
+                .persist_entry(
+                    "custom",
+                    json!({
+                        "customType": pa_core::session_engine::model_usage::MODEL_USAGE_CUSTOM_TYPE,
+                        "data": data,
+                    }),
+                )
+                .map(|_| ())
+                .map_err(|error| std::io::Error::other(format!("{error:#}")))
+        })
+    }
+
+    /// The engine builds on the store a create or a replacement installed;
+    /// a replacement retires the engine, so the rebuild re-observes.
+    fn observe_billed_rows(
+        &self,
+        sink: pa_core::session::billed_row::BilledRowSink,
+    ) -> pa_core::session_engine::rlm_usage::RlmChildUsageFuture<'_, ()> {
+        let core = Arc::clone(&self.0);
+        Box::pin(async move {
+            if let Some(store) = core.lock().unwrap().store.as_mut() {
+                store.billed_row_sink = crate::session_store::BilledRowSinkSlot(Some(sink));
+            }
+        })
+    }
 }
 
 /// Whether one queued item is a minted goal-context turn (TS's
@@ -937,6 +1308,8 @@ pub async fn run_worker() -> Result<()> {
     if std::env::var(WORKER_ROLE_ENV).unwrap_or_default() != "1" {
         return Err(anyhow!("worker mode requires {WORKER_ROLE_ENV}=1"));
     }
+    // Structured logs land in the worker's captured stderr log.
+    pa_ai::utils::log::install_stderr_log_sink();
     let config = WorkerConfig::from_env()?;
     // Self-registration: the supervisor's roster survives its own restarts
     // because workers re-present their identity (liveness watch + backoff).
@@ -965,10 +1338,47 @@ fn is_rlm_child_status_item(item: &QueuedItem) -> bool {
     crate::child_status_notices::is_reserved_child_status_custom_type(row)
 }
 
+/// One parked item's inbox-notice provenance: the daemon-authored arrival
+/// and reminder twins carry the inbox customType (a user-typed row never
+/// does), so the queue strip folds them — typed provenance, never a
+/// preview-prefix match.
+fn is_inbox_notice_item(item: &QueuedItem) -> bool {
+    item.custom_message
+        .as_ref()
+        .is_some_and(is_inbox_notice_custom_type)
+}
+
+/// One custom row's inbox-notice provenance: the customType exact match
+/// (the same wire vocabulary the daemon's own admission writes). A
+/// caller-supplied row claiming it is a spoof of the inbox system's
+/// identity — the intakes refuse it loudly (the queue-fold anti-spoof
+/// rule, like the reserved child-status kinds: unrefused, the spoof
+/// parks, folds itself out of the strip's browsable rows, and delivers
+/// under the inbox system's identity as an "Agent inbox" row the inbox
+/// never sent).
+pub(crate) fn is_inbox_notice_custom_type(custom_message: &Value) -> bool {
+    custom_message.get("customType").and_then(Value::as_str)
+        == Some(pa_types::inbox_notice::INBOX_NOTICE_CUSTOM_TYPE)
+}
+
+/// The loud intake rejection for a caller-supplied row claiming the
+/// inbox notice kind.
+pub(crate) fn inbox_notice_intake_error() -> String {
+    format!(
+        "Invalid customMessage: the {} custom type is reserved for daemon-authored agent-inbox notices",
+        pa_types::inbox_notice::INBOX_NOTICE_CUSTOM_TYPE
+    )
+}
+
 /// One parked item's engine-minted internal-prompt provenance: the turn
 /// policy marks the admission class and `queue_visible` the invisible shape.
+/// The typed notice rows (child status, inbox notices) carry their OWN
+/// riders instead — one row, one internal class, never both.
 fn is_injected_prompt_item(item: &QueuedItem) -> bool {
-    item.policy == TurnPolicy::Injected && !item.queue_visible && !is_rlm_child_status_item(item)
+    item.policy == TurnPolicy::Injected
+        && !item.queue_visible
+        && !is_rlm_child_status_item(item)
+        && !is_inbox_notice_item(item)
 }
 
 #[cfg(test)]
@@ -982,7 +1392,13 @@ mod agent_message_tests;
 mod prompt_image_tests;
 
 #[cfg(test)]
+mod abort_scope_tests;
+#[cfg(test)]
 mod compaction_admission_tests;
+#[cfg(test)]
+mod inbox_queue_tests;
+#[cfg(test)]
+mod inbox_wake_policy_tests;
 #[cfg(test)]
 mod recovery_verdict_tests;
 #[cfg(test)]

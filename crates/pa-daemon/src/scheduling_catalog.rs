@@ -747,6 +747,8 @@ impl Supervisor {
                     .insert("promotedOwnerClientId".to_string(), json!(owner));
                 crate::descriptor::persist_worker(&resident.descriptor_path, &descriptor)
                     .map_err(|error| error.to_string())?;
+                // The promotion clear (the TS `promoteOwnedWorker`).
+                resident.clear_launch_env();
                 Ok(())
             }
             // An already-promoted session stays promoted; a foreign owner
@@ -959,9 +961,10 @@ mod tests {
             dir.path().join("worker.json"),
         );
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel(1);
-        *worker.cmd_tx.lock().await = Some(cmd_tx);
-        worker.note_connection_live();
-        worker.note_session_ready();
+        worker
+            .install_command_channel(worker.begin_connection(), cmd_tx)
+            .await;
+        worker.transition(crate::registry::WorkerTransition::SessionReady);
         supervisor.registry.insert(Arc::clone(&worker)).await;
         continue_tx.send(()).expect("resume scan");
 

@@ -1,7 +1,8 @@
 //! ACP wire types: the method surface, `session/update` payload shapes,
-//! and prompt-block parsing. The served surface is exactly what the TS
-//! product serves; ACP-spec methods it does not serve (`session/load`,
-//! `session/read`, `session/clone`, cwd adoption) are not invented here.
+//! and prompt-block parsing. The served surface is the TS product's plus
+//! the stable `session/list` and `session/load`; other ACP-spec methods
+//! (`session/resume`, `session/read`, `session/clone`, cwd adoption) are
+//! not served.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -43,11 +44,16 @@ pub struct McpCapabilities {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionCapabilities {
     pub close: CloseCapability,
+    pub list: ListCapability,
 }
 
 /// `{}`: present means `session/close` is served.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CloseCapability {}
+
+/// `{}`: present means `session/list` is served.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ListCapability {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,7 +91,8 @@ impl AcpToolKind {
     /// secondary escape hatch.
     pub fn of_tool(tool_name: &str) -> AcpToolKind {
         match tool_name {
-            "ipython" | "bash" => AcpToolKind::Execute,
+            name if pa_types::ai::is_python_tool_name(name) => AcpToolKind::Execute,
+            "bash" => AcpToolKind::Execute,
             "read" => AcpToolKind::Read,
             "edit" | "write" => AcpToolKind::Edit,
             _ => AcpToolKind::Other,
@@ -132,6 +139,9 @@ pub struct AcpStopReasonResponse {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "sessionUpdate")]
 pub enum AcpSessionUpdate {
+    /// A user message of a replayed conversation (`session/load`).
+    #[serde(rename = "user_message_chunk")]
+    UserMessageChunk { content: TextBlock },
     /// A streaming chunk of the assistant's visible answer.
     #[serde(rename = "agent_message_chunk")]
     AgentMessageChunk {
@@ -353,6 +363,54 @@ impl PromptParams {
     }
 }
 
+/// The `_session/steering` extension request params: the text blocks join
+/// with newlines; `messageId` dedupes retries within the session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SteeringParams {
+    pub session_id: String,
+    pub text: String,
+    pub message_id: Option<String>,
+}
+
+impl SteeringParams {
+    /// `Err` is the invalid-params reason.
+    pub fn parse(params: &Value) -> Result<SteeringParams, &'static str> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or("sessionId must be a string")?;
+        let texts = params
+            .get("prompt")
+            .and_then(Value::as_array)
+            .filter(|blocks| !blocks.is_empty())
+            .and_then(|blocks| {
+                blocks
+                    .iter()
+                    .map(|block| {
+                        (block.get("type").and_then(Value::as_str) == Some("text"))
+                            .then(|| block.get("text").and_then(Value::as_str))
+                            .flatten()
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or("steering requires text content blocks")?;
+        let text = texts.join("\n");
+        if text.trim().is_empty() {
+            return Err("steering text must not be blank");
+        }
+        let message_id = match params.get("messageId") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.is_empty() => Some(id.clone()),
+            Some(_) => return Err("messageId must be a non-empty string"),
+        };
+        Ok(SteeringParams {
+            session_id: session_id.to_string(),
+            text,
+            message_id,
+        })
+    }
+}
+
 /// The `session/set_config_option` request params.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetConfigOptionParams {
@@ -387,7 +445,7 @@ pub fn initialize_result(product_version: &str) -> InitializeResult {
     InitializeResult {
         protocol_version: 1,
         agent_capabilities: AgentCapabilities {
-            load_session: false,
+            load_session: true,
             prompt_capabilities: PromptCapabilities {
                 image: true,
                 embedded_context: true,
@@ -395,6 +453,7 @@ pub fn initialize_result(product_version: &str) -> InitializeResult {
             mcp_capabilities: Some(McpCapabilities { http: true }),
             session_capabilities: SessionCapabilities {
                 close: CloseCapability::default(),
+                list: ListCapability::default(),
             },
         },
         agent_info: AgentInfo {
@@ -402,7 +461,12 @@ pub fn initialize_result(product_version: &str) -> InitializeResult {
             title: "Prime Agent".to_string(),
             version: product_version.to_string(),
         },
-        meta: super::meta::prime_agent_meta(&super::meta::PrimeAgentSessionMeta::default()),
+        meta: {
+            let mut meta =
+                super::meta::prime_agent_meta(&super::meta::PrimeAgentSessionMeta::default());
+            meta["steering"] = serde_json::json!({ "supported": true });
+            meta
+        },
     }
 }
 
@@ -419,20 +483,23 @@ mod tests {
             json!({
                 "protocolVersion": 1,
                 "agentCapabilities": {
-                    "loadSession": false,
+                    "loadSession": true,
                     "promptCapabilities": { "image": true, "embeddedContext": true },
                     "mcpCapabilities": { "http": true },
-                    "sessionCapabilities": { "close": {} },
+                    "sessionCapabilities": { "close": {}, "list": {} },
                 },
                 "agentInfo": { "name": "prime-agent", "title": "Prime Agent", "version": "9.9.9" },
-                "_meta": { "ai.primeintellect.prime-agent": {} },
+                "_meta": {
+                    "ai.primeintellect.prime-agent": {},
+                    "steering": { "supported": true },
+                },
             })
         );
     }
 
     #[test]
     fn tool_kind_map_matches_the_ts_map() {
-        assert_eq!(AcpToolKind::of_tool("ipython"), AcpToolKind::Execute);
+        assert_eq!(AcpToolKind::of_tool("python_repl"), AcpToolKind::Execute);
         assert_eq!(AcpToolKind::of_tool("bash"), AcpToolKind::Execute);
         assert_eq!(AcpToolKind::of_tool("read"), AcpToolKind::Read);
         assert_eq!(AcpToolKind::of_tool("edit"), AcpToolKind::Edit);

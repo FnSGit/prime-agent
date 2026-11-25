@@ -2,28 +2,14 @@
 //! (harness/goal/etc.) and their settle/exit waits.
 
 use super::{
-    anyhow, json, lock, Arc, Duration, HostRequestPayload, Inner, Value,
+    anyhow, json, lock, Arc, Duration, HostRequestPayload, Inner, Value, END_TURN_REQUEST_TYPE,
     MAX_HANDLED_HOST_REQUEST_IDS,
 };
 
-/// The cell source attached to a host request is capped at this many characters (TS #2475:
-/// `MAX_CELL_SOURCE_CHARS`): the spawning cell's source rides on every host request it triggers.
-const MAX_CELL_SOURCE_CHARS: usize = 2 * 1024;
-
-/// Cap a cell source for host-request attachment: a longer one keeps the first
-/// `MAX_CELL_SOURCE_CHARS` characters and carries the truncation marker.
-fn cap_cell_source(code: &str) -> String {
-    if code.chars().count() <= MAX_CELL_SOURCE_CHARS {
-        code.to_string()
-    } else {
-        let head: String = code.chars().take(MAX_CELL_SOURCE_CHARS).collect();
-        format!("{head}\n[... cell source truncated at {MAX_CELL_SOURCE_CHARS} chars ...]")
-    }
-}
-
 impl Inner {
-    /// Dispatch one typed request from kernel code to the registered handler
-    /// and reply over the protocol. Unhandled requests answer with an error.
+    /// Dispatch one typed request from kernel code and reply over the
+    /// protocol: the manager answers `rlm.end_turn` itself, registered
+    /// handlers answer the rest, and unhandled requests answer with an error.
     pub(crate) fn start_host_request(self: &Arc<Self>, request_id: &str, data: Value) {
         {
             let mut g = lock(&self.guarded);
@@ -76,6 +62,31 @@ impl Inner {
             .and_then(Value::as_str)
             .filter(|t| !t.is_empty())
             .ok_or_else(|| anyhow!("host request payload must have a string type"))?;
+        if request_type == END_TURN_REQUEST_TYPE {
+            // The manager's own answer: mark the calling cell (the request
+            // names it; another cell may run beside it), and the flag rides
+            // the settled result so the turn ends once the batch settles.
+            let execution = obj
+                .get("cell")
+                .and_then(Value::as_str)
+                .and_then(|cell| lock(&self.guarded).active_execution(cell))
+                .ok_or_else(|| anyhow!("rlm.end_turn has no running cell to end the turn for"))?;
+            let mut buffers = lock(&execution.buffers);
+            // A cell that settled between the clone and this write could
+            // not carry the flag: answer the error, never a silent no-op.
+            if buffers.settled {
+                return Err(anyhow!("rlm.end_turn arrived after its cell settled"));
+            }
+            // A backgrounded cell's turn already returned: no turn is
+            // left to end.
+            if execution.detached.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow!(
+                    "rlm.end_turn ran in a backgrounded cell; its turn already returned"
+                ));
+            }
+            buffers.ended_turn = true;
+            return Ok(json!({ "endedTurn": true }));
+        }
         let handler = self
             .options
             .host_handlers
@@ -84,24 +95,7 @@ impl Inner {
                 anyhow!("host request type \"{request_type}\" is not available in this session")
             })?
             .clone();
-        // Tag the request with the cell that triggered it. Detached spawns fire after the
-        // scheduling cell goes idle, so fall back to that last cell's source.
-        let cell_source_code = {
-            let g = lock(&self.guarded);
-            g.active_execution
-                .as_ref()
-                .map(|e| cap_cell_source(&e.code))
-                .or_else(|| g.last_cell_code.as_deref().map(cap_cell_source))
-        };
-        let mut payload = obj.clone();
-        if let Some(code) = cell_source_code {
-            payload.insert("cellSourceCode".to_string(), Value::String(code));
-        }
-        handler(HostRequestPayload {
-            data: Value::Object(payload),
-            cell_source_code: None,
-        })
-        .await
+        handler(HostRequestPayload { data: data.clone() }).await
     }
 
     /// Wait (bounded) for the in-flight host request tasks to settle.
@@ -142,42 +136,5 @@ impl Inner {
                 return;
             }
         }
-    }
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn marker() -> String {
-        format!("\n[... cell source truncated at {MAX_CELL_SOURCE_CHARS} chars ...]")
-    }
-
-    #[test]
-    fn a_source_within_the_cap_attaches_verbatim() {
-        let code = "x".repeat(MAX_CELL_SOURCE_CHARS);
-        assert_eq!(cap_cell_source(&code), code);
-    }
-
-    #[test]
-    fn an_oversized_source_keeps_the_prefix_and_carries_the_marker() {
-        let code = "x".repeat(MAX_CELL_SOURCE_CHARS + 1);
-        let capped = cap_cell_source(&code);
-        let expected = format!("{}{}", "x".repeat(MAX_CELL_SOURCE_CHARS), marker());
-        assert_eq!(capped, expected);
-    }
-
-    #[test]
-    fn a_short_source_is_untouched() {
-        let code = "print(1)";
-        assert_eq!(cap_cell_source(code), code);
-    }
-
-    #[test]
-    fn the_cap_lands_on_a_character_boundary() {
-        // A multi-byte tail: the cap must slice by characters, never split one.
-        let code = format!("{}{}", "é".repeat(MAX_CELL_SOURCE_CHARS), "é");
-        let capped = cap_cell_source(&code);
-        assert!(capped.starts_with(&"é".repeat(MAX_CELL_SOURCE_CHARS)));
-        assert!(capped.ends_with(&marker()));
     }
 }

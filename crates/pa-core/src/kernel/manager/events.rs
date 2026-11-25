@@ -6,9 +6,9 @@ use super::{
     Arc, Event, ExecBuffers, ExecuteStatus, Guarded, Inner, KernelBashCommands, KernelError,
     StreamName, Value, AGENT_MESSAGE_DISPLAY_MIME, ATTACHMENT_DISPLAY_MIME,
     BASH_ACTIVITY_DISPLAY_MIME, BASH_COMMAND_DISPLAY_MIME, DIFF_DISPLAY_MIME,
-    MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS,
+    INBOX_MESSAGE_DISPLAY_MIME, MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS,
+    TRANSCRIPT_READ_DISPLAY_MIME,
 };
-use std::fmt::Write as _;
 
 impl Inner {
     pub(crate) fn handle_event(self: &Arc<Self>, event: Event) {
@@ -51,7 +51,11 @@ impl Inner {
                 self.dispatch_display(id.as_deref(), data);
             }
             Event::Ready { protocol } => {
-                if let Some(tx) = lock(&self.guarded).ready_tx.take() {
+                let ready_tx = lock(&self.guarded)
+                    .lifecycle
+                    .starting_mut()
+                    .and_then(|starting| starting.ready_tx.take());
+                if let Some(tx) = ready_tx {
                     let _ = tx.send(Ok(protocol));
                 }
             }
@@ -63,8 +67,8 @@ impl Inner {
                 self.route_stream(id.as_deref(), StreamName::Stderr, &text);
             }
             Event::Result { id, text } => {
-                let execution = lock(&self.guarded).active_execution.clone();
-                if let Some(execution) = execution.filter(|e| e.request_id == id) {
+                let execution = lock(&self.guarded).active_execution(&id);
+                if let Some(execution) = execution {
                     lock(&execution.buffers).result = Some(text);
                 }
             }
@@ -74,8 +78,10 @@ impl Inner {
                 evalue,
                 traceback,
             } => {
-                let execution = lock(&self.guarded).active_execution.clone();
-                match (execution.filter(|e| Some(&e.request_id) == id.as_ref()), id) {
+                let execution = id
+                    .as_deref()
+                    .and_then(|id| lock(&self.guarded).active_execution(id));
+                match (execution, id) {
                     (Some(execution), _) => {
                         let mut buffers = lock(&execution.buffers);
                         buffers.error = Some(KernelError {
@@ -115,8 +121,8 @@ impl Inner {
                     .get("status")
                     .and_then(Value::as_str)
                     .unwrap_or("error");
-                let execution = lock(&self.guarded).active_execution.clone();
-                if let Some(execution) = execution.filter(|e| e.request_id == id) {
+                let execution = lock(&self.guarded).active_execution(&id);
+                if let Some(execution) = execution {
                     {
                         let mut buffers = lock(&execution.buffers);
                         buffers.done_fields = Some(fields.clone());
@@ -150,38 +156,17 @@ impl Inner {
     /// stdout/stderr events: attributed to the active execution when the id
     /// matches, otherwise buffered as background output.
     fn route_stream(&self, id: Option<&str>, stream: StreamName, text: &str) {
-        let execution = lock(&self.guarded).active_execution.clone();
-        let Some(execution) = execution.filter(|e| Some(e.request_id.as_str()) == id) else {
+        let execution = id.and_then(|id| lock(&self.guarded).active_execution(id));
+        let Some(execution) = execution else {
             // Unowned output (null id, or another cell's id): never merge it
             // into the active cell's streams; buffer it as background output.
             self.append_background_output(text);
             return;
         };
         let mut buffers = lock(&execution.buffers);
-        let ExecBuffers {
-            stdout,
-            stdout_chars,
-            stdout_truncated,
-            stderr,
-            stderr_chars,
-            stderr_truncated,
-            ..
-        } = &mut *buffers;
         match stream {
-            StreamName::Stdout => append_truncated(
-                stdout,
-                stdout_truncated,
-                stdout_chars,
-                text,
-                execution.max_chars,
-            ),
-            StreamName::Stderr => append_truncated(
-                stderr,
-                stderr_truncated,
-                stderr_chars,
-                text,
-                execution.max_chars,
-            ),
+            StreamName::Stdout => buffers.stdout.push(text, execution.max_chars),
+            StreamName::Stderr => buffers.stderr.push(text, execution.max_chars),
         }
         drop(buffers);
         if let Some(on_stream) = &execution.opts.on_stream {
@@ -191,18 +176,12 @@ impl Inner {
 
     /// display events: diffs, attachments, sent agent messages, late or live.
     fn dispatch_display(&self, id: Option<&str>, data: &Value) {
-        let execution = lock(&self.guarded).active_execution.clone();
-        let matching = execution
-            .as_ref()
-            .filter(|e| Some(e.request_id.as_str()) == id);
+        let execution = id.and_then(|id| lock(&self.guarded).active_execution(id));
         // A settled cell keeps receiving late agent messages via its handler.
-        if matching.is_none() {
-            if self.dispatch_late_sent_agent_message(id, data) {
-                return;
-            }
+        let Some(execution) = execution else {
+            self.dispatch_late_sent_agent_message(id, data);
             return;
-        }
-        let execution = matching.expect("filter guarantees presence").clone();
+        };
         let settled = lock(&execution.buffers).settled;
         if settled && self.dispatch_late_sent_agent_message(id, data) {
             return;
@@ -220,13 +199,14 @@ impl Inner {
             Some(Err(_)) => {
                 buffers.attachment_oversized = true;
                 if !buffers.stderr.is_empty() {
-                    buffers.stderr.push('\n');
+                    buffers.stderr.push("\n", execution.max_chars);
                 }
-                let _ = write!(
-                    buffers.stderr,
-                    "attachment dropped: exceeds {MAX_ATTACHMENT_DATA_CHARS} base64 chars"
+                buffers.stderr.push(
+                    &format!(
+                        "attachment dropped: exceeds {MAX_ATTACHMENT_DATA_CHARS} base64 chars"
+                    ),
+                    execution.max_chars,
                 );
-                buffers.stderr_chars = buffers.stderr.chars().count();
                 buffers.status = ExecuteStatus::Error;
             }
             Some(Ok(attachment)) => buffers.attachments.push(attachment),
@@ -236,6 +216,12 @@ impl Inner {
             if let Some(message) = parse_sent_agent_message(payload) {
                 buffers.sent_agent_messages.push(message);
             }
+        }
+        if let Some(read) = data.get(TRANSCRIPT_READ_DISPLAY_MIME) {
+            buffers.transcript_reads.push(read.clone());
+        }
+        if let Some(message) = data.get(INBOX_MESSAGE_DISPLAY_MIME) {
+            buffers.inbox_messages.push(message.clone());
         }
         if let Some(payload) = data.get(BASH_COMMAND_DISPLAY_MIME) {
             if let (Some(command), Some(lines)) = (
@@ -259,13 +245,13 @@ impl Inner {
         }
     }
 
-    /// Unattributed stream text: attached to the active cell's background
-    /// buffer, or held for the next cell when the kernel is idle.
+    /// Unattributed stream text: attached to the newest running cell's
+    /// background buffer, or held for the next cell when the kernel is idle.
     fn append_background_output(&self, text: &str) {
         if text.is_empty() {
             return;
         }
-        let execution = lock(&self.guarded).active_execution.clone();
+        let execution = lock(&self.guarded).active_executions.last().cloned();
         if let Some(execution) = execution {
             let mut buffers = lock(&execution.buffers);
             if buffers.background_output_chars >= MAX_BACKGROUND_OUTPUT_CHARS {
@@ -314,8 +300,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::kernel::manager::ReplKernelManager;
-    use crate::kernel::shared::{BackgroundWorkSettledCallback, KernelManagerOptions};
+    use crate::kernel::manager::{ActiveExecution, ReplKernelManager};
+    use crate::kernel::shared::{
+        BackgroundWorkSettledCallback, ExecuteOptions, KernelManagerOptions,
+    };
     use crate::platform::process::Signal;
     use serde_json::json;
 
@@ -400,6 +388,39 @@ mod tests {
         );
         manager.inner.cleanup_resources(Signal::Term);
         assert_eq!(fired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn inbox_message_displays_collect_into_the_owning_cell() {
+        let manager = ReplKernelManager::new(KernelManagerOptions::default());
+        let (result_tx, _result_rx) = tokio::sync::oneshot::channel();
+        let execution = Arc::new(ActiveExecution {
+            request_id: "cell-1".to_string(),
+            started: std::time::Instant::now(),
+            max_chars: 1_000,
+            opts: ExecuteOptions::default(),
+            namespace_code: true,
+            restores_namespace: false,
+            buffers: std::sync::Mutex::new(ExecBuffers::default()),
+            result_tx: std::sync::Mutex::new(Some(result_tx)),
+            detached: std::sync::atomic::AtomicBool::new(false),
+            stop_signal: crate::kernel::cancellation::AbortSignal::default(),
+            settled_tx: tokio::sync::watch::channel(false).0,
+        });
+        lock(&manager.inner.guarded).active_executions = vec![Arc::clone(&execution)];
+        let messages = [
+            json!({ "id": "inbox-1", "class": "bash-done", "arrivedAtMs": 1, "text": "a", "meta": {} }),
+            json!({ "id": "inbox-2", "class": "heartbeat", "arrivedAtMs": 2, "text": "b", "meta": {} }),
+        ];
+        for message in &messages {
+            let mut data = serde_json::Map::new();
+            data.insert(INBOX_MESSAGE_DISPLAY_MIME.to_string(), message.clone());
+            manager.inner.handle_event(Event::Display {
+                id: Some("cell-1".to_string()),
+                data: Value::Object(data),
+            });
+        }
+        assert_eq!(lock(&execution.buffers).inbox_messages, messages);
     }
 
     #[test]

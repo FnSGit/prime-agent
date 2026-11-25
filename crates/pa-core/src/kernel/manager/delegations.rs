@@ -1,8 +1,8 @@
 //! `ReplKernelManager` delegations onto Inner.
 
 use super::{
-    AbortSignal, Arc, ExecuteOptions, Inner, InternalExecuteResult, ReplKernelManager, Request,
-    RestoreResult, SnapshotResult,
+    AbortSignal, Admission, Arc, ExecuteOptions, Inner, InternalExecuteResult, ReplKernelManager,
+    Request, RestoreResult, SnapshotResult,
 };
 
 impl ReplKernelManager {
@@ -43,10 +43,11 @@ impl ReplKernelManager {
 
     pub(crate) async fn wait_for_active_execution_to_clear_for_reuse(
         &self,
+        admission: Admission,
         signal: Option<&AbortSignal>,
     ) -> anyhow::Result<()> {
         self.inner
-            .wait_for_active_execution_to_clear_for_reuse(signal)
+            .wait_for_active_execution_to_clear_for_reuse(admission, signal)
             .await
     }
 
@@ -76,17 +77,15 @@ impl Inner {
     pub(crate) fn enqueue_request(
         self: &Arc<Self>,
         request: Request,
-        code: &str,
         opts: ExecuteOptions,
         execution_timeout_ms: Option<u64>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<InternalExecuteResult>> + Send>,
     > {
         let manager = self.as_manager();
-        let code = code.to_string();
         Box::pin(async move {
             manager
-                .enqueue_request(request, &code, opts, execution_timeout_ms)
+                .enqueue_request(request, opts, execution_timeout_ms)
                 .await
         })
     }

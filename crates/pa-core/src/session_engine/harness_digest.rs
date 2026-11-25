@@ -14,7 +14,7 @@ use crate::refinement::ranking::{
 };
 use crate::refinement::{load_harness_state, merge_harness_states, HarnessScope};
 
-use super::messages::{COMPACTION_SUMMARY_PREFIX, HARNESS_DIGEST_PREFIX, HARNESS_DIGEST_SUFFIX};
+use super::messages::{HARNESS_DIGEST_PREFIX, HARNESS_DIGEST_SUFFIX};
 
 #[cfg(test)]
 mod direction;
@@ -204,62 +204,6 @@ fn digest_from_frame(text: &str) -> Option<&str> {
     Some(end.trim_end_matches('\n'))
 }
 
-/// Whether one loop-context row is a delivered digest row: the custom wire
-/// shape, or the user turn a rebuild converted — matched byte-exactly against
-/// the digest's frame, so a quoting user turn survives the refresh.
-fn is_digest_row(message: &AgentMessage, latest_digest: Option<&str>) -> bool {
-    match message {
-        AgentMessage::Custom(custom) => {
-            custom
-                .payload
-                .get("customType")
-                .and_then(serde_json::Value::as_str)
-                == Some(super::headless::HARNESS_DIGEST_CUSTOM_TYPE)
-        }
-        AgentMessage::Standard(Message::User(user)) => latest_digest.is_some_and(|digest| {
-            loop_user_text(&user.content) == harness_digest_message_text(digest)
-        }),
-        AgentMessage::Standard(_) => false,
-    }
-}
-
-/// Strip a live compaction-summary row's superseded digest block: the summary text
-/// stays. The block must be the newest in-context digest's frame, never a quoting user turn.
-fn strip_compaction_digest_block(
-    message: AgentMessage,
-    latest_digest: Option<&str>,
-) -> AgentMessage {
-    let AgentMessage::Standard(Message::User(user)) = &message else {
-        return message;
-    };
-    let Some(digest) = latest_digest else {
-        return message;
-    };
-    let text = loop_user_text(&user.content);
-    let frame = format!("{HARNESS_DIGEST_PREFIX}{digest}{HARNESS_DIGEST_SUFFIX}\n\n");
-    let Some(summary_text) = text.strip_prefix(&frame) else {
-        return message;
-    };
-    if !summary_text.starts_with(COMPACTION_SUMMARY_PREFIX) {
-        return message;
-    }
-    let mut stripped = message;
-    let AgentMessage::Standard(Message::User(user)) = &mut stripped else {
-        return stripped;
-    };
-    match &mut user.content {
-        UserContent::Text(text) => *text = summary_text.to_string(),
-        UserContent::Parts(parts) => {
-            for part in parts.iter_mut() {
-                if let UserPart::Text(text) = part {
-                    text.text = summary_text.to_string();
-                }
-            }
-        }
-    }
-    stripped
-}
-
 /// The newest in-context digest and its state fingerprint: a fingerprint-less
 /// latest (a converted user turn) falls back to rendered-text comparison, and
 /// recency is by timestamp — out-of-context entries must not suppress delivery.
@@ -279,7 +223,7 @@ pub fn latest_context_digest_details(messages: &[AgentMessage]) -> Option<Latest
     ) {
         if latest
             .as_ref()
-            .is_none_or(|kept| timestamp > kept.timestamp)
+            .is_none_or(|kept| timestamp >= kept.timestamp)
         {
             *latest = Some(LatestContextDigest {
                 timestamp,
@@ -352,7 +296,7 @@ fn latest_typed_digest_details(messages: &[SessionAgentMessage]) -> Option<Lates
     ) {
         if latest
             .as_ref()
-            .is_none_or(|kept| timestamp as i64 > kept.timestamp)
+            .is_none_or(|kept| timestamp as i64 >= kept.timestamp)
         {
             *latest = Some(LatestContextDigest {
                 timestamp: timestamp as i64,
@@ -455,9 +399,23 @@ impl super::AgentSession {
         Ok(())
     }
 
+    /// Re-arm the deferred digest after an admission lost the run slot
+    /// before the prompt processed its rows: the digest delivery never ran,
+    /// so the next admission still owes it (rendered fresh from the live
+    /// state at that point).
+    pub(crate) fn rearm_digest_pending(&self) {
+        self.digest_pending
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// The deferred first-turn digest as the prompt row that rides the turn's
-    /// admission; the pending flag is consumed either way.
+    /// admission; disabled sessions defer the pending flag until enabled.
     pub(crate) async fn pending_digest_prompt_row(&self) -> anyhow::Result<Option<AgentMessage>> {
+        // Preserve the pending flag while disabled; a consumed delivery must
+        // never be re-armed merely by toggling the setting off and on.
+        if !self.harness_refinements_enabled() {
+            return Ok(None);
+        }
         if !self
             .digest_pending
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -477,6 +435,9 @@ impl super::AgentSession {
     /// relevance terms. `None` when the session carries no harness state; the
     /// disk read stays deferred to render time, so a snapshot reads fresh state.
     pub(crate) async fn harness_digest_inputs(&self) -> Option<HarnessDigestInputs> {
+        if !self.harness_refinements_enabled() {
+            return None;
+        }
         let context = self.harness_digest.clone()?;
         let recent_texts = self.recent_message_texts_newest_first().await;
         let goal = {
@@ -527,31 +488,17 @@ impl super::AgentSession {
 
     /// Deliver a stale digest onto an already-populated loop context: the row
     /// is pushed directly and persisted eagerly, without events. The fresh
-    /// digest is authoritative, so the append replaces older in-context copies.
+    /// digest is authoritative; older context rows stay byte-for-byte intact.
     async fn append_stale_harness_digest(&self) -> anyhow::Result<()> {
         let Some(render) = self.fresh_digest().await else {
             return Ok(());
         };
-        // The newest in-context digest is the provenance marker: the converted
-        // rows are its exact frame, so the strip never matches a quoting user turn.
-        let latest_digest = latest_context_digest_details(&self.agent.state().await.messages)
-            .map(|details| details.digest);
         let message = harness_digest_prompt_row(
             &render.digest,
             super::now_millis(),
             &render.state_fingerprint,
         );
-        let mut messages: Vec<AgentMessage> = self
-            .agent
-            .state()
-            .await
-            .messages
-            .into_iter()
-            .filter(|existing| !is_digest_row(existing, latest_digest.as_deref()))
-            .map(|row| strip_compaction_digest_block(row, latest_digest.as_deref()))
-            .collect();
-        messages.push(message);
-        self.agent.set_messages(messages).await;
+        self.agent.append_messages(vec![message]).await;
         let mut session = self.session.lock().await;
         persist_digest(&mut session, &render.digest, &render.state_fingerprint)?;
         Ok(())

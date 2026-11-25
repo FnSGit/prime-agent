@@ -83,6 +83,7 @@ pub enum McpServerConfig {
         /// Env var holding a static bearer token (skips OAuth).
         #[serde(
             rename = "bearerTokenEnvVar",
+            alias = "bearer_token_env_var",
             default,
             skip_serializing_if = "Option::is_none"
         )]
@@ -117,6 +118,24 @@ pub enum McpServerConfig {
             skip_serializing_if = "Option::is_none"
         )]
         call_timeout_ms: Option<u64>,
+        #[serde(rename = "clientId", default, skip_serializing_if = "Option::is_none")]
+        client_id: Option<String>,
+        #[serde(
+            rename = "callbackPort",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        callback_port: Option<u16>,
+        /// Secret of the pre-registered client, for servers that only issue confidential clients.
+        #[serde(
+            rename = "clientSecret",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        client_secret: Option<String>,
+        /// Space-separated scopes to request instead of the server's advertised ones.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scopes: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     Stdio {
@@ -242,6 +261,9 @@ pub(crate) struct ResolvedIntegration {
 pub type BeginLoginFuture = Box<dyn Future<Output = anyhow::Result<()>> + Send>;
 pub type BeginLoginFn = Arc<dyn Fn(String) -> BeginLoginFuture + Send + Sync>;
 
+/// Reads the current `mcpServers` setting.
+pub type UserServersFn = Arc<dyn Fn() -> Option<HashMap<String, McpServerConfig>> + Send + Sync>;
+
 pub struct McpManagerOptions {
     pub auth_storage: AuthStorage,
     /// Reads the current `mcpServers` setting; re-read on refresh.
@@ -357,11 +379,24 @@ impl McpManager {
     /// runtime): a credential another process wrote — the interactive
     /// client's `/mcp` key flow stores through its own storage instance —
     /// becomes visible to the next view read, like the settings re-read
-    /// above.
-    pub fn reload_auth_storage(&mut self) {
+    /// above. The reload's failure surfaces to the caller: a malformed
+    /// document or a lock that could not be acquired leaves the manager
+    /// serving its previous credentials, and a successful reload must
+    /// not be reported over that.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage reload's error when the document cannot be
+    /// read or parsed (a malformed `auth.json`, an unacquirable lock):
+    /// the manager keeps its previous credentials in that case.
+    pub fn reload_auth_storage(&mut self) -> Result<(), String> {
         let storage = self.auth_storage.clone();
         let mut handle = storage.blocking_lock();
         handle.reload();
+        match handle.load_error() {
+            Some(error) => Err(error.to_string()),
+            None => Ok(()),
+        }
     }
 
     /// The resolved integrations (login resolution and status displays).
@@ -520,12 +555,14 @@ impl McpManager {
         user_servers: std::collections::HashMap<String, McpServerConfig>,
         agent_dir: &std::path::Path,
     ) -> (Vec<String>, Vec<String>, McpManager) {
+        let user_servers: UserServersFn = Arc::new(move || Some(user_servers.clone()));
+        let oauth_user_servers = Arc::clone(&user_servers);
         let manager = McpManager::new(McpManagerOptions {
             auth_storage: crate::auth::AuthStorage::create_with_oauth(
                 agent_dir,
-                std::sync::Arc::new(McpOAuth::new()),
+                std::sync::Arc::new(McpOAuth::new(oauth_user_servers)),
             ),
-            get_user_servers: Box::new(move || Some(user_servers.clone())),
+            get_user_servers: Box::new(move || user_servers()),
             begin_login: None,
             agent_dir: Some(agent_dir.to_path_buf()),
             get_catalog_sources: None,
@@ -554,8 +591,8 @@ impl McpManager {
     /// Register the `mcp.*` host-request handlers: `refresh`/`config`/`begin_login` dispatch
     /// plumbing plus the inventory surface the kernel's generic `mcp` module reaches for.
     ///
-    /// The inventory handlers capture this manager so each request serves LIVE views; view
-    /// computation reads the blocking auth-store snapshot.
+    /// The `config` and inventory handlers capture this manager so each request serves
+    /// live views; inventory view computation reads the blocking auth-store snapshot.
     ///
     /// # Panics
     ///
@@ -593,22 +630,13 @@ impl McpManager {
             Ok(number.min(max_limit as u64) as usize)
         }
 
-        let (
-            auth,
-            acp_servers,
-            usage_refresh,
-            acp_servers_for_config,
-            integrations,
-            usage_config,
-            begin_login,
-        ) = {
+        let (auth, acp_servers, usage_refresh, acp_servers_for_config, usage_config, begin_login) = {
             let manager = manager.lock().unwrap();
             (
                 manager.auth_storage.clone(),
                 manager.acp_servers.clone(),
                 manager.usage_report.clone(),
                 manager.acp_servers.clone(),
-                manager.integrations.clone(),
                 manager.usage_report.clone(),
                 manager.begin_login.clone(),
             )
@@ -653,10 +681,11 @@ impl McpManager {
                 })
             }),
         );
+        let manager_for_config = std::sync::Arc::clone(manager);
         handlers.register(
             "mcp.config",
             host_handler(move |payload| {
-                let integrations = integrations.clone();
+                let manager = std::sync::Arc::clone(&manager_for_config);
                 let acp_servers = acp_servers_for_config.clone();
                 let usage_config = usage_config.clone();
                 Box::pin(async move {
@@ -680,7 +709,11 @@ impl McpManager {
                         }
                         return Ok(config);
                     }
-                    let Some(integration) = integrations.get(&server) else {
+                    let integration = {
+                        let manager = manager.lock().unwrap();
+                        manager.integrations.get(&server).cloned()
+                    };
+                    let Some(integration) = integration else {
                         return Ok(json!({}));
                     };
                     if !integration.user_declared {
@@ -989,15 +1022,6 @@ fn is_generic_server_name(name: &str) -> bool {
     chars.all(|char| char.is_ascii_alphanumeric() || char == '_' || char == '-')
 }
 
-impl ResolvedIntegration {
-    fn config_url(&self) -> Option<&str> {
-        match &self.config {
-            McpServerConfig::Http { url, .. } => Some(url.as_str()),
-            McpServerConfig::Stdio { .. } => None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,6 +1056,24 @@ mod tests {
             disabled_tools: None,
             startup_timeout_ms: None,
             call_timeout_ms: None,
+            client_id: None,
+            callback_port: None,
+            client_secret: None,
+            scopes: None,
+        }
+    }
+
+    #[test]
+    fn both_bearer_token_env_var_spellings_read() {
+        let expected = http_config("https://e.com/mcp", None, Some("MY_TOKEN"));
+        for key in ["bearerTokenEnvVar", "bearer_token_env_var"] {
+            let parsed: McpServerConfig = serde_json::from_value(serde_json::json!({
+                "type": "http",
+                "url": "https://e.com/mcp",
+                key: "MY_TOKEN"
+            }))
+            .unwrap();
+            assert_eq!(parsed, expected, "{key}");
         }
     }
 
@@ -1055,7 +1097,7 @@ mod tests {
         let manager = manager_with(Some(user_servers));
         let roster = manager.connection_roster();
         let names: Vec<&str> = roster.iter().map(|entry| entry.server.as_str()).collect();
-        assert_eq!(names, vec!["fixture-echo", "linear", "notion"]);
+        assert_eq!(names, vec!["fixture-echo", "linear", "notion", "slack"]);
         let fixture = &roster[0];
         assert!(fixture.connected);
         assert!(fixture.generic);
@@ -1111,7 +1153,7 @@ mod tests {
             ]
         );
         let status = manager.list_status();
-        assert_eq!(status.len(), 2);
+        assert_eq!(status.len(), 3);
         let linear = status.iter().find(|row| row.server == "linear").unwrap();
         assert!(!linear.enabled);
         assert!(linear.uses_oauth);
@@ -1208,19 +1250,21 @@ mod tests {
             },
         );
         let manager = std::sync::Arc::new(std::sync::Mutex::new(manager_with(Some(user_servers))));
-        assert_eq!(
-            manager
+        let gating_manager = Arc::clone(&manager);
+        let enabled = tokio::task::spawn_blocking(move || {
+            gating_manager
                 .lock()
                 .unwrap()
-                .get_enabled_persistent_generic_servers(),
-            vec!["fixture-echo".to_string()]
-        );
+                .get_enabled_persistent_generic_servers()
+        })
+        .await
+        .unwrap();
+        assert_eq!(enabled, vec!["fixture-echo".to_string()]);
         let mut handlers = HostRequestHandlers::default();
         McpManager::register_host_handlers(&manager, &mut handlers);
         let config = handlers.get("mcp.config").unwrap().clone();
         let result = config(crate::kernel::shared::HostRequestPayload {
             data: json!({ "server": "fixture-echo" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
@@ -1238,7 +1282,6 @@ mod tests {
         let config = handlers.get("mcp.config").unwrap().clone();
         let result = config(crate::kernel::shared::HostRequestPayload {
             data: json!({ "server": "nope" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
@@ -1261,18 +1304,14 @@ mod tests {
         let config = handlers.get("mcp.config").unwrap().clone();
         let result = config(crate::kernel::shared::HostRequestPayload {
             data: json!({ "server": "session-tool" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
         assert_eq!(result["type"], "stdio");
         assert_eq!(result["credentialSource"], "acp");
-        let error = config(crate::kernel::shared::HostRequestPayload {
-            data: json!({}),
-            cell_source_code: None,
-        })
-        .await
-        .unwrap_err();
+        let error = config(crate::kernel::shared::HostRequestPayload { data: json!({}) })
+            .await
+            .unwrap_err();
         assert_eq!(error.to_string(), "mcp.config requires a server");
         assert!(handlers.get("mcp.begin_login").is_none());
     }
@@ -1284,12 +1323,9 @@ mod tests {
         McpManager::register_host_handlers(&manager, &mut handlers);
         let list_plugins = handlers.get("mcp.list_plugins").expect("wired").clone();
         // Default page: the first 50 plugin cards, and the real catalog is present.
-        let page = list_plugins(crate::kernel::shared::HostRequestPayload {
-            data: json!({}),
-            cell_source_code: None,
-        })
-        .await
-        .unwrap();
+        let page = list_plugins(crate::kernel::shared::HostRequestPayload { data: json!({}) })
+            .await
+            .unwrap();
         assert!(page["plugins"].as_array().expect("plugins").len() > 1);
         assert!(
             page["plugins"]
@@ -1301,7 +1337,6 @@ mod tests {
         );
         let filtered = list_plugins(crate::kernel::shared::HostRequestPayload {
             data: json!({ "connectionStatus": "connected" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
@@ -1315,7 +1350,6 @@ mod tests {
         );
         let error = list_plugins(crate::kernel::shared::HostRequestPayload {
             data: json!({ "connectionStatus": "maybe" }),
-            cell_source_code: None,
         })
         .await
         .unwrap_err();
@@ -1325,7 +1359,6 @@ mod tests {
         );
         let error = list_plugins(crate::kernel::shared::HostRequestPayload {
             data: json!({ "connectionStatus": 7 }),
-            cell_source_code: None,
         })
         .await
         .unwrap_err();
@@ -1335,7 +1368,6 @@ mod tests {
         );
         let error = list_plugins(crate::kernel::shared::HostRequestPayload {
             data: json!({ "cursor": "not-digits" }),
-            cell_source_code: None,
         })
         .await
         .unwrap_err();
@@ -1345,7 +1377,6 @@ mod tests {
         );
         let error = list_plugins(crate::kernel::shared::HostRequestPayload {
             data: json!({ "limit": 0 }),
-            cell_source_code: None,
         })
         .await
         .unwrap_err();
@@ -1355,7 +1386,6 @@ mod tests {
         );
         let clamped = list_plugins(crate::kernel::shared::HostRequestPayload {
             data: json!({ "limit": 1000 }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
@@ -1368,7 +1398,6 @@ mod tests {
         if total > 2 {
             let first = list_plugins(crate::kernel::shared::HostRequestPayload {
                 data: json!({ "limit": 2 }),
-                cell_source_code: None,
             })
             .await
             .unwrap();
@@ -1378,7 +1407,6 @@ mod tests {
             assert_eq!(next_cursor, "2");
             let second = list_plugins(crate::kernel::shared::HostRequestPayload {
                 data: json!({ "limit": 2, "cursor": next_cursor }),
-                cell_source_code: None,
             })
             .await
             .unwrap();
@@ -1397,7 +1425,6 @@ mod tests {
         let search = handlers.get("mcp.search_plugins").expect("wired").clone();
         let result = search(crate::kernel::shared::HostRequestPayload {
             data: json!({ "query": "linear" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
@@ -1407,12 +1434,9 @@ mod tests {
             .any(|entry| entry["serviceId"] == json!("linear")));
         assert_eq!(result["nextCursor"], serde_json::Value::Null);
         for bad in [json!(["query", ""]), json!({}), json!({ "query": "   " })] {
-            let error = search(crate::kernel::shared::HostRequestPayload {
-                data: bad,
-                cell_source_code: None,
-            })
-            .await
-            .unwrap_err();
+            let error = search(crate::kernel::shared::HostRequestPayload { data: bad })
+                .await
+                .unwrap_err();
             assert_eq!(
                 error.to_string(),
                 "mcp.search_plugins requires a non-empty query"
@@ -1420,7 +1444,6 @@ mod tests {
         }
         let error = search(crate::kernel::shared::HostRequestPayload {
             data: json!({ "query": "linear", "limit": -3 }),
-            cell_source_code: None,
         })
         .await
         .unwrap_err();
@@ -1465,12 +1488,10 @@ mod tests {
         let mut handlers = HostRequestHandlers::default();
         McpManager::register_host_handlers(&manager, &mut handlers);
         let list_connections = handlers.get("mcp.list_connections").expect("wired").clone();
-        let result = list_connections(crate::kernel::shared::HostRequestPayload {
-            data: json!({}),
-            cell_source_code: None,
-        })
-        .await
-        .unwrap();
+        let result =
+            list_connections(crate::kernel::shared::HostRequestPayload { data: json!({}) })
+                .await
+                .unwrap();
         let connections = result["connections"].as_array().expect("connections");
         let mut ids = Vec::new();
         for entry in connections {

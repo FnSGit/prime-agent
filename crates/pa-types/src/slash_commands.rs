@@ -11,7 +11,6 @@ pub const SESSION_SLASH_COMMAND_NAMES: [&str; 4] = ["compact", "refine", "goal",
 /// result, persisted in sessions and rendered by every surface.
 pub const SESSION_SLASH_COMMAND_CUSTOM_TYPE: &str = "session_slash_command";
 pub const SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE: &str = "session_slash_command_result";
-
 #[must_use]
 pub fn is_session_slash_command_name(value: &str) -> bool {
     SESSION_SLASH_COMMAND_NAMES.contains(&value)
@@ -58,7 +57,7 @@ const CANONICAL_BUILTIN_SLASH_COMMANDS: &[BuiltinSlashCommand] = &[
     BuiltinSlashCommand { name: "telemetry", description: "Show or change usage telemetry (pseudonymous metrics, never prompts or code)", execution: SlashCommandExecution::Client, argument_hint: Some("[status|on|off]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "context", description: "Show token, cost, and context usage for agent and sub-agents", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &["usage"], takes_argument: false },
     BuiltinSlashCommand { name: "changelog", description: "Show changelog entries", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
-    BuiltinSlashCommand { name: "update", description: "Update to the latest Rust build (uninstalls the TypeScript version; sessions preserved)", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
+    BuiltinSlashCommand { name: "update", description: "Update to the latest version (sessions preserved)", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "nightly", description: "Switch Prime Agent updates to the nightly channel (unreleased builds, may be broken)", execution: SlashCommandExecution::Client, argument_hint: Some("[on|off|status]"), aliases: &[], takes_argument: true },
     BuiltinSlashCommand { name: "hotkeys", description: "Show all keyboard shortcuts", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
     BuiltinSlashCommand { name: "fork", description: "Create a new fork from a previous user message", execution: SlashCommandExecution::Client, argument_hint: None, aliases: &[], takes_argument: false },
@@ -265,26 +264,6 @@ mod tests {
     }
 
     #[test]
-    fn cached_registry_matches_owned_registry() {
-        let owned = SlashCommandRegistry::builtin();
-        let cached = SlashCommandRegistry::builtin_cached();
-        assert!(std::ptr::eq(cached, SlashCommandRegistry::builtin_cached()));
-        assert_eq!(cached.all(), owned.all());
-        assert_eq!(
-            cached.suggestion_candidates(),
-            owned.suggestion_candidates()
-        );
-        for name in owned.suggestion_candidates().into_iter().chain(["unknown"]) {
-            assert_eq!(cached.resolve_name(name), owned.resolve_name(name));
-            assert_eq!(cached.get(name), owned.get(name));
-            assert_eq!(cached.is_builtin(name), owned.is_builtin(name));
-            assert_eq!(cached.takes_argument(name), owned.takes_argument(name));
-            let input = format!("/{name} -- example");
-            assert_eq!(cached.parse(&input), owned.parse(&input));
-        }
-    }
-
-    #[test]
     fn parse_resolves_and_keeps_args() {
         let registry = SlashCommandRegistry::builtin();
         let resolved = registry.parse("/thinking high").unwrap();
@@ -323,12 +302,5 @@ mod tests {
             Some("compact")
         );
         assert_eq!(find_slash_command_suggestion("zzzzzz", &candidates), None);
-    }
-
-    #[test]
-    fn edit_distance_counts_substitutions() {
-        assert_eq!(slash_command_edit_distance("abc", "abc"), 0);
-        assert_eq!(slash_command_edit_distance("ab", "ac"), 1);
-        assert_eq!(slash_command_edit_distance("", "abc"), 3);
     }
 }

@@ -2,7 +2,7 @@
 //! command-catalog refresh/fold, and the shared connection-state read.
 use super::{
     create_session, effort_picker, info_commands, terminal_columns, AgentView, AuthSelectorKind,
-    ChatEntry, CommandCatalogUpdate, DaemonCommand, DockFold, Duration, InfoContent, Map,
+    ChatEntry, CommandCatalogUpdate, DaemonCommand, DockFold, Duration, InfoContent, Map, Overlay,
     PendingConfirm, RebuildKind, Result, SessionUi, SlashCommandExecution, SlashCommandRegistry,
     StatusKind, SubmitBehavior, Value, UI_REQUEST_TIMEOUT_MS,
 };
@@ -128,7 +128,38 @@ impl SessionUi {
                 self.note("Usage: /clear", view);
             }
             "new" => {
+                // The raw suffix after the typed command name (TS parses
+                // `text.slice(4)`): the leading separator and the verbatim
+                // prompt survive, where the trimmed `resolved.args` would
+                // lose them.
+                let options = match crate::new_session_command::parse_new_session_command(
+                    &text[1 + resolved.original_name.len()..],
+                ) {
+                    Ok(options) => options,
+                    Err(message) => {
+                        // The draft the submit drained restores next to the
+                        // error row (TS `editor.setText(text)` + `showError`).
+                        view.editor.set_text(text);
+                        self.error_row(&message, view);
+                        return Ok(());
+                    }
+                };
                 self.start_new_session(view).await?;
+                if let Some(name) = options.name {
+                    if !self.set_session_name(&name, view).await {
+                        // TS parity (`handleClearCommand`'s catch): the
+                        // rename failed after the session exists — the
+                        // prompt restores into the editor and never submits.
+                        if let Some(prompt) = options.prompt.as_deref() {
+                            view.editor.set_text(prompt);
+                        }
+                        return Ok(());
+                    }
+                }
+                if let Some(prompt) = options.prompt {
+                    view.editor.add_to_history(&prompt);
+                    self.send_prompt(&prompt, SubmitBehavior::Steer, view)?;
+                }
             }
             // `/quit` detaches and exits (the session keeps running in the daemon).
             "quit" => {
@@ -193,7 +224,7 @@ impl SessionUi {
                     .map(str::to_string);
                 match effort_picker::effort_command(&levels, current.as_deref(), &resolved.args) {
                     effort_picker::EffortCommandOutcome::Open(picker) => {
-                        view.effort_picker = Some(picker);
+                        view.overlay = Some(Overlay::ChoicePicker(picker));
                         self.track_feature_outcome("effort", "initiated", None);
                     }
                     effort_picker::EffortCommandOutcome::Unsupported => {
@@ -484,10 +515,8 @@ impl SessionUi {
             // update replaces only the on-disk binary, so the new build
             // takes effect on restart and nothing here blocks or tears
             // down; there is no busy guard to keep). The confirm carries
-            // the preserve invariant: the update uninstalls the
-            // TypeScript version and installs the latest Rust build;
-            // sessions and configuration (~/.prime/agent) are never
-            // touched.
+            // the preserve invariant: sessions and configuration
+            // (~/.prime/agent) are never touched.
             "update" => {
                 if !resolved.args.trim().is_empty() {
                     view.editor.set_text(text);
@@ -505,11 +534,13 @@ impl SessionUi {
                 view.editor.set_text("");
                 // The message is hand-wrapped to fit the panel rows (the
                 // confirm renders each line truncated, never wrapped).
-                view.confirm = Some(crate::confirm::ConfirmPanel::yes_no(
-                    "Update Prime Agent",
-                    "Update uninstalls the TypeScript version and installs the latest Rust build;\nyour sessions and configuration (~/.prime/agent) are never touched.\n\nThe update runs in the background — restart prime-agent after it\nfinishes to run the new build.",
-                ));
-                self.pending_confirm = Some(PendingConfirm::Update);
+                view.overlay = Some(Overlay::Confirm {
+                    panel: crate::confirm::ConfirmPanel::yes_no(
+                        "Update Prime Agent",
+                        "Update installs the latest Prime Agent build;\nyour sessions and configuration (~/.prime/agent) are never touched.\n\nThe update runs in the background — restart prime-agent after it\nfinishes to run the new build.",
+                    ),
+                    pending: PendingConfirm::Update,
+                });
                 self.dirty = true;
             }
             // The auth flows run in the client process; other management subcommands
@@ -521,7 +552,7 @@ impl SessionUi {
                 self.open_mcp_view("/plugins", view, "").await?;
                 let search = resolved.args.trim();
                 if !search.is_empty() {
-                    if let Some(mcp) = view.mcp_view.as_mut() {
+                    if let Some(Overlay::Mcp(mcp)) = view.overlay.as_mut() {
                         mcp.paste(search);
                     }
                 }
@@ -622,11 +653,16 @@ impl SessionUi {
                     Ok(tree) => {
                         // TS render width: clamp(columns - 2, 60, 120).
                         let width = terminal_columns().saturating_sub(2).clamp(60, 120);
+                        let factory_runs =
+                            crate::factory_view::parse_factory_runs(&self.factory_graph);
                         self.open_info_panel(
                             view,
                             None,
                             InfoContent::Rows(info_commands::context_tree_rows(
-                                &tree, width, scope,
+                                &tree,
+                                width,
+                                scope,
+                                &factory_runs,
                             )),
                         );
                         self.track_menu_opened("context", "command");
@@ -737,26 +773,7 @@ impl SessionUi {
                     }
                     return Ok(());
                 }
-                match self
-                    .bounded_request(
-                        Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
-                        DaemonCommand::SetSessionName {
-                            id: None,
-                            active_session_id: self.active_session_id.clone(),
-                            name: name.to_string(),
-                            worker_token: None,
-                            rest: Map::default(),
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        self.session_name = Some(name.to_string());
-                        view.chrome.chat_name = self.session_display();
-                        self.plain_row(&format!("Session name set: {name}"), view);
-                    }
-                    Err(error) => self.error_row(&format!("{error:#}"), view),
-                }
+                self.set_session_name(name, view).await;
             }
             "fast" => {
                 if !resolved.args.is_empty() {
@@ -827,6 +844,38 @@ impl SessionUi {
             }
         }
         Ok(())
+    }
+
+    /// Rename the active session through the daemon's `SetSessionName` seam —
+    /// the one path the `/name` and `/new --name` arms share. On success the
+    /// local name, the chrome's chat title, and the `Session name set:` row
+    /// update; on failure the error row reports and the caller learns the
+    /// rename did not land.
+    async fn set_session_name(&mut self, name: &str, view: &mut AgentView) -> bool {
+        match self
+            .bounded_request(
+                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
+                DaemonCommand::SetSessionName {
+                    id: None,
+                    active_session_id: self.active_session_id.clone(),
+                    name: name.to_string(),
+                    worker_token: None,
+                    rest: Map::default(),
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                self.session_name = Some(name.to_string());
+                view.chrome.chat_name = self.session_display();
+                self.plain_row(&format!("Session name set: {name}"), view);
+                true
+            }
+            Err(error) => {
+                self.error_row(&format!("{error:#}"), view);
+                false
+            }
+        }
     }
 
     /// Report a menu surface opening (`tui menu opened`), fire-and-forget;

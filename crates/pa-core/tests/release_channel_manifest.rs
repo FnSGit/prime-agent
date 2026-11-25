@@ -113,9 +113,17 @@ fn run_step(script: &str, cwd: &Path, release_version: &str) -> std::process::Ou
 }
 
 fn python(script: &Path, args: &[&std::ffi::OsStr]) -> std::process::Output {
+    // The assembler's fixture repo has no Cargo workspace for cargo-about to
+    // scan; the release scripts' stand-in writes placeholder notices.
+    let fake_cargo_about = workspace_root().join("scripts/release/testdata/bin");
+    let path = std::env::join_paths(std::iter::once(fake_cargo_about).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("join PATH");
     Command::new("python3")
         .arg(script)
         .args(args)
+        .env("PATH", path)
         .current_dir(workspace_root())
         .output()
         .expect("run the release script")
@@ -250,17 +258,21 @@ fn the_workflow_wires_the_channel_manifest_producer() {
         files.contains("release-out/*.json"),
         "the attach list must carry the channel manifest via a json glob"
     );
-    // A -beta* tag attaches as a GitHub PRE-RELEASE so the nightly can never take the Latest
-    // pointer; the stable channel's download base (.../releases/latest/download/) keeps serving the
-    // last stable release's latest.json (Bugbot: beta tags steal GitHub Latest).
+    // Only stable tags attach individual GitHub releases. Beta assets use the
+    // rolling nightly release and versioned R2 archive instead.
+    assert_eq!(
+        attach_step.r#if.as_deref(),
+        Some("${{ !contains(github.ref_name, '-') }}"),
+        "individual GitHub releases are stable-only"
+    );
     let prerelease = attach_step
         .with
         .as_ref()
         .and_then(|with| with.prerelease.as_deref())
         .expect("the attach step must decide prerelease-ness");
     assert_eq!(
-        prerelease, "${{ contains(github.ref_name, '-') }}",
-        "the attach step must mark prerelease-tag releases as prereleases"
+        prerelease, "false",
+        "the stable attachment remains a non-prerelease"
     );
     // Every tag promotes under its own group: a queued promotion is never
     // canceled by another tag's push, so every published tag gets its
@@ -334,16 +346,16 @@ fn the_rolling_nightly_refresh_is_a_serialized_job() {
         .as_deref()
         .expect("the refresh step runs a script");
     assert!(run.contains("gh release upload nightly"), "{run}");
-    assert!(run.contains("release-out/beta.json"), "{run}");
+    assert!(run.contains("release-out/*.json"), "{run}");
     assert!(run.contains("--clobber"), "{run}");
     assert!(run.contains("--prerelease"), "{run}");
     assert!(run.contains("release-out/prime-agent-*.tar.gz"), "{run}");
     // The newest-wins guard: re-runs of an older tag must never clobber a newer rolling beta.json;
     // gh release download's destination flag is --dir (Bugbot: --output-dir was discarded and never
     // wrote the guard file). The guard FAILS CLOSED: a release carrying an unreadable beta.json is
-    // never clobbered (Bugbot: a discarded download failure fell through to --clobber), while a
-    // release with NO beta.json asset (a partial earlier refresh) has nothing to protect - the
-    // clobber heals it.
+    // never clobbered (Bugbot: a discarded download failure fell through to --clobber), and a
+    // witnessless release clobbers only when its own tarball asset names carry no newer version -
+    // an empty release (no versioned assets at all) heals unconditionally.
     assert!(run.contains("sort -V"), "{run}");
     assert!(run.contains("skipping the refresh"), "{run}");
     assert!(run.contains(r#"--dir "$guard""#), "{run}");
@@ -537,6 +549,10 @@ fn assert_reader_artifacts_are_truthful(release: &LatestRelease, out: &Path) {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "compiles and splits a Linux ELF fixture (gcc -Wl,--build-id)"
+)]
 fn assembled_archives_carry_the_platform_alias_the_reader_demands() {
     let (_, workflow) = load_workflow();
     let emit_run = channel_step_run(&workflow);
@@ -553,6 +569,7 @@ fn assembled_archives_carry_the_platform_alias_the_reader_demands() {
     .expect("runtime manifest");
     std::fs::create_dir_all(repo.join("skills")).expect("skills dir");
     std::fs::write(repo.join("LICENSE"), "fixture license\n").expect("LICENSE");
+    std::fs::write(repo.join("deny.toml"), "[licenses]\nallow = [\"MIT\"]\n").expect("deny.toml");
     std::fs::write(repo.join("README.md"), "fixture readme\n").expect("README.md");
     // The fail-closed Linux assembler accepts only a paired shipped ELF +
     // decoder from split_debug.py, so the fixture compiles a tiny real ELF

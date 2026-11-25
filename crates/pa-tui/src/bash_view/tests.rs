@@ -15,6 +15,12 @@ fn theme() -> Theme {
     Theme::builtin("prime", ColorMode::TrueColor)
 }
 
+/// Enter on row `id`'s list row: its detail opens.
+fn open(view: &mut BashView, id: &str) -> BashViewAction {
+    view.select(id);
+    view.handle_key("enter", &kb())
+}
+
 fn activities() -> Vec<BashActivity> {
     parse_bash_activities(&json!({"activities": [
         {"id":"a","command":"cargo build --release","pid":42,"startedAt":"2026-09-22T01:00:00Z","status":"running","durationMs":3412},
@@ -101,10 +107,8 @@ fn the_list_renders_columned_rows_and_one_hint() {
         1,
         "the close hint appears once: {text:?}"
     );
-    assert!(text
-        .iter()
-        .any(|row| row
-            .contains("\u{2191}/\u{2193} move \u{b7} Enter open \u{b7} \u{2190}/Esc close")));
+    assert!(text.iter().any(|row| row
+        .contains("\u{2191}/\u{2193} move \u{b7} Enter/\u{2192} open \u{b7} \u{2190}/Esc close")));
     for line in &frame {
         assert!(crate::width::spans_width(line) <= 70);
     }
@@ -114,6 +118,7 @@ fn the_list_renders_columned_rows_and_one_hint() {
 fn the_list_hint_drops_unbound_keys() {
     let mut cfg = crate::keybindings::KeybindingsConfig::new();
     cfg.insert("app.modal.back".to_string(), Vec::new());
+    cfg.insert("app.modal.open".to_string(), Vec::new());
     let kb = KeybindingsManager::with_user_bindings(cfg);
     let view = BashView::new(activities(), 24);
     let frame = view.render(&theme(), 70, &kb);
@@ -121,7 +126,7 @@ fn the_list_hint_drops_unbound_keys() {
     assert!(
         text.iter()
             .any(|row| row.contains("\u{2191}/\u{2193} move \u{b7} Enter open \u{b7} Esc close")),
-        "the emptied back binding drops the arrow: {text:?}"
+        "the emptied open and back bindings drop their arrows: {text:?}"
     );
 }
 
@@ -240,6 +245,7 @@ fn the_pane_runs_to_the_bottom() {
             status: "finished".to_string(),
             exit_code: Some(0),
             duration_ms: Some(u64::from(n) * 1_000),
+            persistent: false,
         })
         .collect();
     for viewport in [10usize, 16, 24] {
@@ -313,6 +319,24 @@ fn enter_opens_the_detail_and_the_cancel_action() {
     assert_eq!(open_id, "b");
     assert_eq!(view.handle_key("enter", &kb()), BashViewAction::None);
     let _ = first_generation;
+}
+
+#[test]
+fn right_opens_the_selected_row_like_enter() {
+    let mut view = BashView::new(activities(), 24);
+    let action = view.handle_key("right", &kb());
+    let BashViewAction::OpenDetail { id, .. } = &action else {
+        panic!("right opens the selected row: {action:?}");
+    };
+    assert_eq!(id, "a");
+    // In the detail Right is not Enter: the running row is not killed.
+    assert_eq!(view.handle_key("right", &kb()), BashViewAction::None);
+    assert_eq!(
+        view.mode,
+        Mode::Detail {
+            id: "a".to_string()
+        }
+    );
 }
 
 /// No labeled-pair blocks, no section labels, no duplicated title.
@@ -1108,4 +1132,120 @@ fn durations_format_compactly() {
     assert_eq!(format_duration(Some(780)), "780ms");
     assert_eq!(format_duration(Some(3_412)), "3.4s");
     assert_eq!(format_duration(Some(125_000)), "2m 05s");
+}
+
+/// The dock's shells row lists only the running shells, each `<command, truncated> · <elapsed>`;
+/// done and failed runs stay rows inside the bash view.
+#[test]
+fn the_dock_shell_items_list_running_shells_only() {
+    let mut rows = activities();
+    rows.extend(failed_activities());
+    rows.extend(parse_bash_activities(&json!({"activities": [
+        {"id":"long","command":"python -m pytest tests/integration --maxfail=1 -x","status":"running","durationMs":125_000},
+    ]})));
+    assert_eq!(
+        dock_shell_items(&rows),
+        vec![
+            "cargo build --release · 3.4s",
+            "python -m pytest tests/integrat… · 2m 05s",
+        ]
+    );
+}
+
+#[test]
+fn replacing_the_entire_view_rejects_previous_output_and_errors() {
+    let mut previous = BashView::new(activities(), 40);
+    open(&mut previous, "a");
+    let old_generation = previous.detail_generation;
+    for id in ["a", "b"] {
+        let mut replacement = BashView::new(activities(), 40);
+        open(&mut replacement, id);
+        replacement.set_output(id, "current output", replacement.detail_generation);
+        replacement.set_output(id, "stale output", old_generation);
+        replacement.set_error("stale error".to_string(), true, Some(old_generation));
+        let text = frame_text(&replacement.render(&theme(), 70, &kb())).join("\n");
+        assert!(text.contains("current output"), "{text}");
+        assert!(
+            !text.contains("stale output") && !text.contains("stale error"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn registry_changes_preserve_failed_tail_fetches_and_their_retry() {
+    let mut view = BashView::new(activities(), 40);
+    let action = open(&mut view, "a");
+    let BashViewAction::OpenDetail { generation, .. } = action else {
+        panic!("open detail")
+    };
+    view.set_error(
+        "Bash output: unavailable".to_string(),
+        true,
+        Some(generation),
+    );
+    let mut refreshed = activities();
+    refreshed[0].command = "changed metadata".to_string();
+    view.apply_activities(refreshed);
+    view.clear_error();
+    let text = frame_text(&view.render(&theme(), 70, &kb())).join("\n");
+    assert!(text.contains("Bash output: unavailable"), "{text}");
+    assert_eq!(
+        view.handle_key("up", &kb()),
+        BashViewAction::OpenDetail {
+            id: "a".to_string(),
+            generation,
+        }
+    );
+    view.set_output("a", "recovered output", generation);
+    let text = frame_text(&view.render(&theme(), 70, &kb())).join("\n");
+    assert!(
+        text.contains("recovered output") && !text.contains("unavailable"),
+        "{text}"
+    );
+    view.set_error("Bash output: row gone".to_string(), true, Some(generation));
+    view.apply_activities(Vec::new());
+    view.clear_error();
+    assert!(
+        view.error.is_none(),
+        "a vanished row retires its fetch error"
+    );
+}
+
+/// The hosts clear a kill error before they apply the refresh. A refresh that drops the open
+/// detail's row still retires that detail's fetch error, without a second changed refresh.
+#[test]
+fn dropping_the_detail_retires_its_fetch_error() {
+    let mut view = BashView::new(activities(), 40);
+    let BashViewAction::OpenDetail { generation, .. } = open(&mut view, "a") else {
+        panic!("open detail")
+    };
+    view.set_error(
+        "Bash output: unavailable".to_string(),
+        true,
+        Some(generation),
+    );
+    view.clear_error();
+    view.apply_activities(activities().split_off(1));
+    let text = frame_text(&view.render(&theme(), 70, &kb())).join("\n");
+    assert!(!text.contains("unavailable"), "{text}");
+}
+
+/// Only running shells count, and the persistent ones among them; a finished persistent shell
+/// counts in neither.
+#[test]
+fn running_shell_counts_skip_finished_shells() {
+    let data = json!({"activities": [
+        {"id": "a", "command": "x", "status": "running", "persistent": true},
+        {"id": "b", "command": "y", "status": "running"},
+        {"id": "c", "command": "z", "status": "done", "persistent": true},
+        {"id": "d", "command": "w", "status": "failed"},
+    ]});
+    assert_eq!(
+        running_shell_counts(&data),
+        ShellCounts {
+            running: 2,
+            persistent: 1,
+        }
+    );
 }

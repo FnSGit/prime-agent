@@ -111,7 +111,9 @@ fn get_message_from_entry(entry: &FileEntry) -> Option<AgentMessage> {
             _ => Some(message.clone()),
         },
         FileEntry::CustomMessage { payload, .. } => {
-            if payload.custom_type == "harness_digest" {
+            if payload.custom_type == "harness_digest"
+                || payload.custom_type == super::ipython_state::IPYTHON_STATE_CUSTOM_TYPE
+            {
                 return None;
             }
             Some(AgentMessage::Custom(pa_types::session::CustomMessage {
@@ -149,6 +151,14 @@ fn get_message_from_entry(entry: &FileEntry) -> Option<AgentMessage> {
 /// is hit. File ops are collected from ALL entries (cumulative tracking).
 #[must_use]
 pub fn prepare_branch_entries(entries: &[FileEntry], token_budget: u64) -> BranchPreparation {
+    prepare_branch_entries_with_refinements(entries, token_budget, /*enabled*/ true)
+}
+
+fn prepare_branch_entries_with_refinements(
+    entries: &[FileEntry],
+    token_budget: u64,
+    enabled: bool,
+) -> BranchPreparation {
     let mut file_ops = FileOperations::default();
     // Cumulative tracking from prior branch summaries (never hooked ones).
     for entry in entries {
@@ -167,6 +177,17 @@ pub fn prepare_branch_entries(entries: &[FileEntry], token_budget: u64) -> Branc
     let mut total_tokens = 0u64;
     for entry in entries.iter().rev() {
         let Some(message) = get_message_from_entry(entry) else {
+            continue;
+        };
+        // Disabled harness content must not consume budget or terminate selection.
+        let message = if enabled {
+            Some(message)
+        } else {
+            super::refinement_gate::without_refinements(vec![message])
+                .into_iter()
+                .next()
+        };
+        let Some(message) = message else {
             continue;
         };
         extract_file_ops_from_message(&message, &mut file_ops);
@@ -195,7 +216,7 @@ pub fn prepare_branch_entries(entries: &[FileEntry], token_budget: u64) -> Branc
 
 const BRANCH_SUMMARY_PREAMBLE: &str = "The user explored a different conversation branch before returning here.\nSummary of that exploration:\n\n";
 
-const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
+const BRANCH_SUMMARY_PROMPT: &str = "Create a structured summary of this conversation branch for context when returning later.\n\nUse this EXACT format:\n\n## Goal\n[What was the user trying to accomplish in this branch?]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Work that was started but not finished]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Outstanding Work\n- [Running subagents: name / task / status (recovery pointer: rlm.list_subagents())]\n- [Background bash handles: command / status (recovery: the [bash-done] notification; a lost handle cannot be re-awaited)]\n- [Active heartbeats and the goal: schedule / objective (recovery pointers: rlm_heartbeat.list() and goal.get())]\n- [Or \"(none)\" if nothing is in flight]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [What should happen next to continue this work]\n\nKeep each section concise. Preserve exact file paths, function names, and error messages.";
 
 /// Build the branch-summary request messages for the model.
 #[must_use]
@@ -205,7 +226,23 @@ pub fn build_branch_summary_request(
     custom_instructions: Option<&str>,
     replace_instructions: bool,
 ) -> (Vec<AgentMessage>, BranchPreparation) {
-    let preparation = prepare_branch_entries(entries, token_budget);
+    build_branch_summary_request_with_refinements(
+        entries,
+        token_budget,
+        custom_instructions,
+        replace_instructions,
+        /*enabled*/ true,
+    )
+}
+
+fn build_branch_summary_request_with_refinements(
+    entries: &[FileEntry],
+    token_budget: u64,
+    custom_instructions: Option<&str>,
+    replace_instructions: bool,
+    enabled: bool,
+) -> (Vec<AgentMessage>, BranchPreparation) {
+    let preparation = prepare_branch_entries_with_refinements(entries, token_budget, enabled);
     let messages = if preparation.messages.is_empty() {
         Vec::new()
     } else {
@@ -265,6 +302,9 @@ pub struct GenerateBranchSummaryOptions<'a> {
     /// When present, the summary call resolves its model through the
     /// `auxiliaryModel` setting with a context-window fit check.
     pub auxiliary: Option<&'a super::auxiliary_model::AuxiliaryModelContext>,
+    /// The owning conversation's id (TS `branch-summarization.ts` passes `sessionId`), so
+    /// providers that route by conversation (opencode's `x-opencode-session`) accept the call.
+    pub session_id: Option<&'a str>,
 }
 
 /// The default reserve budget.
@@ -322,6 +362,7 @@ pub async fn generate_branch_summary(
         replace_instructions,
         reserve_tokens,
         auxiliary,
+        session_id,
     } = options;
     // The branch summary runs with its own prompt prefix, so on the session model it
     // re-reads the whole branch — route it to the auxiliary model when its known window fits.
@@ -371,11 +412,25 @@ pub async fn generate_branch_summary(
         128_000
     };
     let token_budget = context_window.saturating_sub(reserve_tokens);
-    let (request_messages, preparation) = build_branch_summary_request(
+    let enabled = match auxiliary {
+        Some(context) => {
+            let context = context.clone();
+            tokio::task::spawn_blocking(move || {
+                let settings =
+                    crate::settings::SettingsManager::create(&context.cwd, &context.agent_dir);
+                super::refinement_gate::enabled(Some(&settings))
+            })
+            .await
+            .unwrap_or(false)
+        }
+        None => true,
+    };
+    let (request_messages, preparation) = build_branch_summary_request_with_refinements(
         entries,
         token_budget,
         custom_instructions,
         replace_instructions,
+        enabled,
     );
     if request_messages.is_empty() {
         let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
@@ -403,20 +458,25 @@ pub async fn generate_branch_summary(
             .collect(),
         tools: None,
     };
-    let stream_options =
+    let mut stream_options =
         pa_ai::types::SimpleStreamOptions::from_base(pa_ai::types::StreamOptions {
             max_tokens: Some(BRANCH_SUMMARY_MAX_TOKENS),
             api_key,
+            session_id: session_id.map(str::to_string),
+            // One-off prompts ride SSE: they keep the conversation id (cache key, opencode routing)
+            // but never take or replace the session's Codex WebSocket and its continuation.
+            transport: Some(pa_ai::types::Transport::Sse),
             headers: summary_headers.map(|headers| headers.into_iter().collect()),
             ..Default::default()
         });
+    stream_options.reasoning = pa_types::ai::minimum_reasoning(model);
     let response = match pa_ai::complete_simple(model, &context, Some(stream_options)).await {
         Ok(response) => response,
         Err(error) => {
             return BranchSummaryResult {
                 error: Some(format!("{error:#}")),
                 ..Default::default()
-            }
+            };
         }
     };
     if response.stop_reason == pa_types::ai::StopReason::Aborted {
@@ -482,6 +542,69 @@ mod tests {
     }
 
     #[test]
+    fn disabled_refinement_notices_cannot_exhaust_the_branch_summary_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = crate::session::manager::SessionManager::in_memory(tmp.path());
+        let conversation = user("Earlier conversation about the task");
+        session.append_message(conversation.clone()).unwrap();
+        session
+            .append_custom_message(
+                "refinement_notice",
+                pa_types::ai::UserContent::Text("saved refinement ".repeat(500)),
+                /*display*/ false,
+                None,
+            )
+            .unwrap();
+        let (request, preparation) = build_branch_summary_request_with_refinements(
+            session.retained_entries(),
+            50,
+            None,
+            /*replace_instructions*/ false,
+            /*enabled*/ false,
+        );
+        assert_eq!(preparation.messages, vec![conversation]);
+        assert!(!request.is_empty());
+        let (enabled_request, _) = build_branch_summary_request_with_refinements(
+            session.retained_entries(),
+            50,
+            None,
+            /*replace_instructions*/ false,
+            /*enabled*/ true,
+        );
+        assert!(
+            enabled_request.is_empty(),
+            "the enabled legacy budget path selects no older rows"
+        );
+    }
+
+    #[test]
+    fn branch_summary_request_skips_python_state_notices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut session = crate::session::manager::SessionManager::in_memory(tmp.path());
+        session.append_message(user("explore the widget")).unwrap();
+        session
+            .append_custom_message(
+                super::super::ipython_state::IPYTHON_STATE_CUSTOM_TYPE,
+                pa_types::ai::UserContent::Text(super::super::ipython_state::notice_content(
+                    None,
+                    Some(&["stacked_kernel_var".to_string()]),
+                )),
+                /*display*/ false,
+                None,
+            )
+            .unwrap();
+        let (messages, _) =
+            build_branch_summary_request(session.retained_entries(), 0, None, false);
+        let text = match &messages[0] {
+            AgentMessage::User(user) => user.content.text(),
+            _ => panic!("expected a user message"),
+        };
+        assert!(text.contains("explore the widget"));
+        assert!(!text.contains("[python-state]"));
+        assert!(!text.contains("stacked_kernel_var"));
+    }
+
+    #[test]
     fn collects_old_branch_to_common_ancestor() {
         // root -> u1 -> a1 -> u2 (old leaf)
         //        \\-> u3 (target)
@@ -537,6 +660,21 @@ mod tests {
         assert!(summary.contains("The user explored a different conversation branch"));
         assert!(summary.contains("## Goal"));
         assert!(branch_summary_presentation("s").contains("[branch-summary]"));
+    }
+
+    #[test]
+    fn branch_summary_request_carries_outstanding_work() {
+        let entries = vec![entry("e0", None, user("explore the widget"))];
+        let (messages, _) = build_branch_summary_request(&entries, 0, None, false);
+        assert_eq!(messages.len(), 1);
+        let text = match &messages[0] {
+            AgentMessage::User(user) => user.content.text(),
+            _ => panic!("expected a user message"),
+        };
+        assert!(text.contains("## Outstanding Work"));
+        assert!(text.contains("rlm.list_subagents()"));
+        assert!(text.contains("the [bash-done] notification"));
+        assert!(text.contains("rlm_heartbeat.list()"));
     }
 
     #[test]
@@ -597,6 +735,7 @@ mod tests {
                 replace_instructions: false,
                 reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
                 auxiliary: None,
+                session_id: None,
             },
         )
         .await;
@@ -629,6 +768,7 @@ mod tests {
                 replace_instructions: false,
                 reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
                 auxiliary: None,
+                session_id: None,
             },
         )
         .await;
@@ -665,16 +805,23 @@ mod tests {
                 cwd: tmp.path().to_path_buf(),
                 agent_dir: tmp.path().to_path_buf(),
             };
-            let seen_models: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-                std::sync::Arc::default();
+            let seen_models =
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    Vec::<(String, Option<String>, bool)>::new(),
+                ));
             let recorder = seen_models.clone();
             registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Factory(
                 std::sync::Arc::new(
                     move |_context: &pa_types::ai::Context,
-                          _options: Option<&pa_ai::types::StreamOptions>,
+                          options: Option<&pa_ai::types::StreamOptions>,
                           _call: u64,
                           model: &pa_types::ai::Model| {
-                        recorder.lock().unwrap().push(model.id.clone());
+                        recorder.lock().unwrap().push((
+                            model.id.clone(),
+                            options.and_then(|options| options.session_id.clone()),
+                            options.and_then(|options| options.transport)
+                                == Some(pa_ai::types::Transport::Sse),
+                        ));
                         Ok(pa_ai::faux::faux_assistant_text_message(
                             "## Goal\nexplore the tree",
                             pa_ai::faux::FauxAssistantMessageOptions::default(),
@@ -692,12 +839,17 @@ mod tests {
                     replace_instructions: false,
                     reserve_tokens: DEFAULT_BRANCH_RESERVE_TOKENS,
                     auxiliary: Some(&aux),
+                    session_id: Some("conversation"),
                 },
             )
             .await;
             assert!(result.error.is_none(), "error: {:?}", result.error);
             assert!(result.summary.is_some());
-            assert_eq!(seen_models.lock().unwrap().as_slice(), ["faux-1"]);
+            // The routed call still carries the owning conversation's id.
+            assert_eq!(
+                seen_models.lock().unwrap().as_slice(),
+                [("faux-1".to_string(), Some("conversation".to_string()), true)]
+            );
             registration.unregister();
         }
     }

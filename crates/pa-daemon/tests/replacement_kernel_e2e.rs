@@ -6,7 +6,8 @@
 //!
 //! The process-table scans diff against a baseline snapshot, so ambient kernels never
 //! interfere; tests skip (with a note) on machines without a live kernel install.
-#![cfg(unix)]
+// The kernel census scans /proc: Linux only.
+#![cfg(target_os = "linux")]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -285,13 +286,13 @@ fn write_faux_script(dir: &Path) -> PathBuf {
             "engine": "faux",
             "responses": [
                 { "content": [
-                    { "type": "toolCall", "name": "ipython", "arguments": {
+                    { "type": "toolCall", "name": "python_repl", "arguments": {
                         "code": seed_cell(dir, "seed"),
                     } },
                 ] },
                 { "text": "done" },
                 { "content": [
-                    { "type": "toolCall", "name": "ipython", "arguments": {
+                    { "type": "toolCall", "name": "python_repl", "arguments": {
                         "code": probe_cell(dir, "probe"),
                     } },
                 ] },
@@ -579,7 +580,7 @@ fn switch_session_rebinds_the_kernel_cwd_onto_the_target_session() {
             "engine": "faux",
             "responses": [
                 { "content": [
-                    { "type": "toolCall", "name": "ipython", "arguments": {
+                    { "type": "toolCall", "name": "python_repl", "arguments": {
                         "code": format!(
                             "import os\nopen({receipt:?}, \"w\").write(os.getcwd())\nprint(\"cwd\")",
                             receipt = receipt.to_string_lossy(),

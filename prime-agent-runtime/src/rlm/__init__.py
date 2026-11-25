@@ -5,10 +5,11 @@ from __future__ import annotations
 import sys
 import types
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .bash import BashHandle, BashResult, bash
+from .bash import BashHandle, BashResult, BashSnapshot, bash, persistent_shells, _set_completion_notices_wired
 from .factory import (
     FACTORY_HELP,
     graph_factory,
@@ -57,6 +58,10 @@ class RLMSubagentActivity:
 
 @dataclass(frozen=True)
 class RLMSubagent:
+    """One direct child row: `status` is `running` | `completed` | `error` |
+    `cancelled` (a cancelled child keeps its status verbatim in the
+    registry row, the TS-era semantics)."""
+
     rlm_child_id: str
     active_session_id: str | None
     session_id: str | None
@@ -81,8 +86,28 @@ class RLMProgressNoteResult:
 
 
 @dataclass(frozen=True)
+class RLMMessage:
+    """One message of this session's transcript, from `rlm.session.messages()`.
+
+    `index` is the message's position among the messages the same `role` filter
+    keeps. `raw` is the stored message (tool calls, thinking, tool-result details).
+    """
+
+    index: int
+    id: str
+    role: str
+    text: str
+    timestamp: int | None
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class RLMChildResult:
-    """Terminal or in-progress state of one direct child, from `collect()`."""
+    """Terminal or in-progress state of one direct child, from `collect()`.
+
+    `answer_text` is the child's full final answer (the settle-binding
+    lane, host-bounded); `answer_preview` is the compact roster preview.
+    """
 
     rlm_child_id: str
     session_name: str | None
@@ -90,10 +115,44 @@ class RLMChildResult:
     status: str
     settled: bool
     answer_preview: str | None
-    error: str | None
-    duration_ms: int | None
-    tool_use_count: int | None
-    replied_since_task: bool | None
+    answer_text: str | None = None
+    error: str | None = None
+    duration_ms: int | None = None
+    tool_use_count: int | None = None
+    replied_since_task: bool | None = None
+
+
+@dataclass(frozen=True)
+class RLMInboxMessage:
+    """One machine-generated notice waiting in the session inbox.
+
+    `inbox_class` is `bash-done`, `factory-progress`, `agent-message`,
+    `child-exited`, `child-failed`, or `heartbeat`; `arrived_at_ms` is
+    the epoch-ms arrival time; `sender` is the command for a bash
+    completion, the run id for a factory milestone, the agent name for
+    an agent message, the child's session name for a child lifecycle
+    notice, or the job id for a heartbeat fire; `meta` carries the
+    notice's metadata (pid/command/exitCode/exitClass, the run's
+    fields, the message id, sender and family relationship, the child's
+    status and ids, or the fired heartbeat's job fields).
+    """
+
+    id: str
+    inbox_class: str
+    arrived_at_ms: int
+    sender: str | None
+    text: str
+    meta: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RLMInboxCount:
+    """The inbox snapshot `count()` returns: the waiting count, the oldest
+    arrival time, and the per-class breakdown."""
+
+    count: int
+    oldest_arrived_at_ms: int | None
+    classes: dict[str, int]
 
 
 def _spawn_handle_from_payload(payload: Any) -> RLMSpawnHandle:
@@ -167,12 +226,33 @@ def emit(data: dict[str, Any]) -> None:
     repl.emit(data)
 
 
+async def end_turn() -> dict[str, Any]:
+    """End the turn: the sanctioned terminal programmatic call.
+
+    The host marks the calling cell (a task the cell started counts as that
+    cell, also when another cell runs beside it), the cell's tool result
+    confirms the turn ended, and no further assistant response is streamed
+    for the run. A call from a backgrounded cell, or after the calling cell
+    finished, raises: its turn already returned. Other tool calls in the
+    same message still execute first; the turn ends when the batch's
+    end-turn call finishes Ok (one is enough). The turn returns to the user
+    while background work keeps running: the remaining jobs keep running
+    and their completion notices collect the results. Raises where the host
+    does not support the call (a foreign harness): it never silently no-ops.
+    """
+    from . import repl
+
+    return await host_request("rlm.end_turn", {"cell": repl.current_cell_id()})
+
+
 async def spawn(
     prompt: str,
     *,
     name: str,
     model: str | None = None,
     thinking: str | None = None,
+    cwd: str | None = None,
+    kind: str | None = None,
 ) -> RLMSpawnHandle:
     """Spawn a recursive Prime Agent child and return once its task is admitted.
 
@@ -180,7 +260,26 @@ async def spawn(
     ``model`` selects a child with an exact ``provider/model`` selector.
     ``thinking`` sets the child reasoning level (e.g. 'off', 'low', 'medium', 'high');
     defaults to the parent level; levels invalid for the resolved model fail the spawn.
+    ``cwd`` starts the child in that directory (relative to the session cwd); defaults
+    to the session cwd.
+    ``kind`` selects a dedicated child kind; ``"decision"`` spawns the Decision API
+    child (the model comes from the ``decisionModel`` setting).
     """
+    return await _spawn(prompt, name=name, model=model, thinking=thinking, cwd=cwd, kind=kind)
+
+
+async def _spawn(
+    prompt: str,
+    *,
+    name: str,
+    model: str | None = None,
+    thinking: str | None = None,
+    cwd: str | None = None,
+    factory: dict[str, str] | None = None,
+    kind: str | None = None,
+) -> RLMSpawnHandle:
+    """``spawn`` plus the factory executor's run tag (``{runId, specId,
+    stateId}``), which the host records on the child's ledger spawn edge."""
     if not isinstance(prompt, str):
         raise TypeError(f"prompt must be str, got {type(prompt).__name__}")
     kwargs: dict[str, Any] = {"name": name}
@@ -188,6 +287,12 @@ async def spawn(
         kwargs["model"] = model
     if thinking is not None:
         kwargs["thinking"] = thinking
+    if cwd is not None:
+        kwargs["cwd"] = cwd
+    if factory is not None:
+        kwargs["factory"] = factory
+    if kind is not None:
+        kwargs["kind"] = kind
     # Wire type stays "rlm.run" so kernels and hosts of different versions stay compatible.
     payload = await host_request("rlm.run", {"prompt": prompt, "kwargs": kwargs})
     return _spawn_handle_from_payload(payload)
@@ -306,7 +411,7 @@ def _subagent_from_payload(payload: Any, operation: str = "rlm.list_subagents") 
         raise RuntimeError(f"{operation} entry is missing session_name")
     if not isinstance(session_dir, str) or not session_dir:
         raise RuntimeError(f"{operation} entry is missing session_dir")
-    if status not in {"running", "completed", "error"}:
+    if status not in {"running", "completed", "error", "cancelled"}:
         raise RuntimeError(f"{operation} entry has invalid status")
     return RLMSubagent(
         rlm_child_id=child_id,
@@ -389,6 +494,7 @@ def _child_result_from_payload(payload: Any) -> RLMChildResult:
         status=status,
         settled=settled,
         answer_preview=_optional_str("answer_preview"),
+        answer_text=_optional_str("answer_text"),
         error=_optional_str("error"),
         duration_ms=_optional_int("duration_ms"),
         tool_use_count=_optional_int("tool_use_count"),
@@ -463,6 +569,118 @@ async def progress_note(message: str) -> RLMProgressNoteResult:
     if retry_after_ms is not None and (not isinstance(retry_after_ms, int) or isinstance(retry_after_ms, bool)):
         raise RuntimeError("rlm.progress.note returned an invalid retry_after_ms")
     return RLMProgressNoteResult(accepted=accepted, retry_after_ms=retry_after_ms)
+
+
+# Display MIME the host collects into the cell card: one per message a read returned.
+_INBOX_MESSAGE_MIME = "application/vnd.prime-agent.inbox-message+json"
+
+
+def _inbox_message_from_payload(payload: Any) -> RLMInboxMessage:
+    if not isinstance(payload, dict):
+        raise RuntimeError("rlm.inbox.read returned an invalid message entry")
+    message_id = payload.get("id")
+    inbox_class = payload.get("class")
+    arrived_at_ms = payload.get("arrivedAtMs")
+    text = payload.get("text")
+    if not isinstance(message_id, str) or not message_id:
+        raise RuntimeError("rlm.inbox.read entry is missing id")
+    if not isinstance(inbox_class, str) or not inbox_class:
+        raise RuntimeError("rlm.inbox.read entry has invalid class")
+    if not isinstance(arrived_at_ms, int) or isinstance(arrived_at_ms, bool):
+        raise RuntimeError("rlm.inbox.read entry has invalid arrivedAtMs")
+    if not isinstance(text, str):
+        raise RuntimeError("rlm.inbox.read entry has invalid text")
+    sender = payload.get("sender")
+    if sender is not None and not isinstance(sender, str):
+        raise RuntimeError("rlm.inbox.read entry has invalid sender")
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        raise RuntimeError("rlm.inbox.read entry has invalid meta")
+    return RLMInboxMessage(
+        id=message_id,
+        inbox_class=inbox_class,
+        arrived_at_ms=arrived_at_ms,
+        sender=sender,
+        text=text,
+        meta=meta,
+    )
+
+
+async def inbox_read(
+    sender: str | None = None,
+    inbox_class: str | None = None,
+    since_ms: int | None = None,
+    before_ms: int | None = None,
+) -> list[RLMInboxMessage]:
+    """Read and drain the session inbox: the waiting machine-generated
+    notices (bash completions, factory milestones, agent messages,
+    child lifecycle terminals, heartbeat fires) return in arrival order
+    with their arrival time, and the inbox empties. Read messages are gone,
+    so assign the result: ``msgs = await rlm.inbox.read()``.
+
+    Every argument narrows the read (ANDed); no argument drains
+    everything. ``sender`` matches exactly (a command, a run id, an
+    agent name, a child's session name, or a heartbeat job id);
+    ``inbox_class`` matches the message class (``bash-done``,
+    ``factory-progress``, ``agent-message``, ``child-exited``,
+    ``child-failed``, ``heartbeat``); ``since_ms`` is the inclusive
+    arrival lower bound and ``before_ms`` the exclusive upper bound
+    (epoch milliseconds). Only the matching messages leave the inbox.
+
+    Machine notices accumulate in the daemon-owned inbox instead of
+    steering their full rows; a short steering notice announces their
+    arrival, and this call is how the agent reads them.
+    """
+    if sender is not None and (not isinstance(sender, str) or not sender):
+        raise TypeError("sender must be a non-empty str or None")
+    if inbox_class is not None and (not isinstance(inbox_class, str) or not inbox_class):
+        raise TypeError("inbox_class must be a non-empty str or None")
+    if since_ms is not None and (not isinstance(since_ms, int) or isinstance(since_ms, bool)):
+        raise TypeError("since_ms must be an int or None")
+    if before_ms is not None and (not isinstance(before_ms, int) or isinstance(before_ms, bool)):
+        raise TypeError("before_ms must be an int or None")
+    filter_payload: dict[str, Any] = {}
+    if sender is not None:
+        filter_payload["sender"] = sender
+    if inbox_class is not None:
+        filter_payload["class"] = inbox_class
+    if since_ms is not None:
+        filter_payload["sinceMs"] = since_ms
+    if before_ms is not None:
+        filter_payload["beforeMs"] = before_ms
+    payload = await host_request("rlm.inbox.read", filter_payload)
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        raise RuntimeError("rlm.inbox.read returned an invalid messages list")
+    read = [_inbox_message_from_payload(entry) for entry in messages]
+    for entry in messages:
+        emit({_INBOX_MESSAGE_MIME: entry})
+    return read
+
+
+async def inbox_count() -> RLMInboxCount:
+    """Count the session inbox's waiting messages without draining them:
+    the total, the oldest arrival's epoch-ms time, and the per-class
+    breakdown (`bash-done`, `factory-progress`, ...)."""
+    payload = await host_request("rlm.inbox.count")
+    count = payload.get("count")
+    if not isinstance(count, int) or isinstance(count, bool):
+        raise RuntimeError("rlm.inbox.count returned an invalid count")
+    oldest_arrived_at_ms = payload.get("oldestArrivedAtMs")
+    if oldest_arrived_at_ms is not None and (
+        not isinstance(oldest_arrived_at_ms, int) or isinstance(oldest_arrived_at_ms, bool)
+    ):
+        raise RuntimeError("rlm.inbox.count returned an invalid oldestArrivedAtMs")
+    classes = payload.get("classes")
+    if not isinstance(classes, dict) or not all(
+        isinstance(value, int) and not isinstance(value, bool) for value in classes.values()
+    ):
+        raise RuntimeError("rlm.inbox.count returned an invalid classes breakdown")
+    return RLMInboxCount(
+        count=count,
+        oldest_arrived_at_ms=oldest_arrived_at_ms,
+        classes=classes,
+    )
 
 
 async def delete_subagent(target: str | RLMSubagent | RLMSpawnHandle) -> RLMSubagent:
@@ -549,11 +767,40 @@ class _HarnessProxy:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._resolve(), name)
 
+    def __dir__(self) -> list[str]:
+        return sorted({*super().__dir__(), *(name for name in dir(self._resolve()) if not name.startswith("_"))})
+
     def __repr__(self) -> str:
         return repr(self._resolve())
 
 
 _harness_state = _HarnessProxy()
+
+
+class _RLMInboxNamespace:
+    """The session inbox of machine-generated notices:
+    ``msgs = await rlm.inbox.read()`` drains and returns the waiting messages
+    (optionally narrowed by sender, inbox_class, and arrival window); read
+    messages are gone, so assign the result; ``await rlm.inbox.count()``
+    counts them without draining.
+    """
+
+    async def read(
+        self,
+        sender: str | None = None,
+        inbox_class: str | None = None,
+        since_ms: int | None = None,
+        before_ms: int | None = None,
+    ) -> list[RLMInboxMessage]:
+        return await inbox_read(
+            sender=sender,
+            inbox_class=inbox_class,
+            since_ms=since_ms,
+            before_ms=before_ms,
+        )
+
+    async def count(self) -> RLMInboxCount:
+        return await inbox_count()
 
 
 class _RLMFactoryNamespace:
@@ -618,8 +865,101 @@ class _RLMFactoryNamespace:
         return FACTORY_HELP
 
 
+# Display MIME the host collects into the cell card's transcript row: one per read.
+_TRANSCRIPT_READ_MIME = "application/vnd.prime-agent.transcript-read+json"
+
+
+def _message_text(message: dict[str, Any]) -> str:
+    role = message["role"]
+    if role in ("compactionSummary", "branchSummary"):
+        return message.get("summary", "")
+    if role == "bashExecution":
+        return "\n".join(part for part in (message.get("command"), message.get("output")) if part)
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    return "\n".join(block["text"] for block in content or [] if block.get("type") == "text")
+
+
+def _message_timestamp(message: dict[str, Any]) -> int | None:
+    value = message.get("timestamp")
+    if isinstance(value, str):
+        # Custom rows carry their row's ISO time; every other row carries epoch ms.
+        return round(datetime.fromisoformat(value).timestamp() * 1000)
+    return None if value is None else int(value)
+
+
+def _roles(role: str | tuple[str, ...]) -> list[str]:
+    return [role] if isinstance(role, str) else list(role)
+
+
+class _RLMSessionNamespace:
+    """A session's transcript as data: ``await rlm.session.messages()``."""
+
+    async def messages(
+        self,
+        start: int = -10,
+        limit: int = 10,
+        *,
+        role: str | tuple[str, ...] = "*",
+        agent: str | RLMSpawnHandle | RLMSubagent | None = None,
+    ) -> list[RLMMessage]:
+        """Return ``rows[start:][:limit]`` of a session's transcript on the active branch.
+
+        ``rows`` are the messages whose role matches ``role`` (an fnmatch glob or a
+        tuple of globs), oldest first, including the messages compaction summarized
+        away (each compaction appears in place as a ``compactionSummary`` message).
+        ``start`` counts from the end when negative. Each message's ``index`` is its
+        position in ``rows``. ``agent`` reads a nuclear-family member's transcript
+        instead of this session's: a name, child id, session id, spawn handle, or
+        ``list_subagents()`` row.
+        """
+        if limit < 0:
+            raise ValueError("limit must not be negative")
+        roles = _roles(role)
+        reply = await _read_transcript(start, limit, roles, agent)
+        messages = [
+            RLMMessage(
+                index=row["index"],
+                id=row["id"],
+                role=row["message"]["role"],
+                text=_message_text(row["message"]),
+                timestamp=_message_timestamp(row["message"]),
+                raw=row["message"],
+            )
+            for row in reply["messages"]
+        ]
+        first = messages[0].index if messages else None
+        read = {"returned": len(messages), "first": first, "total": reply["total"], "roles": roles}
+        if agent is not None:
+            read["agent"] = reply["agent"]
+        emit({_TRANSCRIPT_READ_MIME: read})
+        return messages
+
+    async def count(
+        self,
+        role: str | tuple[str, ...] = "*",
+        *,
+        agent: str | RLMSpawnHandle | RLMSubagent | None = None,
+    ) -> int:
+        """Return how many messages of the transcript match ``role`` (``agent`` as in ``messages``)."""
+        reply = await _read_transcript(0, 0, _roles(role), agent)
+        return reply["total"]
+
+
+async def _read_transcript(
+    start: int, limit: int, roles: list[str], agent: str | RLMSpawnHandle | RLMSubagent | None
+) -> dict[str, Any]:
+    request = {"start": start, "limit": limit, "roles": roles}
+    if agent is None:
+        return await host_request("rlm.session.messages", request)
+    target = _collect_target_selector(agent, "agent")
+    return await host_request("agent_observe.session_messages", {**request, "target": target})
+
+
 class _RLMNamespace:
     harness = _harness_state
+    session = _RLMSessionNamespace()
     get_harness_state = staticmethod(get_harness_state)
 
     async def spawn(
@@ -629,8 +969,10 @@ class _RLMNamespace:
         name: str,
         model: str | None = None,
         thinking: str | None = None,
+        cwd: str | None = None,
+        kind: str | None = None,
     ) -> RLMSpawnHandle:
-        return await spawn(prompt, name=name, model=model, thinking=thinking)
+        return await spawn(prompt, name=name, model=model, thinking=thinking, cwd=cwd, kind=kind)
 
     async def create_session(
         self,
@@ -665,7 +1007,11 @@ class _RLMNamespace:
     async def collect(self, targets: Any = None, *, timeout_ms: int = 0) -> list[RLMChildResult]:
         return await collect(targets, timeout_ms=timeout_ms)
 
+    async def end_turn(self) -> dict[str, Any]:
+        return await end_turn()
+
     factory = _RLMFactoryNamespace()
+    inbox = _RLMInboxNamespace()
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         raise TypeError(_NOT_CALLABLE_MESSAGE)
@@ -679,6 +1025,7 @@ class _RLMNamespace:
 
 rlm = _RLMNamespace()
 harness = _harness_state
+factory = rlm.factory
 
 
 class _NotCallableModule(types.ModuleType):
@@ -698,6 +1045,9 @@ __all__ = [
     "McpToolError",
     "NotEnabled",
     "RLMCreateSessionHandle",
+    "RLMInboxCount",
+    "RLMInboxMessage",
+    "RLMMessage",
     "RLMModel",
     "RLMProgressNoteResult",
     "RLMSpawnHandle",
@@ -708,11 +1058,15 @@ __all__ = [
     "bash",
     "delete_subagent",
     "emit",
+    "end_turn",
     "find_models",
     "get_harness_state",
     "harness",
     "host_request",
+    "inbox_count",
+    "inbox_read",
     "list_subagents",
+    "persistent_shells",
     "progress_note",
     "rename",
     "rlm",
@@ -729,6 +1083,4 @@ def __getattr__(name: str) -> Any:  # noqa: D401 - module-level lazy attr hook
         from . import mcp_base
 
         return getattr(mcp_base, name)
-    if name == "run":
-        raise AttributeError(_RENAMED_RUN_MESSAGE)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    return getattr(rlm, name)

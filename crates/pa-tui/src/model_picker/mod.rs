@@ -8,7 +8,7 @@ mod render;
 use std::collections::{HashMap, HashSet};
 
 use pa_types::ai::{
-    clamp_thinking_level, get_supported_thinking_levels, Model, ModelThinkingLevel,
+    clamp_thinking_level, get_supported_thinking_levels, Model, ModelServing, ModelThinkingLevel,
     PRIME_INFERENCE_PROVIDER_ID,
 };
 
@@ -670,8 +670,6 @@ impl ModelPicker {
     }
 
     pub(crate) fn effort_layout(&self, start: usize, end: usize) -> EffortLayout {
-        /// Wide detail columns must fit "Cached input".
-        const EFFORT_NAME_COLUMN_MAX: usize = 30;
         const EFFORT_NAME_COLUMN_MIN: usize = 12;
         const ARROWS_AND_GAPS: usize = 6;
 
@@ -716,8 +714,7 @@ impl ModelPicker {
             .iter()
             .map(|model| crate::width::str_width(&model.name))
             .max()
-            .unwrap_or(0)
-            .min(EFFORT_NAME_COLUMN_MAX);
+            .unwrap_or(0);
         let square_slots = reasoning
             .iter()
             .map(|model| {
@@ -783,8 +780,19 @@ impl ModelPicker {
         if !self.is_configured(model) {
             segments.push("require sign in".to_string());
         }
-        segments.push(model.provider.clone());
+        segments.push(provider_label(model).to_string());
         segments
+    }
+}
+
+/// The provider a row displays (and search matches): Prime Inference routes
+/// split into their serving class (the live catalog labels each route hosted
+/// or gateway); unlabeled routes and every other provider show the provider id.
+fn provider_label(model: &Model) -> &str {
+    match (model.provider.as_str(), model.serving) {
+        (PRIME_INFERENCE_PROVIDER_ID, Some(ModelServing::Hosted)) => "prime-hosted",
+        (PRIME_INFERENCE_PROVIDER_ID, Some(ModelServing::Gateway)) => "prime-gateway",
+        _ => model.provider.as_str(),
     }
 }
 

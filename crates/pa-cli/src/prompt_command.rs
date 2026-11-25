@@ -1,7 +1,7 @@
 //! `prime-agent prompt`: dump the fully-assembled effective system prompt with
 //! its per-layer breakdown, without starting a session or a provider.
 
-use pa_core::resources::{load_resources, ResourceLoaderOptions};
+use pa_core::resources::{load_resources, LoadedResources, ResourceLoaderOptions};
 use pa_core::settings::SettingsManager;
 
 use crate::config::get_agent_dir;
@@ -57,8 +57,11 @@ pub fn run_prompt_command(args: &[String]) -> i32 {
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    match assemble_breakdown(&cwd, parsed.model.as_deref()) {
-        Ok(breakdown) => {
+    match assemble_breakdown(&cwd, &get_agent_dir(), parsed.model.as_deref()) {
+        Ok((breakdown, errors)) => {
+            for error in &errors {
+                eprintln!("Error: {error}");
+            }
             if parsed.json {
                 print_json(&breakdown);
             } else {
@@ -73,55 +76,96 @@ pub fn run_prompt_command(args: &[String]) -> i32 {
     }
 }
 
-fn assemble_breakdown(
+/// The resources a fresh root session in `cwd` loads: its settings,
+/// auto-discovery, and the user's MCP gating (auth-gated built-in
+/// integrations drop their skills), plus the enabled generic MCP servers the
+/// prompt's MCP guidance names. `prompt` and `skills` share it.
+pub(crate) fn load_session_resources(
     cwd: &std::path::Path,
-    model: Option<&str>,
-) -> anyhow::Result<pa_core::prompts::SystemPromptBreakdown> {
-    let agent_dir = get_agent_dir();
-    let settings = SettingsManager::create(cwd, &agent_dir);
-    // MCP gating: auth-gated built-in integrations drop their skills; enabled persistent generic
-    // servers add the prompt MCP guidance.
-    let user_servers = settings
-        .settings()
-        .mcp_servers
-        .clone()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|(server, config)| {
-            serde_json::from_value(config)
-                .ok()
-                .map(|parsed| (server, parsed))
-        })
-        .collect::<std::collections::HashMap<String, pa_core::mcp::McpServerConfig>>();
+    agent_dir: &std::path::Path,
+) -> anyhow::Result<(SettingsManager, LoadedResources, Vec<String>)> {
+    let settings = SettingsManager::create(cwd, agent_dir);
     let (skill_overrides, generic_servers, _manager) =
-        pa_core::mcp::McpManager::prompt_gating(user_servers, &agent_dir);
+        pa_core::resources::mcp_gating(settings.global_settings(), agent_dir);
     let resources = load_resources(ResourceLoaderOptions {
+        settings: Some(settings.reopen()),
         extra_builtin_skill_overrides: skill_overrides,
         system_prompt: None,
-        ..ResourceLoaderOptions::new(cwd.to_path_buf(), agent_dir)
+        ..ResourceLoaderOptions::new(cwd, agent_dir)
     })?;
-    Ok(pa_core::prompts::system_prompt::system_prompt_breakdown(
+    Ok((settings, resources, generic_servers))
+}
+
+/// The model a fresh daemon session runs on: `--model` resolved like the
+/// CLI flag, else the daemon's startup chain (the saved default, then the
+/// featured default, then the first available or catalog model).
+fn session_model(
+    selector: Option<&str>,
+    settings: &SettingsManager,
+    agent_dir: &std::path::Path,
+) -> anyhow::Result<pa_types::ai::Model> {
+    let registry = pa_core::models::ModelRegistry::create(
+        pa_core::auth::AuthStorage::create(agent_dir),
+        agent_dir.join("models.json"),
+    );
+    let all = registry.get_all();
+    if let Some(selector) = selector {
+        let resolved = pa_core::models::resolve_cli_model(None, selector, all);
+        return resolved
+            .model
+            .ok_or_else(|| anyhow::anyhow!(resolved.error.unwrap_or_default()));
+    }
+    let available: Vec<pa_types::ai::Model> =
+        registry.get_available().into_iter().cloned().collect();
+    pa_core::models::find_initial_model(&pa_core::models::InitialModelOptions {
+        cli_provider: None,
+        cli_model: None,
+        scoped_models: &[],
+        is_continuing: false,
+        default_provider: settings.get_default_provider(),
+        default_model_id: settings.get_default_model(),
+        all_models: all,
+        available_models: &available,
+    })
+    .or_else(|| all.first().cloned())
+    .ok_or_else(|| anyhow::anyhow!("No models available."))
+}
+
+fn assemble_breakdown(
+    cwd: &std::path::Path,
+    agent_dir: &std::path::Path,
+    model: Option<&str>,
+) -> anyhow::Result<(pa_core::prompts::SystemPromptBreakdown, Vec<String>)> {
+    let (settings, resources, generic_servers) = load_session_resources(cwd, agent_dir)?;
+    let model = session_model(model, &settings, agent_dir)?;
+    let model_prompts = pa_core::prompts::model_prompts::load_model_prompts(
+        Some(&format!("{}/{}", model.provider, model.id)),
+        agent_dir,
+    );
+    let breakdown = pa_core::prompts::system_prompt::system_prompt_breakdown(
         &pa_core::prompts::BuildSystemPromptOptions {
+            settings: &settings,
+            resources: &resources,
+            // A daemon worker registers the host request of every
+            // controller-backed skill, so all loaded skills stay visible.
+            skills: &resources.skills,
+            // The shipped model-tool surface: `python_repl` only; bash/edit are kernel-resident
+            // programmatic tools.
+            selected_tools: vec![pa_types::ai::PYTHON_TOOL_NAME],
+            model_prompt_extras: model_prompts.extras.as_deref(),
+            model_input: &model.input,
             cwd: cwd.display().to_string(),
             // A dump has no session file; the tail states the value it uses.
             messages_path: None,
-            model,
-            custom_prompt: resources.system_prompt.clone(),
-            context_files: resources
-                .agents_files
-                .iter()
-                .map(|file| (file.path.display().to_string(), file.content.clone()))
-                .collect(),
-            skills: resources.skills.clone(),
-            // The shipped model-tool surface: `ipython` only; bash/edit are kernel-resident
-            // programmatic tools.
-            selected_tools: Some(vec!["ipython"]),
-            allow_recursion: Some(true),
             generic_mcp_servers: generic_servers,
-            rlm_depth: Some(0),
-            ..Default::default()
+            // A fresh daemon root session.
+            rlm_depth: 0,
+            factory_child: false,
+            daemonless: false,
+            can_spawn: true,
         },
-    ))
+    );
+    Ok((breakdown, model_prompts.errors))
 }
 
 fn print_text(breakdown: &pa_core::prompts::SystemPromptBreakdown) {
@@ -213,10 +257,16 @@ mod tests {
         assert_eq!(run_prompt_command(&["--help".to_string()]), 0);
     }
 
+    /// A catalog model without image input.
+    const TEXT_MODEL: &str = "prime-inference/z-ai/glm-5.3";
+
     #[test]
     fn assembles_the_layered_prompt_for_a_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let breakdown = assemble_breakdown(dir.path(), Some("mock/mock-1")).unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+        let (breakdown, errors) =
+            assemble_breakdown(dir.path(), agent_dir.path(), Some(TEXT_MODEL)).unwrap();
+        assert!(errors.is_empty());
         assert!(breakdown.assembled.starts_with("# prime-agent harness"));
         assert!(breakdown
             .assembled
@@ -224,6 +274,9 @@ mod tests {
         assert!(breakdown
             .assembled
             .contains("Conversation log: not persisted"));
+        assert!(breakdown
+            .assembled
+            .contains("Image input: this model cannot see images"));
         // Every static segment sits inside the cached prefix.
         for segment in &breakdown.segments {
             let inside = breakdown
@@ -237,5 +290,27 @@ mod tests {
                 segment.name
             );
         }
+    }
+
+    #[test]
+    fn the_dump_carries_the_discovered_appended_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(pa_core::settings::CONFIG_DIR_NAME);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("APPEND_SYSTEM.md"), "Project appendix.").unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+        let (breakdown, _) =
+            assemble_breakdown(dir.path(), agent_dir.path(), Some(TEXT_MODEL)).unwrap();
+        assert!(breakdown.assembled.ends_with("Project appendix."));
+    }
+
+    #[test]
+    fn an_unknown_model_fails_like_the_cli_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+        let error =
+            assemble_breakdown(dir.path(), agent_dir.path(), Some("no-such-model-anywhere"))
+                .unwrap_err();
+        assert!(error.to_string().contains("not found"), "{error}");
     }
 }

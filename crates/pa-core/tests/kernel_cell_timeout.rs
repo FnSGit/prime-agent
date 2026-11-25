@@ -1,0 +1,334 @@
+// Pedantic-gate dispositions as src/lib.rs (large_futures/too_many_lines/casts).
+#![allow(
+    clippy::large_futures,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+
+//! The cell wait budget backgrounds, never interrupts: a cell that outlives
+//! its budget returns early with the partial output and a detach marker, the
+//! cell keeps running, and its completion arrives through the background
+//! sink. The namespace survives and the turn continues.
+#![cfg(unix)]
+
+use std::path::PathBuf;
+
+use pa_agent::scripted::{tool_call_turn_steps, ScriptedProvider, ScriptedTurn};
+use pa_core::session::manager::SessionManager;
+use pa_core::session_engine::engine::{create_session, SessionEngineConfig};
+use serde_json::{json, Value};
+
+/// The kernel Python with prime-agent-runtime installed (the interpreter the
+/// TS product's kernel venv bootstraps). Skipped (with a note) on machines
+/// without a live install; `PA_CORE_KERNEL_PYTHON` points at an explicit one.
+fn kernel_python() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("PA_CORE_KERNEL_PYTHON") {
+        let explicit = PathBuf::from(explicit);
+        assert!(
+            explicit.exists(),
+            "PA_CORE_KERNEL_PYTHON {} not found",
+            explicit.display()
+        );
+        return Some(explicit);
+    }
+    let candidate = PathBuf::from(std::env::var("HOME").map_or_else(
+        |_| "/home/ubuntu/.prime/agent/kernel-venv/bin/python".to_string(),
+        |home| format!("{home}/.prime/agent/kernel-venv/bin/python"),
+    ));
+    if candidate.exists() {
+        return Some(candidate);
+    }
+    eprintln!(
+        "kernel python {} not found; skipping live kernel test",
+        candidate.display()
+    );
+    None
+}
+
+/// Scoped process-env overrides: applied on construction, restored on drop.
+struct EnvOverride {
+    saved: Vec<(String, Option<String>)>,
+}
+
+impl EnvOverride {
+    fn apply(pairs: &[(&str, Option<String>)]) -> Self {
+        let saved = pairs
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        for (key, value) in pairs {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        EnvOverride { saved }
+    }
+}
+
+impl Drop for EnvOverride {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
+fn scripted_model() -> pa_agent::types::Model {
+    serde_json::from_value(json!({
+        "id": "faux-1", "name": "Faux", "api": "test", "provider": "faux",
+        "baseUrl": "http://localhost", "reasoning": false,
+        "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+        "contextWindow": 200_000, "maxTokens": 4_000
+    }))
+    .expect("faux loop model")
+}
+
+/// The `(details.status, text)` of the tool result for `call_id` in the session rows.
+fn tool_result(entries: &Value, call_id: &str) -> (String, String) {
+    let message = entries
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .filter_map(|entry| entry.get("message"))
+        .find(|message| message["role"] == "toolResult" && message["toolCallId"] == call_id)
+        .unwrap_or_else(|| panic!("no tool result for {call_id}: {entries}"));
+    let text = message["content"]
+        .as_array()
+        .expect("content array")
+        .iter()
+        .filter_map(|block| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let status = message["details"]["status"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no details.status for {call_id}: {message}"))
+        .to_string();
+    (status, text)
+}
+
+type Outcomes =
+    std::sync::Arc<std::sync::Mutex<Vec<pa_core::kernel::shared::BackgroundCellOutcome>>>;
+
+/// One live-kernel session that ran `calls` (one `python_repl` call per
+/// scripted turn) in a single prompt. The engine stays alive so backgrounded
+/// cells keep running; their outcomes land in `outcomes`.
+struct CellRun {
+    _dir: tempfile::TempDir,
+    _env: EnvOverride,
+    _engine: pa_core::session_engine::engine::SessionEngine,
+    entries: Value,
+    outcomes: Outcomes,
+}
+
+async fn run_cells(kernel_python: &std::path::Path, calls: Vec<(&str, Value)>) -> CellRun {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let sessions_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let cwd = dir.path().join("project");
+    std::fs::create_dir_all(&cwd).expect("project dir");
+
+    let env = EnvOverride::apply(&[
+        (
+            "PRIME_AGENT_KERNEL_PYTHON",
+            Some(kernel_python.display().to_string()),
+        ),
+        ("PRIME_AGENT_CODING_AGENT_DIR", None),
+        ("PRIME_API_KEY", None),
+    ]);
+
+    let mut session = SessionManager::in_memory(&cwd);
+    session.materialize_session_file(Some(sessions_dir));
+
+    let model = scripted_model();
+    let provider = std::sync::Arc::new(ScriptedProvider::new(model.clone()));
+    for (call_id, args) in calls {
+        provider.push_turn(ScriptedTurn::Events(tool_call_turn_steps(
+            &model,
+            None,
+            vec![(call_id, "python_repl", args)],
+        )));
+    }
+    provider.push_text_turn("done");
+
+    let outcomes: Outcomes = std::sync::Arc::default();
+    let sink = std::sync::Arc::clone(&outcomes);
+
+    let engine = create_session(SessionEngineConfig {
+        on_late_sent_agent_message: None,
+        semantic_edges: None,
+        cron_store: None,
+        steering_mode: None,
+        follow_up_mode: None,
+        factory_child: false,
+        cwd: cwd.clone(),
+        agent_dir,
+        model: Some(model),
+        thinking_level: None,
+        stream_fn: Some(provider.stream_fn()),
+        tools: Vec::new(),
+        custom_system_prompt: None,
+        prompt_guidelines: Vec::new(),
+        session_manager: Some(session),
+        extra_host_handlers: None,
+        conversation_log_path: None,
+        additional_skill_paths: Vec::new(),
+        additional_prompt_paths: Vec::new(),
+        extra_builtin_skill_overrides: Vec::new(),
+        rlm_subagent_host: None,
+        rlm_usage_store: None,
+        inbox: None,
+        progress_note_emit: None,
+        rlm_depth: None,
+        daemonless: false,
+        telemetry: None,
+        model_info: None,
+        mcp_manager: None,
+        kernel_ready_gate: None,
+        prewarm_ipython_kernel: None,
+        on_background_work_settled: None,
+        cell_wake: None,
+        on_background_cell: Some(std::sync::Arc::new(move |outcome| {
+            sink.lock().unwrap().push(outcome);
+        })),
+        bash_notice_wake: None,
+        queued_goal_context_purge: None,
+        queued_steering_probe: None,
+        should_stop_after_turn: None,
+        image_model_router: None,
+    })
+    .await
+    .expect("create_session");
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(240),
+        engine.session.prompt(
+            "run the cells",
+            pa_core::session_engine::PromptOptions::default(),
+        ),
+    )
+    .await
+    .expect("the turn must not wait out the whole sleep")
+    .expect("prompt");
+
+    let entries = serde_json::to_value(engine.session.entries().await).expect("entries json");
+    CellRun {
+        _dir: dir,
+        _env: env,
+        _engine: engine,
+        entries,
+        outcomes,
+    }
+}
+
+/// Wait (bounded) for the one background-cell outcome.
+async fn background_outcome(outcomes: &Outcomes) -> pa_core::kernel::shared::BackgroundCellOutcome {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(outcome) = outcomes.lock().unwrap().pop() {
+            return outcome;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the background completion never fired"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_cell_past_its_wait_budget_auto_backgrounds_and_the_turn_continues() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let run = run_cells(
+        &kernel_python,
+        vec![
+            ("call-1", json!({ "code": "x = 41" })),
+            (
+                "call-2",
+                json!({ "code": "import time\nprint('before')\ntime.sleep(3)\nprint('after')", "timeout": 1 }),
+            ),
+            ("call-3", json!({ "code": "print(x + 1)" })),
+        ],
+    )
+    .await;
+
+    // The over-budget cell returns early: ok, with the partial output and the
+    // backgrounded note naming the cell; it is never an interrupt error.
+    let (status, text) = tool_result(&run.entries, "call-2");
+    assert_eq!(status, "ok", "{text}");
+    assert!(text.contains("before"), "{text}");
+    assert!(text.contains("auto-backgrounded"), "{text}");
+    assert!(!text.contains("interrupted after"), "{text}");
+    assert!(!text.contains("<ipython_kernel_reset>"), "{text}");
+
+    // The turn continued and the namespace is intact.
+    let (status, text) = tool_result(&run.entries, "call-3");
+    assert_eq!(status, "ok", "{text}");
+    assert!(text.contains("42"), "{text}");
+
+    // The cell kept running to completion in the background: the sink sees
+    // its full output and an ok status.
+    let outcome = background_outcome(&run.outcomes).await;
+    assert_eq!(
+        outcome.reason,
+        pa_core::kernel::shared::DetachReason::WaitBudget(1_000)
+    );
+    assert_eq!(
+        outcome.result.status,
+        pa_core::kernel::shared::ExecuteStatus::Ok
+    );
+    assert!(outcome.result.stdout.contains("after"), "{outcome:?}");
+}
+
+/// A backgrounded cell waiting at an await point no longer locks the kernel:
+/// the next cell runs at once beside it, and the backgrounded cell's
+/// `[cell-done]` notice still carries its output tail.
+#[tokio::test]
+async fn a_new_cell_runs_beside_a_backgrounded_cell_that_awaits() {
+    let Some(kernel_python) = kernel_python() else {
+        return;
+    };
+    let run = run_cells(
+        &kernel_python,
+        vec![
+            ("call-1", json!({ "code": "x = 41" })),
+            (
+                "call-2",
+                json!({ "code": "import asyncio\nprint('before')\nawait asyncio.sleep(4)\nprint('after')", "timeout": 1 }),
+            ),
+            ("call-3", json!({ "code": "print(x + 1)" })),
+        ],
+    )
+    .await;
+
+    let (status, text) = tool_result(&run.entries, "call-2");
+    assert_eq!(status, "ok", "{text}");
+    assert!(text.contains("auto-backgrounded"), "{text}");
+    let (status, text) = tool_result(&run.entries, "call-3");
+    assert_eq!(status, "ok", "{text}");
+    assert!(text.contains("42"), "{text}");
+    // The turn ended while the backgrounded cell still awaited: call-3 never
+    // waited for it to settle.
+    assert!(
+        run.outcomes.lock().unwrap().is_empty(),
+        "the backgrounded cell settled before the next cell ran"
+    );
+
+    let outcome = background_outcome(&run.outcomes).await;
+    let notice =
+        pa_core::session_engine::bash_notices::KernelNotice::background_cell_completion(&outcome);
+    let text = serde_json::to_value(&notice.row.content).expect("notice content");
+    let text = text.as_str().expect("a text-only notice");
+    assert!(text.starts_with("[cell-done id:"), "{text}");
+    assert!(text.contains("status:ok"), "{text}");
+    assert!(text.ends_with("before\nafter"), "{text}");
+}

@@ -17,11 +17,32 @@ use serde_json::Value;
 
 /// Minimum protocol version accepted in command envelopes (TS parity).
 pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u64 = DAEMON_PROTOCOL_VERSION;
-/// The product version the daemon reports in every `daemon_hello`
-/// (`appVersion`): the CLI's `doctor`/`status` "current" classification
-/// compares against the same value, so this must stay the bare product
-/// version (the build identity marker lives in `runtime.buildId`).
+/// Compiled product-version fallback for library embedders. Packaged CLI
+/// processes initialize the reported version through [`configure_app_version`].
 pub const DAEMON_APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+static PRODUCT_VERSION: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// Set the packaged product version once in the composition root, before
+/// serving supervisor or worker connections. Repeating the same value is safe.
+///
+/// # Errors
+/// Returns an error if a process attempts to serve two product versions.
+pub fn configure_app_version(version: &'static str) -> anyhow::Result<()> {
+    let configured = PRODUCT_VERSION.get_or_init(|| version);
+    anyhow::ensure!(
+        *configured == version,
+        "daemon product version was already configured differently"
+    );
+    Ok(())
+}
+
+/// Product version shared by daemon handshakes and update checkpoints. Library
+/// embedders without package metadata retain the compiled version fallback.
+#[must_use]
+pub(crate) fn app_version() -> &'static str {
+    PRODUCT_VERSION.get().copied().unwrap_or(DAEMON_APP_VERSION)
+}
 
 /// Command types the daemon recognizes (TS `DAEMON_COMMAND_TYPES` in TS
 /// declared order, followed by the Rust-native supervisor/worker frames).
@@ -144,6 +165,11 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "set_mcp_static_token",
     "remove_mcp_connection",
     "mark_anthropic_warning_shown",
+    "list_persistent_shells",
+    "tail_persistent_shell",
+    "kill_persistent_shell",
+    "get_session_messages",
+    "search_session_content",
 ];
 
 /// Parsed client command envelope.
@@ -298,6 +324,7 @@ pub fn supported_client_capabilities() -> &'static [&'static str] {
         "chunked_snapshot",
         "client_owned_sessions",
         "elide_snapshot_images",
+        "windowed_snapshot",
     ]
 }
 
@@ -314,6 +341,8 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "side_question_transcript",
                 "transient_bash",
                 "kernel_bash_activity",
+                "persistent_shells",
+                "session_content_search",
                 "factory_activity",
                 "session_input_admission",
                 "prompt_admission_cancellation",
@@ -325,6 +354,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "session_input_pause",
                 "acp_mcp_servers",
                 "abort_and_send_queued",
+                "background_cell_abort",
                 "agent_roster",
                 "direct_peer_transport",
             ]
@@ -680,6 +710,9 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::GetMessages {
             active_session_id, ..
         }
+        | DaemonCommand::GetSessionMessages {
+            active_session_id, ..
+        }
         | DaemonCommand::GetRlmChildren {
             active_session_id, ..
         }
@@ -904,6 +937,10 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::PrepareUpdateRestart { .. }
         | DaemonCommand::CommitUpdateRestart { .. }
         | DaemonCommand::UpdateRestoreStatus { .. }
+        | DaemonCommand::ListPersistentShells { .. }
+        | DaemonCommand::SearchSessionContent { .. }
+        | DaemonCommand::TailPersistentShell { .. }
+        | DaemonCommand::KillPersistentShell { .. }
         | DaemonCommand::Restart { .. }
         | DaemonCommand::Shutdown { .. } => None,
     }
@@ -952,6 +989,10 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::ListKernelBash { .. } => "list_kernel_bash",
         DaemonCommand::TailKernelBash { .. } => "tail_kernel_bash",
         DaemonCommand::KillKernelBash { .. } => "kill_kernel_bash",
+        DaemonCommand::ListPersistentShells { .. } => "list_persistent_shells",
+        DaemonCommand::SearchSessionContent { .. } => "search_session_content",
+        DaemonCommand::TailPersistentShell { .. } => "tail_persistent_shell",
+        DaemonCommand::KillPersistentShell { .. } => "kill_persistent_shell",
         DaemonCommand::CancelRlmChild { .. } => "cancel_rlm_child",
         DaemonCommand::FactoryActivity { .. } => "factory_activity",
         DaemonCommand::DeleteRlmSubagent { .. } => "delete_rlm_subagent",
@@ -961,6 +1002,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::GetState { .. } => "get_state",
         DaemonCommand::GetConnectionState { .. } => "get_connection_state",
         DaemonCommand::GetMessages { .. } => "get_messages",
+        DaemonCommand::GetSessionMessages { .. } => "get_session_messages",
         DaemonCommand::GetRlmChildren { .. } => "get_rlm_children",
         DaemonCommand::GetSessionStats { .. } => "get_session_stats",
         DaemonCommand::GetContextTree { .. } => "get_context_tree",

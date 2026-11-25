@@ -53,9 +53,13 @@ impl TransportListener for tokio::net::UnixListener {
     }
 }
 
-/// `AF_UNIX` `sun_path` capacity: 108 bytes including the terminating NUL.
+/// Native `AF_UNIX` path capacity, excluding the terminating NUL.
 #[cfg(unix)]
-const MAX_SUN_PATH: usize = 107;
+const MAX_SUN_PATH: usize = {
+    // SAFETY: sockaddr_un contains only integer fields and arrays of integers.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_path.len() - 1
+};
 
 /// A kernel-valid `AF_UNIX` address for `bind`/`connect`. Paths within the limit pass through; a
 /// longer path is re-anchored through an `O_PATH` descriptor on its parent
@@ -158,7 +162,65 @@ pub async fn bind_transport(path: &Path) -> Result<Box<dyn TransportListener>> {
 pub async fn connect_transport(path: &Path) -> Result<Box<dyn TransportStream>> {
     let address = UnixSocketAddress::new(path)?;
     let stream = tokio::net::UnixStream::connect(address.effective()).await?;
+    ensure_same_user_peer(std::os::fd::AsFd::as_fd(&stream), path)?;
     Ok(Box::new(stream))
+}
+
+/// Refuse a socket served by another user's process: whoever controls the
+/// socket's directory could otherwise answer as the daemon.
+#[cfg(unix)]
+fn ensure_same_user_peer(fd: std::os::fd::BorrowedFd<'_>, path: &Path) -> std::io::Result<()> {
+    let peer_uid = peer_uid(fd)?;
+    // SAFETY: geteuid only reads this process's effective uid.
+    let uid = unsafe { libc::geteuid() };
+    if peer_uid != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "Socket {} is served by uid {peer_uid}, not the current user (uid {uid})",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<libc::uid_t> {
+    use std::os::fd::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    // `ucred` is 12 bytes.
+    #[allow(clippy::cast_possible_truncation)]
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: SO_PEERCRED writes at most `len` bytes into `cred`.
+    let status = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&raw mut cred).cast(),
+            &raw mut len,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(cred.uid)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn peer_uid(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<libc::uid_t> {
+    use std::os::fd::AsRawFd;
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: getpeereid writes the peer's ids into the two locals.
+    if unsafe { libc::getpeereid(fd.as_raw_fd(), &raw mut uid, &raw mut gid) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(uid)
 }
 
 /// Definitive nonblocking Unix listener refusal, used by the exit cleanup.
@@ -178,7 +240,7 @@ pub fn unix_listener_definitely_closed(path: &Path) -> bool {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = path;
-        return false;
+        false
     }
     #[cfg(target_os = "linux")]
     {
@@ -346,6 +408,7 @@ impl BlockingTransportStream for std::os::unix::net::UnixStream {
 pub fn connect_blocking(path: &Path) -> std::io::Result<Box<dyn BlockingTransportStream>> {
     let address = UnixSocketAddress::new(path).map_err(std::io::Error::other)?;
     let stream = std::os::unix::net::UnixStream::connect(address.effective())?;
+    ensure_same_user_peer(std::os::fd::AsFd::as_fd(&stream), path)?;
     Ok(Box::new(stream))
 }
 
@@ -364,6 +427,7 @@ pub fn connect_blocking(path: &Path) -> std::io::Result<Box<dyn BlockingTranspor
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::FileTypeExt;
 
     /// A directory whose full path length is exactly `target` bytes; falls
@@ -391,6 +455,7 @@ mod tests {
         dir
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn over_limit_paths_bind_connect_and_land_in_place() {
         use tokio::io::AsyncReadExt;
@@ -444,6 +509,13 @@ mod tests {
         let _ = std::fs::remove_file(&socket);
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn paths_one_byte_over_the_native_limit_are_rejected() {
+        let path = std::path::PathBuf::from(format!("/{}", "x".repeat(MAX_SUN_PATH)));
+        assert!(UnixSocketAddress::new(&path).is_err(), "over native limit");
+    }
+
     #[tokio::test]
     async fn over_limit_paths_without_a_short_name_error_clearly() {
         let dir = dir_of_exact_len("toolong", 120);
@@ -472,22 +544,10 @@ mod pipe_name_tests {
             pipe_name(worker).unwrap(),
             r"\\.\pipe\prime-agent-worker-abc123-0123456789ab"
         );
-    }
-
-    #[test]
-    fn explicit_file_paths_derive_the_same_pipe_on_both_sides() {
-        let socket = Path::new(r"C:\Users\runner\AppData\Local\Temp\.tmpacp\daemon.sock");
-        let a = pipe_name(socket).expect("derives");
-        let b = pipe_name(socket).expect("derives again");
-        assert_eq!(a, b, "the derivation is deterministic");
-        assert!(a.starts_with(r"\\.\pipe\prime-agent-explicit-"), "{a}");
-    }
-
-    #[test]
-    fn distinct_paths_derive_distinct_pipes() {
-        let a = pipe_name(Path::new(r"C:\tmp\one\daemon.sock")).expect("derives");
-        let b = pipe_name(Path::new(r"C:\tmp\two\daemon.sock")).expect("derives");
-        assert_ne!(a, b);
+        let upper = Path::new(r"\\.\PIPE\prime-agent-daemon");
+        assert_eq!(pipe_name(upper).unwrap(), r"\\.\PIPE\prime-agent-daemon");
+        let remote = Path::new(r"\\fileserver\pipe\prime-agent");
+        assert_eq!(pipe_name(remote).unwrap(), r"\\fileserver\pipe\prime-agent");
     }
 
     #[test]
@@ -497,18 +557,13 @@ mod pipe_name_tests {
     }
 
     #[test]
-    fn pipe_paths_match_case_insensitively_and_remote_forms_pass_through() {
-        let upper = Path::new(r"\\.\PIPE\prime-agent-daemon");
-        assert_eq!(pipe_name(upper).unwrap(), r"\\.\PIPE\prime-agent-daemon");
-        let remote = Path::new(r"\\fileserver\pipe\prime-agent");
-        assert_eq!(pipe_name(remote).unwrap(), r"\\fileserver\pipe\prime-agent");
-    }
-
-    #[test]
     fn equivalent_path_spellings_derive_the_same_pipe() {
         let a = pipe_name(Path::new(r"C:\Temp\daemon.sock")).expect("derives");
         let b = pipe_name(Path::new(r"c:\temp\DAEMON.SOCK")).expect("derives");
         assert_eq!(a, b, "case is normalized before hashing");
+        assert!(a.starts_with(r"\\.\pipe\prime-agent-explicit-"), "{a}");
+        let other = pipe_name(Path::new(r"C:\Temp\other\daemon.sock")).expect("derives");
+        assert_ne!(a, other, "distinct paths derive distinct pipes");
     }
 
     #[test]

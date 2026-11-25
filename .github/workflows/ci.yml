@@ -28,12 +28,12 @@
 #
 # THE PR SMOKE MODEL (the touched-crate path filter): the PR wave narrows
 # the TEST phase to touched crates and their reverse dependents' units
-# (the `changes` job maps the PR's changed files to crates; any path
-# outside crates/<pkg>/** fails safe
-# to the full selection — CI/scripts/vendor/runtime changes affect the
-# whole suite, and docs-only waste is cheaper than a silent hole). The
-# stable crc32 shard assignment is untouched — only the unit selection
-# narrows — and the push wave keeps running the full union, so main is the
+# (the `changes` job maps the PR's changed files to crates; `.changes/` and
+# `docs/` paths are skipped, and any other path outside crates/<pkg>/** fails
+# safe to the full selection — CI/scripts/vendor/runtime changes affect the
+# whole suite, and a PR with no crate path runs the full selection). The
+# shard assignment is untouched — only the unit selection narrows — and the
+# push wave keeps running the full union, so main is the
 # authority: the PR proves the touched crates' runtime behavior fast, the
 # merge proves the whole workspace. fmt + check/clippy stay full-scope on
 # PRs (the compile authority); reverse-dep selection also runs tests of
@@ -45,10 +45,10 @@
 # The test phase is sharded: `cargo test --workspace` ran every test binary
 # serially in one job (~13 minutes; the per-PR wall-clock floor). It is now
 # the union of SHARD_COUNT parallel shard jobs: scripts/ci_test_shard.py enumerates
-# the workspace's test binaries via `cargo metadata --no-deps` and each shard
-# runs the units whose stable crc32 hash lands in its slice — every binary
-# lands in exactly one shard on every run (never rebalanced mid-suite), so
-# flake attribution stays put when tests are added or renamed. The union
+# the workspace's test binaries via `cargo metadata --no-deps` and assigns
+# them by the durations recorded in scripts/ci_test_shard_durations.json
+# (longest first onto the least-loaded shard) — every binary lands in exactly
+# one shard, and adding or re-recording units can move others. The union
 # covers exactly what the serial `cargo test --workspace` built and ran:
 # lib/bin/doc unittests, every tests/ integration target, the
 # example/bench compile targets (compile parity, `--no-run`), and the
@@ -102,20 +102,17 @@ env:
   # A partial bump cannot pass silently: too few legs leaves units
   # unassigned and the summary audit goes red; too many leaves dead 0-unit
   # legs visible in the summary report (the partition that ran is still
-  # audited complete - waste, never a coverage hole).
-  # THE ATTRIBUTION RULE (the conductor's 2026-09-29 ruling, 4 -> 8): bump
-  # only in powers of two — crc32 % 8 is a bit-refinement of crc32 % 4, so
-  # an 8-way shard s contains only units whose 4-way home was
-  # ((s-1) % 4) + 1; the flake history stays interpretable and every old
-  # manifest stays derivable (measured at the flip: 0/186 units left
-  # their 4-way parent).
+  # audited complete - waste, never a coverage hole). Any count works: the
+  # duration-balanced assignment is computed for the given --total.
   SHARD_COUNT: "8"
 
 jobs:
   # The touched-crate path filter (the PR smoke's selection). Push and queue
   # runs use the full selection; PR runs select crates plus reverse deps,
-  # failing safe to the full selection on any non-crate path. The output
-  # feeds test shards' --crates; empty means "the full union".
+  # skipping the guaranteed-metadata paths (.changes/ fragments and docs/ -
+  # no test unit reads them) and failing safe to the full selection on any other
+  # non-crate path. The output feeds test shards' --crates; empty means
+  # "the full union".
   changes:
     name: touched crates (PR) / full selection (push + queue)
     needs: trust
@@ -146,10 +143,13 @@ jobs:
           # semantics, renames carrying both sides), fully paginated —
           # `gh pr view --json files` caps at 100 rows and would silently
           # under-map a large PR, and its field names differ from the REST
-          # rows (`path` vs `filename`). The mapping itself is fail-safe
-          # by construction (scripts/ci_pr_crates.py + its battery): any
-          # non-crate path, a rename's removed side, an empty column, or
-          # the API's 3000-file ceiling means the FULL selection runs.
+          # rows (`path` vs `filename`). The mapping is fail-safe by
+          # construction (scripts/ci_pr_crates.py + its battery): a crate
+          # path narrows to its wave; `.changes/` fragments and `docs/`
+          # are skipped (no test unit reads them, and a PR with only those
+          # keeps the FULL selection); any OTHER non-crate path, a rename's removed
+          # side, an empty column, or the API's 3000-file ceiling means
+          # the FULL selection runs.
           gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
             --paginate --jq '.[] | [.filename, .previous_filename // ""] | @tsv' \
             > "${RUNNER_TEMP}/pr-files.tsv"
@@ -205,6 +205,36 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  discussion-notifier:
+    name: discussion notification contract
+    needs: trust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    if: needs.trust.result == 'success' && needs.trust.outputs.allowed == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - run: python3 .github/scripts/discussion-notifier/test_notify.py
+
+  migration-packaging:
+    name: historical upgrade packaging
+    needs: trust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: needs.trust.result == 'success' && needs.trust.outputs.allowed == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Verify native and npm compatibility packaging
+        run: |
+          python3 scripts/release/test_native_compat.py
+          python3 scripts/release/test_npm_bridge.py
+          python3 scripts/release/test_release_publication.py
+          python3 scripts/release/test_restamp.py
+          python3 scripts/release/test_channel_version.py
+
   clippy-test:
     name: check + clippy (workspace)
     needs: trust
@@ -236,7 +266,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # The test suite, sharded per the SHARD_COUNT knob above: each shard runs
-  # the test binaries whose stable crc32 hash lands in its slice
+  # the test binaries the duration-balanced assignment gives it
   # (scripts/ci_test_shard.py); fmt and clippy run above, a shard job runs
   # ONLY its test subset. The union of the shards is exactly the old serial
   # `cargo test --workspace`.
@@ -306,7 +336,9 @@ jobs:
       # behavior is unchanged.
       - name: Build the workspace bins (sibling-binary parity for the e2e suites)
         if: steps.selection.outputs.units != '0'
-        run: cargo build --locked --workspace --bins
+        # --examples pulls in dev-dependencies, so the bins build with the same
+        # feature set as the test units below (CI-only; release jobs unaffected).
+        run: cargo build --locked --workspace --bins --examples
       # The kernel e2e suites resolve the ambient kernel venv; left to
       # bootstrap lazily, the first session prewarm starts it mid-shard and
       # the next kernel unit fails against the half-built venv (run
@@ -314,15 +346,56 @@ jobs:
       - name: Bootstrap the kernel venv (ready before the kernel e2e units)
         if: steps.selection.outputs.units != '0'
         run: ./target/debug/prime-agent --prime-agent-bootstrap
-      - name: Run this shard's test subset
+      # The real-binary lifecycle checks drive the debug binary through owned
+      # daemons, PTYs and loopback providers only. One leg is enough.
+      - name: Run the rust lifecycle checks
+        id: lifecycle_checks
+        if: matrix.shard == 1 && steps.selection.outputs.units != '0' && hashFiles('scripts/check_*.py') != ''
         run: |
-          python3 scripts/ci_test_shard.py --shard ${{ matrix.shard }} --total ${{ env.SHARD_COUNT }}             --crates "${{ needs.changes.outputs.crates }}"             --manifest "$RUNNER_TEMP/shard-manifest-${{ matrix.shard }}.json"
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/lifecycle-check-receipts"
+          export PA_RUST_BINARY="${GITHUB_WORKSPACE}/target/debug/prime-agent"
+          export PRIME_AGENT_KERNEL_PYTHON="${HOME}/.prime/agent/kernel-venv/bin/python"
+          export PA_E2E_KERNEL_PYTHON="${PRIME_AGENT_KERNEL_PYTHON}"
+          test -x "${PRIME_AGENT_KERNEL_PYTHON}"
+          check_status=0
+          python3 scripts/test_lifecycle_lib.py || check_status=1
+          # Discover independently added checks so feature PRs do not
+          # overwrite or conflict with each other's selection.
+          for check in scripts/check_*.py; do
+            [ -f "${check}" ] || continue
+            scenario="${check#scripts/check_}"
+            scenario="${scenario%.py}"
+            check_test="scripts/test_check_${scenario}.py"
+            if [ -f "${check_test}" ]; then
+              python3 "${check_test}" || check_status=1
+            fi
+            python3 "${check}" --receipt "${RUNNER_TEMP}/lifecycle-check-receipts/${scenario}.json" || check_status=1
+          done
+          exit "${check_status}"
+      - name: Upload the lifecycle check receipts
+        if: always() && matrix.shard == 1 && steps.selection.outputs.units != '0' && hashFiles('scripts/check_*.py') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lifecycle-check-receipts-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/lifecycle-check-receipts/
+          if-no-files-found: error
+      - name: Run this shard's test subset
+        if: ${{ !cancelled() && (success() || steps.lifecycle_checks.outcome == 'failure') }}
+        env:
+          # The runner's account venv is a throwaway: the bootstrap step above
+          # built it for these suites, which share it (skills sync into it
+          # lazily). Opt out of the account-venv refusal that .cargo/config.toml
+          # turns on for every cargo-launched process.
+          PRIME_AGENT_REFUSE_ACCOUNT_KERNEL_VENV: "0"
+        run: |
+          python3 scripts/ci_test_shard.py --shard ${{ matrix.shard }} --total ${{ env.SHARD_COUNT }}             --crates "${{ needs.changes.outputs.crates }}"             --manifest "$RUNNER_TEMP/shard-manifest-${{ matrix.shard }}-attempt-${{ github.run_attempt }}.json"
       - name: Upload the shard manifest (always — the summary audits it)
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: shard-manifest-${{ matrix.shard }}
-          path: ${{ runner.temp }}/shard-manifest-${{ matrix.shard }}.json
+          name: shard-manifest-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/shard-manifest-${{ matrix.shard }}-attempt-${{ github.run_attempt }}.json
 
   # The aggregate: audits the partition (same enumeration everywhere,
   # disjoint shards, every assigned unit executed — coverage can never
@@ -344,7 +417,35 @@ jobs:
           merge-multiple: true
           path: manifests
       - name: Audit the shards and merge their failure reports
-        run: python3 scripts/ci_test_shard_summary.py --total ${{ env.SHARD_COUNT }} --dir manifests
+        run: |
+          python3 scripts/test_ci_test_shard.py
+          python3 scripts/test_ci_pr_crates.py
+          python3 scripts/test_ci_test_shard_summary.py
+          python3 scripts/ci_test_shard_summary.py --total ${{ env.SHARD_COUNT }} --dir manifests
+
+  # The vendored runtime suite (prime-agent-runtime): the kernel-side Python
+  # (`bash()`, the repl protocol, the bounded-await contract) has no Rust test,
+  # so this is its only CI gate — CPython 3.11, the minimum the runtime
+  # supports and the version the kernel venv pins.
+  runtime:
+    name: runtime suite (python 3.11)
+    needs: trust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: needs.trust.result == 'success' && needs.trust.outputs.allowed == 'true' && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install uv
+        run: |
+          python3 -m pip install --user uv
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run the runtime suite (CPython 3.11)
+        run: |
+          cd prime-agent-runtime
+          uv run --python 3.11 python -m unittest discover -s test
+          PYTHONPATH=../skills/attach-video/src uv run --python 3.11 python -m unittest discover -s ../skills/attach-video/tests
 
   # The Windows job set + the supply-chain deny gate:
   #
@@ -403,11 +504,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Dependency audit (cargo-deny advisories + licenses)
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check
-          arguments: --all-features --workspace
-          command-arguments: advisories licenses
+        uses: ./.github/actions/dependency-audit
 
   # The trust gate's own failure made visible: a vouch-step error (the
   # action's setup, the runner) would otherwise leave every dependent job
@@ -420,7 +517,18 @@ jobs:
   # enforces.
   trust-audit:
     name: trust gate audit
-    needs: [trust, changes, fmt, clippy-test, test-shard, test-summary, windows-cross, deny]
+    needs:
+      [
+        trust,
+        changes,
+        fmt,
+        clippy-test,
+        test-shard,
+        test-summary,
+        runtime,
+        windows-cross,
+        deny,
+      ]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 10

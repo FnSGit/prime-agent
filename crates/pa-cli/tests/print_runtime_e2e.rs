@@ -99,10 +99,47 @@ fn print_mode_reports_provider_errors_as_exit_one() {
     assert!(!stderr.is_empty());
 }
 
+/// A `/refine` plans in the background, but its failure still fails the run
+/// once the disposal drain has awaited it — in both output modes. A
+/// successful refinement keeps exit 0.
+#[test]
+fn print_mode_refine_command_failure_exits_one() {
+    for (refiner_reply, expected_code) in [
+        ("not json", 1),
+        (r#"{"summary":"no changes","edits":[]}"#, 0),
+    ] {
+        for json_mode in [false, true] {
+            let home = isolated_home();
+            let script = serde_json::json!({ "responses": ["first answer", refiner_reply] });
+            let mut args = vec!["-p", "hello", "/refine"];
+            if json_mode {
+                args.splice(0..0, ["--mode", "json"]);
+            }
+            let (stdout, stderr, code) = run_in_home(home.path(), &args, &script);
+            assert_eq!(
+                code, expected_code,
+                "reply {refiner_reply:?}, json {json_mode}: stdout {stdout} stderr {stderr}"
+            );
+            let reported = if json_mode {
+                stdout.contains(r#""type":"refine_failed""#)
+            } else {
+                stderr.contains("pa-cli: refinement failed:")
+            };
+            assert_eq!(
+                reported,
+                expected_code == 1,
+                "stdout {stdout} stderr {stderr}"
+            );
+        }
+    }
+}
+
 // Session persistence (headless print sessions must land on disk).
 
+/// Under the canonical temp root: sessions record the canonical cwd, and
+/// macOS temp dirs sit behind the /var -> /private/var symlink.
 fn isolated_home() -> tempfile::TempDir {
-    tempfile::TempDir::new().unwrap()
+    tempfile::TempDir::new_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
 }
 
 fn run_in_home(
@@ -152,6 +189,56 @@ fn read_entries(path: &std::path::Path) -> Vec<serde_json::Value> {
         .map(serde_json::from_str)
         .collect::<Result<_, _>>()
         .unwrap()
+}
+
+/// The goal cap's text-mode end state: the capped run exits 1 with the reason, and a later
+/// resume of the capped session answers normally — the persisted cap never swallows a run.
+#[test]
+fn print_mode_goal_cap_reports_the_reason_and_exits_one() {
+    let home = isolated_home();
+    let script = serde_json::json!({ "responses": [{}, {}, {}] });
+    let (stdout, stderr, code) = run_in_home(
+        home.path(),
+        &["--goal", "finish the work", "-p", "work"],
+        &script,
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.ends_with("Goal continuation cap reached: consecutive turns made no progress\n"));
+    assert!(stdout.is_empty());
+
+    let session_id = read_entries(&session_files(home.path())[0])[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let script = serde_json::json!({ "responses": ["follow-up answer"] });
+    let (stdout, stderr, code) = run_in_home(
+        home.path(),
+        &["--resume", &session_id[..8], "-p", "next"],
+        &script,
+    );
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "follow-up answer\n");
+}
+
+/// The session files holding a runtime lease right now (the owner records
+/// under the agent dir's `session-leases`).
+fn leased_session_files(home: &std::path::Path) -> Vec<String> {
+    let mut leased = Vec::new();
+    let Ok(entries) = std::fs::read_dir(home.join(".prime/agent/session-leases")) else {
+        return leased;
+    };
+    for entry in entries.flatten() {
+        let Ok(text) = std::fs::read_to_string(entry.path().join("owner.json")) else {
+            continue;
+        };
+        let Ok(owner) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        if let Some(path) = owner.get("sessionPath").and_then(serde_json::Value::as_str) {
+            leased.push(path.to_string());
+        }
+    }
+    leased
 }
 
 #[test]
@@ -254,6 +341,23 @@ fn print_mode_continue_recent_reuses_the_latest_session() {
         session_files(home.path()).len(),
         1,
         "continue reuses the saved session"
+    );
+}
+
+/// A finished print run releases the session file's runtime lease: the run
+/// exits and no owner record survives under `session-leases`.
+#[test]
+fn print_mode_releases_the_session_lease_when_the_run_ends() {
+    let home = isolated_home();
+    let script = serde_json::json!({ "responses": ["leased answer"] });
+    let (stdout, stderr, code) = run_in_home(home.path(), &["-p", "hi"], &script);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "leased answer\n");
+    let files = session_files(home.path());
+    assert_eq!(files.len(), 1, "one session file, got {files:?}");
+    assert!(
+        leased_session_files(home.path()).is_empty(),
+        "the ended run left a lease owner behind"
     );
 }
 
@@ -740,11 +844,11 @@ fn print_mode_json_streams_the_threshold_compaction_pair() {
             "compaction": { "enabled": true, "reserveTokens": 1, "keepRecentTokens": 10 }
         }),
     );
-    // A small context window: the ~8.1k seed turn stays below the 15_808
-    // ceiling (24k - 4_096 output - 4_096 headroom), and the ~12k-token
-    // crossing turn pushes past it.
+    // The session-scoped faux cache counts the ~8.1k seed prompt as input
+    // plus cache-write tokens. It stays below the 23_808 ceiling (32k -
+    // 4_096 output - 4_096 headroom); the crossing turn exceeds it.
     let script = serde_json::json!({
-        "contextWindow": 24000,
+        "contextWindow": 32000,
         "responses": [
             {"text": "seed reply"},
             {"text": "crossing reply"},
@@ -1006,4 +1110,48 @@ fn print_mode_fork_rejects_empty_sources_and_conflicting_flags() {
             files.iter().all(|path| *path == empty)
         }
     );
+}
+
+/// A provider-qualified `--model` the catalog misses runs on a custom id, never
+/// silently: the resolver's warning reaches stderr once.
+#[test]
+fn print_mode_warns_once_when_the_model_selection_is_inexact() {
+    let home = isolated_home();
+    let agent_dir = home.path().join(".prime/agent");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(
+        agent_dir.join("models.json"),
+        serde_json::json!({ "providers": { "anthropic": {
+            "api": "openai-completions", "baseUrl": "http://127.0.0.1:9/v1", "apiKey": "synthetic-only",
+            "models": [{ "id": "claude-opus-4-7" }]
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        serde_json::json!({ "retry": { "enabled": false } }).to_string(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_prime-agent"))
+        .args([
+            "-p",
+            "hi",
+            "--no-session",
+            "--model",
+            "anthropic/no-such-model",
+        ])
+        .env("HOME", home.path())
+        .env_remove("PRIME_AGENT_FAUX_SCRIPT")
+        .env_remove("PRIME_AGENT_CODING_AGENT_DIR")
+        .env_remove("RLM_DEPTH")
+        .current_dir(home.path())
+        .output()
+        .expect("binary present");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warnings = stderr
+        .lines()
+        .filter(|line| line.starts_with("Warning: ") && line.contains("no-such-model"))
+        .count();
+    assert_eq!(warnings, 1, "stderr: {stderr}");
 }

@@ -3,7 +3,7 @@
 
 use std::sync::mpsc::TryRecvError;
 
-use super::text_utils::{char_at, char_prefix, ends_with_symbol_token};
+use super::text_utils::{char_prefix, ends_with_symbol_token};
 use super::{AutocompleteSearch, Editor, EditorEvent, PendingAutocomplete};
 
 impl Editor {
@@ -57,25 +57,22 @@ impl Editor {
             .autocomplete
             .as_ref()
             .is_some_and(|s| s.kind == Some(crate::autocomplete::SuggestionKind::SlashCommand));
-        let default_slash = self.autocomplete.is_some()
-            && self.autocomplete.as_ref().unwrap().prefix.starts_with('/');
-        (kind_slash || default_slash)
+        kind_slash
             && matches!(ctx, Some(c) if c.kind == crate::autocomplete::SlashKind::Name && c.at_prompt_start)
     }
 
     pub(crate) fn apply_completion(
         &self,
         item: &crate::autocomplete::CompletionItem,
-        prefix: &str,
+        kind: Option<crate::autocomplete::SuggestionKind>,
     ) -> crate::autocomplete::CompletionResult {
+        if kind == Some(crate::autocomplete::SuggestionKind::Emoji) {
+            return self.apply_emoji_completion(&item.value);
+        }
         match self.autocomplete_provider.as_ref() {
-            Some(provider) => provider.apply_completion(
-                &self.lines,
-                self.cursor_line,
-                self.cursor_col,
-                item,
-                prefix,
-            ),
+            Some(provider) => {
+                provider.apply_completion(&self.lines, self.cursor_line, self.cursor_col, item)
+            }
             None => crate::autocomplete::CompletionResult {
                 lines: self.lines.clone(),
                 cursor_line: self.cursor_line,
@@ -106,27 +103,41 @@ impl Editor {
         if self.autocomplete.is_none() {
             let slash_ctx = self.current_slash_command_context();
             let c = ch.chars().next().unwrap_or(' ');
-            if c == '/'
-                && matches!(&slash_ctx, Some(ctx) if ctx.kind == crate::autocomplete::SlashKind::Name)
-            {
+            let slash_name_slash = c == '/'
+                && matches!(&slash_ctx, Some(ctx) if ctx.kind == crate::autocomplete::SlashKind::Name);
+            let slash_word_char =
+                slash_ctx.is_some() && (c.is_ascii_alphanumeric() || ".-_".contains(c));
+            if slash_name_slash || slash_word_char {
                 self.request_autocomplete(false, false);
-            } else if c == '@' || c == '#' {
-                let current_line = &self.lines[self.cursor_line];
-                let before = char_prefix(current_line, self.cursor_col);
-                let prev = char_at(&before, before.chars().count().saturating_sub(2));
-                if before.chars().count() <= 1 || prev == Some(' ') || prev == Some('\t') {
-                    self.request_autocomplete(false, false);
-                }
-            } else if c.is_ascii_alphanumeric() || ".-_".contains(c) {
-                let current_line = &self.lines[self.cursor_line];
-                let before = char_prefix(current_line, self.cursor_col);
-                if slash_ctx.is_some() || ends_with_symbol_token(&before) {
-                    self.request_autocomplete(false, false);
-                }
+            } else {
+                self.request_autocomplete_in_symbol_token();
             }
         } else {
             self.refresh_autocomplete_after_edit(false);
         }
+    }
+
+    /// Request suggestions when the cursor ends an `@`/`#` token or an
+    /// emoji `:name` query: any edit inside it — a `/` too, and a
+    /// completion that keeps it open (an applied directory, `@src/`) —
+    /// lists what the token now matches.
+    pub(crate) fn request_autocomplete_in_symbol_token(&mut self) {
+        if self.cursor_ends_symbol_token() {
+            self.request_autocomplete(false, false);
+        }
+    }
+
+    fn cursor_ends_symbol_token(&self) -> bool {
+        let line = &self.lines[self.cursor_line];
+        let before = char_prefix(line, self.cursor_col);
+        let next = line.chars().nth(self.cursor_col);
+        ends_with_symbol_token(&before)
+            || crate::path_token::at_token_before(
+                &before.chars().collect::<Vec<_>>(),
+                next.as_ref(),
+            )
+            .is_some()
+            || self.emoji_query().is_some()
     }
 
     pub(crate) fn request_autocomplete(&mut self, force: bool, explicit_tab: bool) {
@@ -188,6 +199,10 @@ impl Editor {
     }
 
     fn run_autocomplete_request(&mut self, request: PendingAutocomplete) {
+        if let Some((_, name)) = self.emoji_query() {
+            self.apply_suggestions(Some(Self::emoji_suggestions(&name)), request);
+            return;
+        }
         let Some(provider) = self.autocomplete_provider.as_ref() else {
             return;
         };
@@ -233,11 +248,11 @@ impl Editor {
             let item = suggestions.items[0].clone();
             self.push_undo_snapshot();
             self.last_action = None;
-            let prefix = suggestions.prefix;
-            let result = self.apply_completion(&item, &prefix);
+            let result = self.apply_completion(&item, suggestions.kind);
             self.lines = result.lines;
             self.cursor_line = result.cursor_line;
             self.set_cursor_col(result.cursor_col);
+            self.request_autocomplete_in_symbol_token();
             self.emit(EditorEvent::Changed(self.get_text()));
             return;
         }
@@ -251,12 +266,8 @@ impl Editor {
             } else {
                 suggestions.prefix.clone()
             };
-        let mut state = crate::autocomplete::AutocompleteState::new(
-            suggestions.items,
-            5,
-            suggestions.prefix.clone(),
-            suggestions.kind,
-        );
+        let mut state =
+            crate::autocomplete::AutocompleteState::new(suggestions.items, 5, suggestions.kind);
         if let Some(idx) = state.best_match_index(&matching_prefix) {
             state.set_selected_index(idx);
         }
@@ -270,15 +281,23 @@ impl Editor {
     }
 
     pub(crate) fn refresh_autocomplete_after_edit(&mut self, retrigger: bool) {
-        let current_line = &self.lines[self.cursor_line];
-        let before = char_prefix(current_line, self.cursor_col);
         let has_ctx =
-            self.current_slash_command_context().is_some() || ends_with_symbol_token(&before);
+            self.current_slash_command_context().is_some() || self.cursor_ends_symbol_token();
 
         // An edit that empties the prompt cancels both the open menu and the
         // parked request (a parked request can exist without an open menu; if it
         // survived, it would materialize a dropdown on an empty prompt).
         if self.get_text().trim().is_empty() {
+            self.cancel_autocomplete();
+            return;
+        }
+        // The emoji menu lives only as long as its `:name` token: a closing
+        // colon or a space dismisses it instead of asking the provider anew.
+        let emoji_menu = self
+            .autocomplete
+            .as_ref()
+            .is_some_and(|s| s.kind == Some(crate::autocomplete::SuggestionKind::Emoji));
+        if emoji_menu && self.emoji_query().is_none() {
             self.cancel_autocomplete();
             return;
         }
@@ -299,6 +318,26 @@ impl Editor {
         self.autocomplete_search = None;
         if was {
             self.emit(EditorEvent::AutocompleteToggled(false));
+        }
+    }
+}
+
+#[cfg(test)]
+impl Editor {
+    /// Wait for the actual search response, with a failure deadline rather than idle polling.
+    pub(super) fn settle_autocomplete_search(&mut self) {
+        while self.has_pending_autocomplete() {
+            if self.pending_autocomplete.is_some() {
+                self.materialize_autocomplete();
+            }
+            if let Some(active) = self.autocomplete_search.take() {
+                let result = active
+                    .search
+                    .results
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("autocomplete search must send its result");
+                self.apply_suggestions(result, active.request);
+            }
         }
     }
 }

@@ -27,12 +27,13 @@ use crate::kernel::shared::{
     KernelShutdownOptions, LateSentAgentMessageCallback, StreamName, AGENT_MESSAGE_DISPLAY_MIME,
     ATTACHMENT_DISPLAY_MIME, BASH_ACTIVITY_DISPLAY_MIME, BASH_COMMAND_DISPLAY_MIME,
     DEFAULT_MAX_OUTPUT_CHARS, DEFAULT_SNAPSHOT_DEBOUNCE_MS, DIFF_DISPLAY_MIME,
-    FACTIVITY_SETTLE_TIMEOUT_MS, FACTIVITY_WATCH_TIMEOUT_MS_CAP, HOST_REQUEST_SHUTDOWN_TIMEOUT_MS,
-    KERNEL_ABORT_GRACE_MS, KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE, KERNEL_BUSY_INTERRUPT_INTERVAL_MS,
-    KERNEL_BUSY_REUSE_WAIT_MS, KERNEL_SHUTDOWN_TIMEOUT_MS, KERNEL_STDERR_LOG_BUDGET_MARKER,
-    MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS, MAX_KERNEL_STDERR_CHARS,
-    MAX_KERNEL_STDERR_LOG_BYTES, MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS,
-    RESTORE_EXECUTION_TIMEOUT_MS, SNAPSHOT_EXECUTION_TIMEOUT_MS,
+    END_TURN_REQUEST_TYPE, FACTIVITY_SETTLE_TIMEOUT_MS, FACTIVITY_WATCH_TIMEOUT_MS_CAP,
+    HOST_REQUEST_SHUTDOWN_TIMEOUT_MS, INBOX_MESSAGE_DISPLAY_MIME, KERNEL_ABORT_GRACE_MS,
+    KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE, KERNEL_BUSY_BACKGROUND_CELL_MESSAGE,
+    KERNEL_BUSY_INTERRUPT_INTERVAL_MS, KERNEL_BUSY_REUSE_WAIT_MS, KERNEL_SHUTDOWN_TIMEOUT_MS,
+    KERNEL_STDERR_LOG_BUDGET_MARKER, MAX_ATTACHMENT_DATA_CHARS, MAX_BACKGROUND_OUTPUT_CHARS,
+    MAX_KERNEL_STDERR_CHARS, MAX_KERNEL_STDERR_LOG_BYTES, MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS,
+    RESTORE_EXECUTION_TIMEOUT_MS, SNAPSHOT_EXECUTION_TIMEOUT_MS, TRANSCRIPT_READ_DISPLAY_MIME,
 };
 use crate::kernel::state_snapshot::{
     RestoreResult, SnapshotResult, SnapshotSkip, DEFAULT_SNAPSHOT_MAX_BYTES,
@@ -68,51 +69,60 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KernelState {
-    Idle,
-    Starting,
-    Running,
-    Shutdown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ExitInfo {
     code: Option<i32>,
     signal: Option<i32>,
 }
 
+/// Which running requests a new request must wait out before it starts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Admission {
+    /// Internal ops and state requests: every running request.
+    Exclusive,
+    /// A user cell: attached requests only, so it runs beside backgrounded
+    /// cells (the kernel refuses it while one runs synchronous code).
+    BesideDetached,
+}
+
 /// Fields of a settled execution shared with the stdout reader task.
+#[allow(clippy::struct_excessive_bools)] // independent settlement flags, not a state machine
 #[derive(Default)]
-// The mirrored TS API shape is deliberate (the booleans are the product's own surface).
-#[allow(clippy::struct_excessive_bools)]
 struct ExecBuffers {
-    stdout: String,
-    stderr: String,
-    stdout_chars: usize,
-    stderr_chars: usize,
-    stdout_truncated: bool,
-    stderr_truncated: bool,
+    stdout: HeadTailBuffer,
+    stderr: HeadTailBuffer,
     result: Option<String>,
     diffs: Vec<KernelDiffDisplay>,
     attachments: Vec<KernelAttachment>,
     attachment_oversized: bool,
     sent_agent_messages: Vec<KernelSentAgentMessage>,
     bash_commands: Option<KernelBashCommands>,
+    transcript_reads: Vec<Value>,
+    inbox_messages: Vec<Value>,
     background_output: String,
     background_output_chars: usize,
     background_output_truncated: bool,
     error: Option<KernelError>,
     status: ExecuteStatus,
+    /// The cell called `rlm.end_turn()`; the host-request dispatch marks it.
+    ended_turn: bool,
     done_fields: Option<Value>,
     settled: bool,
 }
 
 pub(crate) struct ActiveExecution {
     request_id: String,
-    code: String,
     started: Instant,
     max_chars: usize,
     opts: ExecuteOptions,
+    /// The call detached from this execution (a wake or the wait budget): its
+    /// result now goes to the background-completion sink. A detached cell is
+    /// never interrupted by a new cell's reuse wait.
+    detached: AtomicBool,
+    /// The execution-local stop signal: a child of the caller's cancellation
+    /// token (or fresh when absent), so a run abort, a manager-targeted user
+    /// cancel, and the hard deadline all reach THIS execution's stop path —
+    /// and stopping it never cancels the provider run or a later cell.
+    stop_signal: crate::kernel::cancellation::AbortSignal,
     /// The request runs user-namespace code (an execute — the bootstrap class
     /// included, internal or not): its settle can rebind or mutate names.
     namespace_code: bool,
@@ -120,6 +130,39 @@ pub(crate) struct ActiveExecution {
     restores_namespace: bool,
     buffers: Mutex<ExecBuffers>,
     result_tx: Mutex<Option<oneshot::Sender<anyhow::Result<InternalExecuteResult>>>>,
+    /// The execution's terminal watch: `true` once the execution settled,
+    /// was rejected by a teardown, or was retired — every watcher
+    /// (out-of-band stop, deadline) selects on it so a terminal execution
+    /// leaves no task awaiting a signal that will never fire.
+    settled_tx: tokio::sync::watch::Sender<bool>,
+}
+
+impl ActiveExecution {
+    /// Mark the execution terminal and wake its watchers: they exit
+    /// instead of awaiting a stop signal that will never fire.
+    pub(crate) fn notify_terminated(&self) {
+        let _ = self.settled_tx.send_if_modified(|settled| {
+            if *settled {
+                false
+            } else {
+                *settled = true;
+                true
+            }
+        });
+    }
+}
+
+/// The kernel error of a user cancel whose interrupt was ignored: the cell
+/// did not stop within the grace, so the kernel was retired — the outcome
+/// names the retirement and the unsnapshotted state it may have lost.
+pub(crate) fn user_cancel_retirement_error() -> crate::kernel::shared::KernelError {
+    crate::kernel::shared::KernelError {
+        ename: "CellUserCancelRetired".to_string(),
+        evalue: "The cell did not stop on its cancel interrupt, so the kernel was retired; \
+unsnapshotted state may be lost."
+            .to_string(),
+        traceback: Vec::new(),
+    }
 }
 
 /// `ExecuteResult` plus the raw fields of the request's `done` event (state ops).
@@ -139,10 +182,82 @@ impl InternalExecuteResult {
                 attachments: None,
                 sent_agent_messages: None,
                 bash_commands: None,
+                transcript_reads: None,
+                inbox_messages: None,
                 background_output: None,
+                ended_turn: false,
                 status: ExecuteStatus::Aborted,
                 error: None,
                 duration_ms: started.elapsed().as_millis() as u64,
+                detached: None,
+            },
+            done_fields: None,
+        }
+    }
+
+    /// The early return of a detached call: the cell keeps running; the
+    /// result carries the partial output so far and the detach marker.
+    fn detached(
+        started: Instant,
+        reason: crate::kernel::shared::DetachReason,
+        cell_id: String,
+        stdout: String,
+        stderr: String,
+    ) -> Self {
+        Self {
+            result: ExecuteResult {
+                stdout,
+                stderr,
+                result: None,
+                diffs: None,
+                attachments: None,
+                sent_agent_messages: None,
+                bash_commands: None,
+                transcript_reads: None,
+                inbox_messages: None,
+                background_output: None,
+                ended_turn: false,
+                status: ExecuteStatus::Ok,
+                error: None,
+                duration_ms: started.elapsed().as_millis() as u64,
+                detached: Some(crate::kernel::shared::DetachedCell { reason, cell_id }),
+            },
+            done_fields: None,
+        }
+    }
+
+    /// The forced-stop completion of a captured execution whose kernel was
+    /// just retired: the partial output so far, and an abort whose error
+    /// names the ignored cancel and the retirement's possible state loss.
+    fn forced_stop(execution: &ActiveExecution) -> Self {
+        let max_chars = execution.max_chars;
+        let (stdout, stderr) = {
+            let buffers = lock(&execution.buffers);
+            (
+                buffers.stdout.snapshot(max_chars),
+                buffers.stderr.snapshot(max_chars),
+            )
+        };
+        Self {
+            result: ExecuteResult {
+                stdout,
+                stderr,
+                result: None,
+                diffs: None,
+                attachments: None,
+                sent_agent_messages: None,
+                bash_commands: None,
+                transcript_reads: None,
+                inbox_messages: None,
+                background_output: None,
+                ended_turn: false,
+                status: ExecuteStatus::Aborted,
+                error: Some(user_cancel_retirement_error()),
+                duration_ms: execution.started.elapsed().as_millis() as u64,
+                // No detach marker: an attached caller sees the forced stop as
+                // its own tool result, and a detached call's continuation
+                // stamps the marker (the original reason and cell id) itself.
+                detached: None,
             },
             done_fields: None,
         }
@@ -261,13 +376,7 @@ struct CaptureFreshness {
 // The mirrored TS API shape is deliberate (the booleans are the product's own surface).
 #[allow(clippy::struct_excessive_bools)]
 struct Guarded {
-    state: KernelState,
-    start_generation: u64,
-    /// Generation whose graceful `shutdown()` owns the teardown, so the exit
-    /// handler must not run it.
-    graceful_shutdown_generation: Option<u64>,
-    teardown_in_flight: u32,
-    startup_protocol_error: Option<String>,
+    lifecycle: KernelLifecycle,
     /// A repair discarded its kernel: the next fresh start must re-run the runtime bootstrap.
     pending_rebootstrap: bool,
     /// Restore the saved namespace on that fresh start too (false when the
@@ -322,11 +431,9 @@ struct Guarded {
     /// never hold the execution queue a python cell needs).
     mcp_status_waiters: HashMap<String, oneshot::Sender<Value>>,
     host_inflight: Vec<tokio::task::JoinHandle<()>>,
-    active_execution: Option<Arc<ActiveExecution>>,
-    /// Source of the most recently started cell, retained after it finishes so
-    /// rlm.run spawns from detached asyncio tasks can still attribute their spawning program.
-    last_cell_code: Option<String>,
-    ready_tx: Option<oneshot::Sender<anyhow::Result<i64>>>,
+    /// Every physically running request, oldest first. More than one only
+    /// when user cells run beside backgrounded (detached) ones.
+    active_executions: Vec<Arc<ActiveExecution>>,
 }
 
 struct ChildHandle {
@@ -359,17 +466,31 @@ pub(crate) struct Inner {
     guarded: Mutex<Guarded>,
     child: Mutex<Option<ChildHandle>>,
     busy_notify: Notify,
-    /// Serializes `execute()` calls — the runtime runs one request at a time.
+    /// Serializes `execute()` calls. A call that detached has released it, so
+    /// a user cell can run beside the backgrounded one.
     execution_queue: tokio::sync::Mutex<()>,
-    start_memo: Mutex<Option<Arc<MemoSlot>>>,
     shutdown_memo: Mutex<Option<Arc<MemoSlot>>>,
     rebootstrap_memo: Mutex<Option<Arc<MemoSlot>>>,
     flush_memo: Mutex<Option<Arc<MemoSlot>>>,
     snapshot_timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// A capture that failed stays owed (the usual cause is a detached
+    /// cell holding the kernel): the cell's settle (any status, kernel
+    /// alive) retries it, so the last settled namespace cannot stay
+    /// unsnapshotted behind a backgrounded cell.
+    snapshot_owed: std::sync::atomic::AtomicBool,
     stderr_closed: Notify,
     stderr_closed_flag: AtomicBool,
     /// File receiving pre-ready kernel stderr, with its remaining write budget.
     stderr_log: Mutex<Option<Arc<Mutex<StderrLog>>>>,
+    /// The session-scoped count of detached cells awaiting their terminal
+    /// admission; the session provisioner shares its own counter with every
+    /// manager it creates, and a directly constructed manager owns a
+    /// private default.
+    pending_detached_completions: Arc<crate::kernel::shared::PendingDetachedCompletions>,
+    /// This manager retired its kernel because a cell ignored its stop
+    /// interrupt: the provisioner turns the flag into the next foreground
+    /// result's kernel-restart note when it revives a replacement.
+    retired_for_ignored_interrupt: AtomicBool,
 }
 
 struct StderrLog {
@@ -377,10 +498,51 @@ struct StderrLog {
     budget: u64,
 }
 
+impl Guarded {
+    /// Whether `execution` is one of the physically running requests.
+    fn holds(&self, execution: &Arc<ActiveExecution>) -> bool {
+        self.active_executions
+            .iter()
+            .any(|active| Arc::ptr_eq(active, execution))
+    }
+
+    /// The running request that owns protocol id `id`.
+    fn active_execution(&self, id: &str) -> Option<Arc<ActiveExecution>> {
+        self.active_executions
+            .iter()
+            .find(|active| active.request_id == id)
+            .cloned()
+    }
+}
+
 impl Inner {
+    /// Fire the stop of every running execution `filter` selects; `false`
+    /// when it selects none.
+    fn stop_active_executions(&self, filter: impl Fn(&ActiveExecution) -> bool) -> bool {
+        let executions: Vec<_> = lock(&self.guarded)
+            .active_executions
+            .iter()
+            .filter(|execution| filter(execution))
+            .cloned()
+            .collect();
+        for execution in &executions {
+            execution.stop_signal.abort();
+        }
+        !executions.is_empty()
+    }
+
+    /// Whether a detached (backgrounded) execution is physically active:
+    /// internal ops queued behind it cannot run until the cell settles.
+    pub(crate) fn has_detached_active_execution(&self) -> bool {
+        lock(&self.guarded)
+            .active_executions
+            .iter()
+            .any(|execution| execution.detached.load(Ordering::SeqCst))
+    }
+
     /// Fire the embedding's background-work settlement notice: the settlement is already recorded,
     /// so a host-callback panic neither breaks the kernel event path nor aborts the teardown.
-    fn notify_background_work_settled(&self) {
+    pub(crate) fn notify_background_work_settled(&self) {
         let Some(callback) = self.options.on_background_work_settled.clone() else {
             return;
         };
@@ -401,7 +563,7 @@ impl Drop for Inner {
     fn drop(&mut self) {
         // Synchronous best-effort cleanup.
         self.supersede_protocol_repair();
-        lock(&self.guarded).state = KernelState::Shutdown;
+        lock(&self.guarded).lifecycle.transition(Lifecycle::Defunct);
         live_kernels::remove_inner(self);
         self.cleanup_resources(Signal::Kill);
     }
@@ -413,29 +575,33 @@ mod delegations;
 mod events;
 mod execution;
 mod host_requests;
+mod lifecycle;
 mod repair;
 mod requests;
 mod snapshot;
 mod startup;
 mod teardown;
 
-use requests::{append_truncated, describe_failure, Signal};
+use lifecycle::{KernelLifecycle, Lifecycle, Starting};
+use requests::{append_truncated, describe_failure, HeadTailBuffer, Signal};
 
 // Public API
 
 impl ReplKernelManager {
     #[must_use]
     pub fn new(options: KernelManagerOptions) -> Self {
+        let pending_detached_completions = options
+            .pending_detached_completions
+            .clone()
+            .unwrap_or_else(|| {
+                Arc::new(crate::kernel::shared::PendingDetachedCompletions::default())
+            });
         let inner = Arc::new(Inner {
             options,
             freshness_stat_probe: std::sync::atomic::AtomicBool::new(false),
             resolved_python: Mutex::new(None),
             guarded: Mutex::new(Guarded {
-                state: KernelState::Idle,
-                start_generation: 0,
-                graceful_shutdown_generation: None,
-                teardown_in_flight: 0,
-                startup_protocol_error: None,
+                lifecycle: KernelLifecycle::new(),
                 pending_rebootstrap: false,
                 pending_restore: false,
                 completed_executions: 0,
@@ -461,21 +627,21 @@ impl ReplKernelManager {
                 factory_activity_waiters: HashMap::new(),
                 mcp_status_waiters: HashMap::new(),
                 host_inflight: Vec::new(),
-                active_execution: None,
-                last_cell_code: None,
-                ready_tx: None,
+                active_executions: Vec::new(),
             }),
             child: Mutex::new(None),
             busy_notify: Notify::new(),
             execution_queue: tokio::sync::Mutex::new(()),
-            start_memo: Mutex::new(None),
             shutdown_memo: Mutex::new(None),
             rebootstrap_memo: Mutex::new(None),
             flush_memo: Mutex::new(None),
             snapshot_timer: Mutex::new(None),
+            snapshot_owed: std::sync::atomic::AtomicBool::new(false),
             stderr_closed: Notify::new(),
             stderr_closed_flag: AtomicBool::new(false),
             stderr_log: Mutex::new(None),
+            pending_detached_completions,
+            retired_for_ignored_interrupt: AtomicBool::new(false),
         });
         Self { inner }
     }
@@ -485,9 +651,49 @@ impl ReplKernelManager {
         self.inner.options.session_id.as_deref()
     }
 
+    /// Whether any background `bash()` handle is live: the `> 0` form of
+    /// [`Self::background_bash_handle_count`], read by the CLI's inline
+    /// quiescence drive through `SessionEngine::has_background_bash`.
     #[must_use]
     pub fn has_background_work(&self) -> bool {
-        !lock(&self.inner.guarded).background_bash_handles.is_empty()
+        self.background_bash_handle_count() > 0
+    }
+
+    /// The number of detached cells whose terminal outcome is not yet
+    /// admitted (the count is released only after the terminal sink call):
+    /// a cell stays outstanding until its notice lands, not just until the
+    /// physical execution clears. Shared with the session provisioner, so a
+    /// replacement manager cannot hide an older pending notice.
+    #[must_use]
+    pub fn pending_detached_completions(&self) -> usize {
+        self.inner.pending_detached_completions.count()
+    }
+
+    /// Stop the kernel's current USER executions out-of-band (attached and
+    /// detached): an interrupt now; when the interrupt is ignored, an
+    /// attached cell is force-aborted and a detached one retires the
+    /// kernel. `false` when no user execution is active —
+    /// internal ops (bootstrap, restore, snapshot) are never targeted.
+    #[must_use]
+    pub fn abort_user_execution(&self) -> bool {
+        self.inner
+            .stop_active_executions(|execution| !execution.opts.internal)
+    }
+
+    /// Stop only detached (backgrounded) executions — the scoped idle
+    /// cancel's target; attached work is never touched. `false` when no
+    /// detached execution is running.
+    #[must_use]
+    pub fn abort_detached_execution(&self) -> bool {
+        self.inner
+            .stop_active_executions(|execution| execution.detached.load(Ordering::SeqCst))
+    }
+
+    /// The number of live background `bash()` handles (the count behind
+    /// [`Self::has_background_work`], read by the quiescence observation).
+    #[must_use]
+    pub fn background_bash_handle_count(&self) -> usize {
+        lock(&self.inner.guarded).background_bash_handles.len()
     }
 
     /// Process id of the spawned kernel child, when present. Used by tests and
@@ -499,13 +705,30 @@ impl ReplKernelManager {
 
     #[must_use]
     pub fn is_running(&self) -> bool {
-        lock(&self.inner.guarded).state == KernelState::Running
+        lock(&self.inner.guarded).lifecycle.is_running()
     }
 
-    /// Terminal: the kernel died or was torn down; only a fresh manager can serve again.
+    /// The kernel died or was torn down (or a graceful shutdown is under way): only a
+    /// fresh manager can serve again.
     #[must_use]
     pub fn is_defunct(&self) -> bool {
-        lock(&self.inner.guarded).state == KernelState::Shutdown
+        match lock(&self.inner.guarded).lifecycle.current() {
+            Lifecycle::ShuttingDown { .. } | Lifecycle::Defunct => true,
+            Lifecycle::Idle
+            | Lifecycle::Starting(_)
+            | Lifecycle::Running
+            | Lifecycle::Discarding => false,
+        }
+    }
+
+    /// Whether this manager's kernel was retired because its cell ignored
+    /// a stop interrupt: the provisioner's revival reads it so the next
+    /// foreground result carries the kernel-restart note.
+    #[must_use]
+    pub fn retired_for_ignored_interrupt(&self) -> bool {
+        self.inner
+            .retired_for_ignored_interrupt
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Diagnostics tail (kernel stderr, at most the last 8 KiB).
@@ -528,35 +751,35 @@ impl ReplKernelManager {
         }
         // The guard is strictly scoped: a conditionally dropped non-Send
         // MutexGuard would make the whole future non-Send.
-        let existing = lock(&self.inner.start_memo).as_ref().cloned();
-        if let Some(existing) = existing {
-            return existing
+        let (slot, owner) = {
+            let mut g = lock(&self.inner.guarded);
+            match g.lifecycle.current() {
+                Lifecycle::Starting(Starting {
+                    start: Some(slot), ..
+                }) => (slot.clone(), false),
+                Lifecycle::Idle => {
+                    let slot = MemoSlot::new();
+                    g.lifecycle.transition(Lifecycle::starting(slot.clone()));
+                    (slot, true)
+                }
+                Lifecycle::Starting(Starting { start: None, .. })
+                | Lifecycle::Running
+                | Lifecycle::ShuttingDown { .. }
+                | Lifecycle::Discarding
+                | Lifecycle::Defunct => return Ok(()),
+            }
+        };
+        if !owner {
+            return slot
                 .wait_or_abort(options.signal.as_ref(), "Kernel startup aborted")
                 .await;
         }
-        let slot = {
-            let mut memo = lock(&self.inner.start_memo);
-            let slot = MemoSlot::new();
-            *memo = Some(slot.clone());
-            slot
-        };
         // Owner: run the startup to completion in a task so the caller\'s abort
         // signal can abandon the wait without killing the kernel for others.
         let inner = self.inner.clone();
         let run_slot = slot.clone();
         let wait_signal = options.signal.clone();
-        let task = tokio::spawn(async move {
-            let result = inner.do_start(&options).await;
-            run_slot.finish(result.as_ref().err().map(|e| anyhow!("{e:#}")));
-            if result.is_err() {
-                let mut memo = lock(&inner.start_memo);
-                // Only clear our own memoization: a stale start must not evict a newer one.
-                if matches!(memo.as_ref(), Some(current) if Arc::ptr_eq(current, &run_slot)) {
-                    *memo = None;
-                }
-            }
-            result
-        });
+        let task = tokio::spawn(async move { inner.run_start(&options, &run_slot).await });
         match wait_signal.as_ref() {
             None => match task.await {
                 Ok(result) => result,
@@ -611,7 +834,11 @@ impl ReplKernelManager {
         let result = self
             .enqueue_execute(code, opts, execution_timeout_ms)
             .await?;
-        if result.result.status == ExecuteStatus::Ok {
+        // An ok cell that settled committed its namespace changes: refresh
+        // the snapshot, or a crash would revive a namespace missing the cell.
+        // A detached call's cell is still running: its continuation schedules
+        // the snapshot at its own settlement.
+        if result.result.status == ExecuteStatus::Ok && result.result.detached.is_none() {
             self.schedule_snapshot();
         }
         Ok(result.result)
@@ -628,7 +855,6 @@ impl ReplKernelManager {
             Request::Execute {
                 code: code.to_string(),
             },
-            code,
             opts,
             execution_timeout_ms,
         )
@@ -817,10 +1043,7 @@ impl ReplKernelManager {
             signal,
             ..ExecuteOptions::default()
         };
-        match self
-            .enqueue_request(Request::ListNames, "", opts, None)
-            .await
-        {
+        match self.enqueue_request(Request::ListNames, opts, None).await {
             Ok(r) if r.result.status == ExecuteStatus::Ok => {
                 let names = r
                     .done_fields
@@ -943,7 +1166,6 @@ impl ReplKernelManager {
             *memo = Some(slot.clone());
             slot
         };
-        lock(&self.inner.guarded).teardown_in_flight += 1;
         self.supersede_protocol_repair();
         let inner = self.inner.clone();
         let result = tokio::spawn(async move {
@@ -957,38 +1179,14 @@ impl ReplKernelManager {
         })
         .await
         .unwrap_or(false);
-        lock(&self.inner.guarded).teardown_in_flight -= 1;
         Ok(result)
-    }
-
-    /// Restart the kernel: shut it down with the default options, then start
-    /// it again. Does nothing when a concurrent teardown wins the shutdown.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when a dispose flush owns the queue tail, or the shutdown or start fails.
-    pub async fn restart(&self) -> anyhow::Result<()> {
-        // Taking a slot now and joining the in-flight shutdown would deadlock:
-        // the flush\'s snapshot waits on our slot while we wait on the flush\'s shutdown.
-        if lock(&self.inner.guarded).flushing_snapshot_for_dispose {
-            return Err(anyhow!("Kernel is shutting down"));
-        }
-        let _queue_guard = self.inner.execution_queue.lock().await;
-        let performed = self.shutdown(KernelShutdownOptions::default()).await?;
-        if !performed {
-            return Ok(());
-        }
-        lock(&self.inner.guarded).state = KernelState::Idle;
-        lock(&self.inner.guarded).kernel_stderr.clear();
-        self.start(KernelStartOptions::default()).await
     }
 
     pub fn kill(&self) {
         self.supersede_protocol_repair();
-        {
-            let mut g = lock(&self.inner.guarded);
-            g.state = KernelState::Shutdown;
-        }
+        lock(&self.inner.guarded)
+            .lifecycle
+            .transition(Lifecycle::Defunct);
         live_kernels::remove_inner(&self.inner);
         self.inner.cleanup_resources(Signal::Kill);
     }
@@ -996,7 +1194,9 @@ impl ReplKernelManager {
     /// Synchronous best-effort cleanup. Safe to call from drop paths.
     pub fn dispose_sync(&self) {
         self.supersede_protocol_repair();
-        lock(&self.inner.guarded).state = KernelState::Shutdown;
+        lock(&self.inner.guarded)
+            .lifecycle
+            .transition(Lifecycle::Defunct);
         live_kernels::remove_inner(&self.inner);
         self.inner.cleanup_resources(Signal::Term);
     }

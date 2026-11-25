@@ -8,6 +8,36 @@ use super::{
     DaemonResumeCursor, Deserialize, JsonMap, Serialize, Value,
 };
 
+/// One page of the display transcript (the branch in order, each compaction as its
+/// summary row), bounded by entry-id cursors.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "from", rename_all = "camelCase")]
+pub enum TranscriptPage {
+    /// The newest `limit` rows before the `before` row; the tail without it.
+    End {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<String>,
+        limit: usize,
+    },
+    /// The oldest `limit` rows after the `after` row (the head without it),
+    /// stopping before the `until` row.
+    Start {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<String>,
+        limit: usize,
+    },
+}
+
+impl TranscriptPage {
+    /// Whether the page can reach rows older than a windowed store's loaded suffix.
+    #[must_use]
+    pub fn reads_history(&self) -> bool {
+        !matches!(self, Self::End { before: None, .. })
+    }
+}
+
 /// `type: "command"` envelope wrapping a [`DaemonCommand`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,6 +147,12 @@ pub enum DaemonCommand {
         session_dir: Option<String>,
         #[serde(default)]
         scope: Value,
+        /// The most session files this request folds; `None` walks to the end of the store.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u64>,
+        /// A previous response's `nextCursor`: the walk resumes after that file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
         #[serde(flatten)]
         rest: JsonMap,
     },
@@ -343,6 +379,10 @@ pub enum DaemonCommand {
         id: Option<String>,
         active_session_id: String,
         message: String,
+        /// Queue only into a running turn: an idle, paused, or suspended
+        /// session answers `{queued: false}` and starts nothing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        require_busy: Option<bool>,
         #[serde(flatten)]
         input: PromptInput,
         #[serde(flatten)]
@@ -434,10 +474,17 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// `abort` (scope `None`): the full abort funnel. `scope:
+    /// "background_cell"` targets ONLY the session's detached
+    /// (backgrounded) kernel cell — no queue is touched, no turn is
+    /// aborted, and a session without one changes nothing (the idle
+    /// cancel contract; capability `background_cell_abort`).
     Abort {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
         #[serde(flatten)]
         rest: JsonMap,
     },
@@ -521,6 +568,41 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// Every persistent `bash()` shell machine-wide with its assigned session id.
+    /// Rust-native extension, advertised by the `persistent_shells` capability.
+    ListPersistentShells {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// The saved sessions whose user or assistant message text contains `query`
+    /// (case-insensitive). Rust-native extension, advertised by the `session_content_search`
+    /// capability.
+    SearchSessionContent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_dir: Option<String>,
+        query: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    TailPersistentShell {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        shell_id: String,
+        lines: u32,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    KillPersistentShell {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        shell_id: String,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     /// The `/factory` view's bridge lane over the session kernel's factory
     /// executor (`graph`/`status`/`watch`/`run`/`stop`/`resume`).
     /// Rust-native extension, advertised by the `factory_activity` capability.
@@ -562,6 +644,9 @@ pub enum DaemonCommand {
         /// (the `wait_for_headless_completion` barrier of the same name).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wait_for_rlm_quiescence: Option<bool>,
+        /// Maximum time to wait for the session and its optional RLM subtree to become idle.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
         #[serde(flatten)]
         rest: JsonMap,
     },
@@ -599,6 +684,27 @@ pub enum DaemonCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<String>,
         active_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        page: Option<TranscriptPage>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<Vec<DaemonClientCapability>>,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
+    /// One slice of the session's display transcript:
+    /// `rows[start:][:limit]` over the rows whose role matches a `roles` glob.
+    /// Rust-native extension.
+    GetSessionMessages {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        active_session_id: String,
+        start: i64,
+        limit: u64,
+        roles: Vec<String>,
+        /// The session's file, which the supervisor reads when no worker holds the
+        /// session (a family member's read).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_file: Option<String>,
         #[serde(flatten)]
         rest: JsonMap,
     },

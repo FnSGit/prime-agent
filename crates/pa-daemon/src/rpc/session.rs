@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use pa_agent::agent::Subscription;
+use pa_core::kernel::provisioner::KernelReadyGate;
 use pa_core::session_engine::engine::SessionEngine;
 use pa_core::session_engine::provider_adapter::ProviderTarget;
 use pa_core::session_engine::session_events::agent_event_json;
@@ -24,6 +25,9 @@ pub struct RpcEngineHandle {
     pub model: Model,
     pub api_key: Option<String>,
     pub provider_target: Arc<std::sync::RwLock<Option<ProviderTarget>>>,
+    /// The built engine's background-bash wake: its completion and
+    /// settle seams fire it, and the pump listener parks on it.
+    pub bash_wake: Arc<tokio::sync::Notify>,
     /// The cross-process ownership lease on the opened session file
     /// (`None` for fresh/in-memory sessions the factory created itself).
     pub session_lease: Option<crate::lease::SessionLease>,
@@ -43,6 +47,10 @@ pub enum RpcEngineRequest {
         /// The same-path reopen: the caller adopted the current lease, so
         /// the factory must not re-acquire (its open guard would refuse our own holder).
         reuse_lease: bool,
+        /// Set with `reuse_lease`: both engines share the session's artifact dir, so
+        /// the replacement's kernel restores only after the replaced kernel's final
+        /// snapshot flush.
+        ready_gate: Option<KernelReadyGate>,
     },
 }
 
@@ -238,6 +246,9 @@ impl RpcSession {
             return Err("A signal exit is in progress".to_string());
         }
         let mut adopted_lease = None;
+        // Opens the replacement's ready gate once the replaced kernel is disposed;
+        // dropping it on any early return opens the gate too.
+        let mut replaced_disposed = None;
         let mut request = request;
         // Retire the pumps spawned against the replaced engine BEFORE the
         // settle: a queued pump waking during the wait sees the moved epoch;
@@ -277,6 +288,7 @@ impl RpcSession {
         if let RpcEngineRequest::Open {
             session_path,
             reuse_lease,
+            ready_gate,
         } = &mut request
         {
             let canonical = crate::lease::canonical_session_path(session_path);
@@ -287,6 +299,14 @@ impl RpcSession {
             if same_path {
                 adopted_lease = handle.session_lease.take();
                 *reuse_lease = true;
+                let (disposed, gate) = tokio::sync::watch::channel(false);
+                *ready_gate = Some(Arc::new(move || {
+                    let mut gate = gate.clone();
+                    Box::pin(async move {
+                        let _ = gate.wait_for(|disposed| *disposed).await;
+                    })
+                }));
+                replaced_disposed = Some(disposed);
             }
         }
         // Build the replacement after the settle: a failed assembly
@@ -339,12 +359,21 @@ impl RpcSession {
             }
             return Err("A signal exit is in progress".to_string());
         }
+        if let Some(disposed) = replaced_disposed {
+            let _ = disposed.send(true);
+        }
         // The adopted same-path lease rides the replacement; a fresh-open
         // replacement carries the lease the factory's open guard acquired.
         if adopted_lease.is_some() {
             replacement.session_lease = adopted_lease;
         }
+        // The background-bash listener parks on the retired handle's wake:
+        // fire it so the listener re-reads the LIVE handle (a stored
+        // permit, because it may not be parked yet). Its kick against the
+        // retired engine is dropped by the pump's liveness checks.
+        let retired_bash_wake = Arc::clone(&handle.bash_wake);
         *handle = replacement;
+        retired_bash_wake.notify_one();
         *self.subscription.lock().await = Some(subscription);
         Ok(())
     }
@@ -360,7 +389,9 @@ impl RpcSession {
     }
 
     /// The stdin-close settle: retires the queued-input pumps, waits the
-    /// running turn out, then unsubscribes and disposes the kernel.
+    /// running turn out, unsubscribes, and disposes the kernel. The handle
+    /// retains its lease: bounded kernel disposal may leave host writers
+    /// alive while the process drains its output.
     pub async fn dispose(&self) {
         // Retire the detached pumps first: none may deliver queued input
         // onto the session this settle is about to dispose.
@@ -385,3 +416,6 @@ impl Drop for ReplacingGate<'_> {
         self.0.store(false, Ordering::SeqCst);
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests;

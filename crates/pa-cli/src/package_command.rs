@@ -7,8 +7,8 @@ use crate::config::{get_agent_dir, APP_NAME, CONFIG_DIR_NAME};
 use crate::self_update::SelfUpdateOptions;
 
 use crate::public_command::{
-    DAEMON_UPDATE_RESTART_COORDINATOR_FLAG, DAEMON_UPDATE_RESTART_ORIGIN_FLAG,
-    DAEMON_UPDATE_RESTART_STATUS_FLAG,
+    DAEMON_UPDATE_RESTART_COORDINATOR_FLAG, DAEMON_UPDATE_RESTART_DAEMON_FLAG,
+    DAEMON_UPDATE_RESTART_ORIGIN_FLAG, DAEMON_UPDATE_RESTART_STATUS_FLAG,
 };
 
 /// Result of running a package command: printed output is handled here, and the
@@ -89,6 +89,7 @@ struct PackageCommandOptions {
     conflicting_options: Option<String>,
     source: Option<String>,
     restart_coordinator: bool,
+    restart_daemon: bool,
     restart_daemon_socket: Option<String>,
     restart_status_path: Option<String>,
     restart_origin_active_session_id: Option<String>,
@@ -210,9 +211,13 @@ fn parse_package_command(args: &[String]) -> Option<PackageCommandOptions> {
                     }
                 }
             }
-            DAEMON_UPDATE_RESTART_COORDINATOR_FLAG => {
+            DAEMON_UPDATE_RESTART_COORDINATOR_FLAG | DAEMON_UPDATE_RESTART_DAEMON_FLAG => {
                 if command == PackageCommand::Update {
-                    options.restart_coordinator = true;
+                    if arg == DAEMON_UPDATE_RESTART_COORDINATOR_FLAG {
+                        options.restart_coordinator = true;
+                    } else {
+                        options.restart_daemon = true;
+                    }
                 } else {
                     options
                         .invalid_option
@@ -363,7 +368,7 @@ fn print_package_command_help(command: PackageCommand) {
     let usage = command.usage();
     match command {
         PackageCommand::Install => println!(
-            "Usage:\n  {usage}\n\nInstall a package and add it to settings.\n\nOptions:\n  --local    Install project-locally ({CONFIG_DIR_NAME}/settings.json)\n\nExamples:\n  {APP_NAME} package install npm:@foo/bar\n  {APP_NAME} package install git:github.com/user/repo\n  {APP_NAME} package install git:git@github.com:user/repo\n  {APP_NAME} package install https://github.com/user/repo\n  {APP_NAME} package install ssh://git@github.com/user/repo\n  {APP_NAME} package install ./local/path\n"
+            "Usage:\n  {usage}\n\nInstall a package and add it to user settings.\n\nOptions:\n  --local    Unsupported: repository settings cannot activate packages\n\nExamples:\n  {APP_NAME} package install npm:@foo/bar\n  {APP_NAME} package install git:github.com/user/repo\n  {APP_NAME} package install git:git@github.com:user/repo\n  {APP_NAME} package install https://github.com/user/repo\n  {APP_NAME} package install ssh://git@github.com/user/repo\n  {APP_NAME} package install ./local/path\n"
         ),
         PackageCommand::Remove => println!(
             "Usage:\n  {usage}\n\nRemove a package and its source from settings.\n\nOptions:\n  --local    Remove from project settings ({CONFIG_DIR_NAME}/settings.json)\n\nExamples:\n  {APP_NAME} package remove npm:@foo/bar\n"
@@ -372,7 +377,7 @@ fn print_package_command_help(command: PackageCommand) {
             "Usage:\n  {usage}\n\nUpdate {APP_NAME} or installed packages.\n\nOptions:\n  --self                  Update {APP_NAME} only\n  --extensions            Update installed packages only\n  --extension <source>    Update one package only\n  --force                 Reinstall {APP_NAME} even if the current version is latest\n  --rollback              Restore the previous compiled release\n  --nightly               Switch updates to the nightly channel (unreleased builds, may be broken)\n  --stable                Return updates to the stable channel\n  --daemon-socket <path>  Restart the daemon listening on this exact socket\n\nCommands:\n  {APP_NAME} update                Update {APP_NAME}\n  {APP_NAME} package update        Update installed packages\n  {APP_NAME} package update <source> Update one package\n"
         ),
         PackageCommand::List => println!(
-            "Usage:\n  {usage}\n\nList installed packages from user and project settings.\n"
+            "Usage:\n  {usage}\n\nList active packages from user settings.\n"
         ),
     }
 }
@@ -431,6 +436,31 @@ pub fn handle_package_command(args: &[String]) -> PackageCommandOutcome {
     if let Some(conflict) = &options.conflicting_options {
         return fail(conflict, Some(&format!("Usage: {}", command.usage())));
     }
+    if options.restart_daemon {
+        let Some(socket) = options.restart_daemon_socket else {
+            return fail("Invalid daemon update restart invocation.", None);
+        };
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return fail(
+                    &format!("Could not start the daemon restart runtime: {error}."),
+                    None,
+                );
+            }
+        };
+        return match runtime.block_on(crate::update_flow::daemon_restart::run(
+            std::path::Path::new(&socket),
+        )) {
+            Ok(code) => PackageCommandOutcome {
+                exit_code: Some(code),
+            },
+            Err(error) => fail(&format!("{error:#}"), None),
+        };
+    }
     if options.restart_coordinator {
         // The detached coordinator mode (spec §4): this process adopts the staged
         // status file and drives the FSM to a terminal state.
@@ -460,6 +490,7 @@ pub fn handle_package_command(args: &[String]) -> PackageCommandOutcome {
         let exit_code = runtime.block_on(crate::update_flow::update_command::run_coordinator_mode(
             socket_path,
             status_path,
+            options.restart_origin_active_session_id.as_deref(),
         ));
         return match exit_code {
             Ok(code) => PackageCommandOutcome {
@@ -481,6 +512,13 @@ pub fn handle_package_command(args: &[String]) -> PackageCommandOutcome {
         return fail(
             &format!("Missing {command_name} source."),
             Some(&format!("Usage: {}", command.usage())),
+        );
+    }
+
+    if command == PackageCommand::Install && options.local {
+        return fail(
+            "Project packages are not activated from repository settings. Install without --local to use your user settings.",
+            None,
         );
     }
 

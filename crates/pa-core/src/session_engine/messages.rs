@@ -9,7 +9,7 @@ use pa_types::ai::{
 use pa_types::session::AgentMessage;
 use std::fmt::Write as _;
 
-pub const COMPACTION_SUMMARY_PREFIX: &str = "[compaction-summary]\n\nThe conversation history before this point was compacted into the following summary.\nThe retained messages below are authoritative; this summary may lag behind them.\n\n<summary>\n";
+pub const COMPACTION_SUMMARY_PREFIX: &str = "[compaction-summary]\n\nThe conversation history before this point was compacted into the following summary.\nThe retained messages below are authoritative; this summary may lag behind them.\nBackground work may have progressed during compaction; treat resource statuses as last-observed and refresh them before relying on them.\n\n<summary>\n";
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
 pub const BRANCH_SUMMARY_PREFIX: &str = "[branch-summary]\n\nThe following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
 pub const BRANCH_SUMMARY_SUFFIX: &str = "\n</summary>";
@@ -26,6 +26,10 @@ pub const REFINEMENT_NOTICE_CUSTOM_TYPE: &str = "refinement_notice";
 /// DIVERGENCE, operator ruling 2026-09-23): a user-facing disclosure, never
 /// model context — `convert_to_llm` drops it.
 pub const PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE: &str = "provider_retry_outcome";
+/// TS `MCP_CONNECTION_OUTCOME_CUSTOM_TYPE`: the durable row an MCP
+/// connect/disconnect leaves in the transcript (produced by the TS-era
+/// daemon; the row is bookkeeping, never model context).
+pub const MCP_CONNECTION_OUTCOME_CUSTOM_TYPE: &str = "mcp_connection_outcome";
 pub const HEARTBEAT_PROMPT_CUSTOM_TYPE: &str = "heartbeat_prompt";
 /// The durable row a detached kernel bash completion admits as the
 /// woken turn's injected prompt.
@@ -38,9 +42,19 @@ pub const SESSION_RENAMED_CUSTOM_TYPE: &str = "session_renamed";
 /// notice's queued row carries (the TUI renders it with its own label,
 /// no lane prefix).
 pub const ASYNC_BASH_COMPLETION_PREVIEW_LABEL: &str = "Background command finished";
+/// The durable row a factory run milestone (`factory.progress`) admits on
+/// the owning session's steering lane.
+pub const FACTORY_PROGRESS_NOTICE_CUSTOM_TYPE: &str = "factory_progress_notice";
+/// The queue-strip label the factory progress notice's queued row carries.
+pub const FACTORY_PROGRESS_PREVIEW_LABEL: &str = "Factory progress";
 /// The queue-strip preview label for a parked heartbeat fire; the queued row reads
 /// `Heartbeat prompt: <content>` instead of the lane-labeled preview.
 pub const HEARTBEAT_PROMPT_PREVIEW_LABEL: &str = "Heartbeat prompt";
+/// The durable row an auto-backgrounded cell's completion admits as the
+/// woken turn's injected prompt (`[cell-done ...]`).
+pub const ASYNC_BACKGROUND_CELL_COMPLETION_CUSTOM_TYPE: &str = "async_background_cell";
+/// The queue-strip label the completion notice's queued row carries.
+pub const BACKGROUND_CELL_PREVIEW_LABEL: &str = "Background cell finished";
 
 /// Why an unsuccessful compaction ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +242,109 @@ pub fn create_async_bash_completion_message(
     }
 }
 
+/// The auto-backgrounded cell's completion notice:
+/// `[cell-done id:<id> status:<status> duration:<d>]` plus a bounded tail of
+/// the cell's output (the one settled-output composition the foreground
+/// tool result shares, so a host stop's cause rides the model-visible
+/// text). Rich completions (image attachments) ride content blocks beside
+/// the text header — the inbox's text-only route declines block content,
+/// so those rows deliver through the full-row lane while text-only
+/// completions stay in the inbox. The details keep the row's identity
+/// only (the inbox class maps on the custom type).
+#[must_use]
+pub fn create_background_cell_completion_message(
+    cell_id: &str,
+    status: &str,
+    duration_ms: u64,
+    reason: &str,
+    output: &str,
+    images: &[crate::kernel::shared::KernelAttachment],
+    timestamp: u64,
+) -> pa_types::session::CustomMessage {
+    const OUTPUT_TAIL_CAP: usize = 2_000;
+    let header_id = sanitize_message_header_value(cell_id);
+    let seconds = duration_ms / 1000;
+    let tenths = (duration_ms % 1000) / 100;
+    let mut text =
+        format!("[cell-done id:{header_id} status:{status} duration:{seconds}.{tenths}s]");
+    let output = output.trim_end();
+    if !output.is_empty() {
+        let tail = if output.len() > OUTPUT_TAIL_CAP {
+            let cut = output.len() - OUTPUT_TAIL_CAP;
+            let cut = output
+                .char_indices()
+                .map(|(i, _)| i)
+                .find(|i| *i >= cut)
+                .unwrap_or(cut);
+            &output[cut..]
+        } else {
+            output
+        };
+        text.push_str("\n\n");
+        text.push_str(tail);
+    }
+    let content = if images.is_empty() {
+        UserContent::Text(text)
+    } else {
+        let mut blocks = vec![UserContentBlock::Text(pa_types::ai::TextContent {
+            text,
+            text_signature: None,
+            rest: serde_json::Map::default(),
+        })];
+        blocks.extend(images.iter().map(|image| {
+            UserContentBlock::Image(pa_types::ai::ImageContent {
+                data: image.data.clone(),
+                mime_type: image.mime_type.clone(),
+                rest: serde_json::Map::default(),
+            })
+        }));
+        UserContent::Blocks(blocks)
+    };
+    let details = serde_json::json!({
+        "cellId": cell_id,
+        "status": status,
+        "durationMs": duration_ms,
+        "reason": reason,
+    });
+    pa_types::session::CustomMessage {
+        custom_type: ASYNC_BACKGROUND_CELL_COMPLETION_CUSTOM_TYPE.to_string(),
+        content,
+        display: true,
+        details: Some(details),
+        timestamp,
+        rest: serde_json::Map::default(),
+    }
+}
+
+/// The factory run milestone notice: `[factory-progress run:<id>] <kind>: <detail>`,
+/// the kernel's `snake_case` kind rendered with hyphens (`budget_exceeded` reads
+/// `budget-exceeded`). The details keep the kernel's raw values.
+#[must_use]
+pub fn create_factory_progress_message(
+    run_id: &str,
+    kind: &str,
+    node: Option<&str>,
+    detail: &str,
+    timestamp: u64,
+) -> pa_types::session::CustomMessage {
+    let header_run = sanitize_message_header_value(run_id);
+    let header_kind = sanitize_message_header_value(&kind.replace('_', "-"));
+    let mut details = serde_json::json!({ "runId": run_id, "kind": kind, "detail": detail });
+    if let Some(node) = node {
+        details["node"] = serde_json::json!(node);
+    }
+    pa_types::session::CustomMessage {
+        custom_type: FACTORY_PROGRESS_NOTICE_CUSTOM_TYPE.to_string(),
+        content: UserContent::Text(format!(
+            "[factory-progress run:{header_run}] {header_kind}: {detail}"
+        )),
+        display: true,
+        details: Some(details),
+        timestamp,
+        rest: serde_json::Map::default(),
+    }
+}
+
 /// Bash output rendered as a fenced block with a fence longer than any
 /// backtick run inside the output.
 fn bash_output_to_text(
@@ -323,8 +440,12 @@ pub fn convert_to_llm(messages: &[AgentMessage]) -> Vec<AgentMessage> {
                     SESSION_SLASH_COMMAND_CUSTOM_TYPE
                         | SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE
                         | COMPACTION_OUTCOME_CUSTOM_TYPE
+                        | MCP_CONNECTION_OUTCOME_CUSTOM_TYPE
                         | REFINEMENT_OUTCOME_CUSTOM_TYPE
                         | PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE
+                        | crate::prompts::model_prompts::MODEL_PROMPT_ERROR_CUSTOM_TYPE
+                        | super::skill_problems_notice::SKILL_PROBLEMS_CUSTOM_TYPE
+                        | super::model_resolution_notice::MODEL_RESOLUTION_WARNING_CUSTOM_TYPE
                 ) {
                     continue;
                 }
@@ -464,6 +585,33 @@ mod tests {
         assert!(
             converted.is_empty(),
             "outcome row must not convert to LLM context"
+        );
+    }
+
+    #[test]
+    fn model_prompt_error_row_is_never_context() {
+        let message = crate::prompts::model_prompts::model_prompt_error_message(&[
+            "/x/model-prompts.toml: bad TOML".to_string(),
+        ]);
+        assert!(convert_to_llm(&[AgentMessage::Custom(message)]).is_empty());
+    }
+
+    /// TS `MCP_CONNECTION_OUTCOME_CUSTOM_TYPE`: the durable MCP
+    /// login/disconnect line is bookkeeping, never model context.
+    #[test]
+    fn mcp_connection_outcome_row_is_never_context() {
+        // The literal is the on-disk value a TS-era session file carries.
+        let message = pa_types::session::CustomMessage {
+            custom_type: "mcp_connection_outcome".to_string(),
+            content: UserContent::Text("Connected acme (12 tools verified).".to_string()),
+            display: true,
+            details: None,
+            timestamp: 0,
+            rest: serde_json::Map::default(),
+        };
+        assert!(
+            convert_to_llm(&[AgentMessage::Custom(message)]).is_empty(),
+            "the MCP connection outcome row must drop out of model context"
         );
     }
 

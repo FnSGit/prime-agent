@@ -9,7 +9,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::runtime::QueuedGoalContextPurge;
-use crate::cron::store::AgentCronJobStore;
 use crate::kernel::bootstrap::KernelPythonSkill;
 use crate::kernel::provisioner::{
     IpythonKernelProvisioner as KernelProvisioner, IpythonKernelProvisionerOptions,
@@ -19,7 +18,7 @@ use crate::session::manager::SessionManager;
 use crate::skills::{get_python_skill_runtime_info, Skill};
 use crate::tools::ipython::{
     IpythonKernelProvisioner, IpythonToolOptions, KernelAttachment, KernelErrorInfo,
-    KernelExecError, KernelExecuteOptions, KernelExecutor,
+    KernelExecuteOptions, KernelExecutor,
 };
 
 use super::host_requests::SessionBinding;
@@ -35,6 +34,13 @@ pub struct RlmWiring {
     /// Child-session machinery backing `rlm.spawn`/`rlm.create_session` and
     /// the roster/collect/delete surface.
     pub subagent_host: Option<Arc<dyn RlmSubagentHost>>,
+    pub usage_store: Option<Arc<dyn super::rlm_usage::RlmChildUsageStore>>,
+    /// Announces every accepted `rlm.progress.note`; `None` keeps the store
+    /// the only surface.
+    pub progress_note_emit: Option<super::rlm_host::RlmProgressNoteEmit>,
+    /// The daemon-owned agent inbox whose `rlm.inbox.*` host requests
+    /// register here; `None` (daemonless) keeps the requests unregistered.
+    pub inbox: Option<Arc<super::inbox::SessionInbox>>,
 }
 
 /// The embedding's cron wiring for the kernel's `rlm_heartbeat.*` host
@@ -89,8 +95,10 @@ pub struct SessionKernelWiring {
     pub rlm_usage: Arc<super::rlm_usage::RlmChildUsageAttributions>,
 }
 
-/// Build the session runtime and register the `goal.*`, `rlm_heartbeat.*`, and `rlm.*`
-/// host handlers; `goal_complete_purge` is the embedding's queued-goal-context purge.
+/// Build the session runtime and register the `goal.*`, `rlm.*`, the
+/// `rlm.inbox.*` requests when an inbox store is supplied, and — only
+/// when `cron_store` wiring exists — the `rlm_heartbeat.*` host
+/// handlers; `goal_complete_purge` is the embedding's queued-goal-context purge.
 #[must_use]
 pub fn wire_session_runtime(
     session: SessionManager,
@@ -130,16 +138,14 @@ pub fn wire_session_runtime(
         ),
         None => fallback_binding(),
     };
-    // An embedding-owned store replaces the engine-private one, so
-    // kernel `rlm_heartbeat.*` writes reach the daemon catalog; the
-    // private file store remains the embedded/standalone default.
+    // An embedding-owned store, so kernel `rlm_heartbeat.*` writes reach
+    // the daemon catalog. Kernel heartbeat requests need the embedding's
+    // scheduler to fire the jobs they create: without cron wiring they
+    // stay unregistered (TS registers only with the heartbeat controller).
     let mutation_hook = cron_store
         .as_ref()
         .and_then(|wiring| wiring.mutation_hook.clone());
-    let cron_store = cron_store.map_or_else(
-        || Arc::new(AgentCronJobStore::new(agent_dir.join("cron-jobs.json"))),
-        |wiring| wiring.store,
-    );
+    let cron_store = cron_store.map(|wiring| wiring.store);
     let mut runtime = SessionRuntime::new(&session, cron_store, active_session_id, binding);
     if let Some(purge) = goal_complete_purge {
         runtime.set_goal_complete_purge(purge);
@@ -153,17 +159,14 @@ pub fn wire_session_runtime(
     runtime.register_host_handlers(session.clone(), &mut handlers);
     let model_registry = rlm.model_registry.unwrap_or_else(|| {
         let auth = crate::auth::AuthStorage::create(agent_dir);
-        let mut registry =
-            crate::models::registry::ModelRegistry::create(auth, agent_dir.join("models.json"));
-        // Adopt the on-disk private authorization before freezing the Arc:
-        // `rlm.find_models` and child-spawn resolution search this registry, and a
-        // fresh registry otherwise gates every private `internal/*` model out (only
-        // the async refresh populates the authorized set).
-        registry.load_private_authorization_from_cache();
-        Arc::new(registry)
+        Arc::new(crate::models::registry::ModelRegistry::create(
+            auth,
+            agent_dir.join("models.json"),
+        ))
     });
     let rlm_usage = Arc::new(super::rlm_usage::RlmChildUsageAttributions::new(
-        session.clone(),
+        rlm.usage_store
+            .unwrap_or_else(|| Arc::new(super::rlm_usage::SessionUsageStore(session.clone()))),
     ));
     // The daemon supplies the child-session host; an embedding without
     // one keeps the no-children behavior, whose self-rename appends the
@@ -175,8 +178,12 @@ pub fn wire_session_runtime(
         model_registry,
         subagent_host,
         rlm_usage.clone(),
+        rlm.progress_note_emit,
     ));
     register_rlm_host_handlers(&mut handlers, &rlm_bridge);
+    if let Some(inbox) = &rlm.inbox {
+        super::inbox::register_inbox_host_handlers(inbox, &mut handlers);
+    }
     SessionKernelWiring {
         session,
         handlers,
@@ -184,6 +191,33 @@ pub fn wire_session_runtime(
         rlm: rlm_bridge,
         rlm_usage,
     }
+}
+
+/// Bundled skills whose kernel host requests are controller-backed: the
+/// skill is model-visible only when its host request is registered (the
+/// registry decides, like TS `_modelVisibleSkills` reads its controllers).
+const CONTROLLER_BACKED_SKILLS: [(&str, &str); 3] = [
+    // skills/agent-message sends `agent_message.send`.
+    ("agent-message", "agent_message.send"),
+    // skills/agent-observe sends `agent_observe.list`.
+    ("agent-observe", "agent_observe.list"),
+    // skills/rlm-heartbeat sends `rlm_heartbeat.create`.
+    ("rlm-heartbeat", "rlm_heartbeat.create"),
+];
+
+/// The model-visible skill list for a final host-handler registry: a
+/// controller-backed bundled skill whose host request is not registered
+/// (print/RPC builds without that wiring) drops out.
+#[must_use]
+pub fn model_visible_skills(skills: Vec<Skill>, handlers: &HostRequestHandlers) -> Vec<Skill> {
+    skills
+        .into_iter()
+        .filter(|skill| {
+            !CONTROLLER_BACKED_SKILLS
+                .iter()
+                .any(|(name, request)| skill.name == *name && handlers.get(request).is_none())
+        })
+        .collect()
 }
 
 /// Kernel-side Python skill modules, pre-imported at bootstrap.
@@ -203,7 +237,13 @@ pub fn kernel_python_skills(skills: &[Skill]) -> Vec<KernelPythonSkill> {
 /// Build the kernel provisioner for a session: host handlers for the goal/heartbeat bridge
 /// plus the pre-imported skills. The session's agent dir is propagated into the kernel env
 /// (`PRIME_AGENT_CODING_AGENT_DIR`): an embedding host whose ambient env differs must not
-/// leak its own paths into the kernel (#109). `cwd` is the SESSION's working directory.
+/// leak its own paths into the kernel (#109). A persistent session's artifact dir is
+/// likewise propagated (`RLM_SESSION_DIR` + `RLM_HARNESS_STATE_DIR`), so kernel-side
+/// harness writes land in the session-local store. The artifact dir is keyed by the
+/// durable session id (the session file's stem), exported as `RLM_SESSION_ID` for the
+/// persistent `bash()` shells' assignment. `cwd` is the SESSION's working directory.
+/// `shell_path` is the session-start-resolved kernel shell: an invalid `shellPath` fails
+/// `create_session`, not the kernel boot.
 #[allow(clippy::too_many_arguments)] // one wiring funnel, same style as AgentSession::from_session_arc
 #[must_use]
 pub fn kernel_provisioner(
@@ -212,37 +252,108 @@ pub fn kernel_provisioner(
     python_skills: Vec<KernelPythonSkill>,
     cwd: std::path::PathBuf,
     agent_dir: &std::path::Path,
-    snapshot_dir: Option<std::path::PathBuf>,
+    shell_path: Option<std::path::PathBuf>,
+    command_prefix: Option<String>,
+    websearch_env: Vec<(String, String)>,
+    session_artifact_dir: Option<std::path::PathBuf>,
+    cell_timeout_ms: Option<u64>,
+    cell_wake: Arc<crate::kernel::cell_wake::CellWake>,
+    on_background_cell: Option<crate::kernel::shared::BackgroundCellCallback>,
     on_restore: Option<crate::kernel::provisioner::RestoreCallback>,
     on_background_work_settled: Option<crate::kernel::shared::BackgroundWorkSettledCallback>,
     on_unavailable_skills: Option<crate::kernel::provisioner::UnavailableSkillsCallback>,
     on_bootstrap_result: Option<crate::kernel::provisioner::KernelBootstrapResultHandler>,
+    ready_gate: Option<crate::kernel::provisioner::KernelReadyGate>,
 ) -> Arc<KernelProvisioner> {
-    let mut env = HashMap::with_capacity(1);
+    let mut env = HashMap::with_capacity(3);
     env.insert(
         "PRIME_AGENT_CODING_AGENT_DIR".to_string(),
         agent_dir.to_string_lossy().to_string(),
     );
+    // Always set: an unsaved session blanks an inherited id (a run started inside another
+    // session's kernel), so its persistent shells never join that session.
+    let rlm_session_id = session_artifact_dir
+        .as_deref()
+        .and_then(std::path::Path::file_name)
+        .map(|id| id.to_string_lossy().to_string())
+        .unwrap_or_default();
+    env.insert("RLM_SESSION_ID".to_string(), rlm_session_id);
+    for (key, value) in [
+        ("RLM_SESSION_DIR", session_artifact_dir.clone()),
+        (
+            "RLM_HARNESS_STATE_DIR",
+            crate::refinement::get_local_harness_state_dir(session_artifact_dir.as_deref()),
+        ),
+    ] {
+        if let Some(value) = value {
+            env.insert(key.to_string(), value.to_string_lossy().to_string());
+        }
+    }
+    env.extend(websearch_env);
     Arc::new(KernelProvisioner::new(
         cwd,
         IpythonKernelProvisionerOptions {
             python: None,
             env,
-            command_prefix: None,
-            shell_path: None,
+            command_prefix,
+            shell_path,
             session_id: Some(session_id),
             host_handlers: handlers,
             python_skills,
             // Only persistent sessions (which have an artifact dir) get
             // a revivable snapshot (TS `snapshotDir`).
-            snapshot_dir,
-            ready_gate: None,
+            snapshot_dir: session_artifact_dir,
+            // The engine-resolved default cell wait budget (`None`: daemonless;
+            // the runtime bootstrap and state ops never arm it).
+            cell_timeout_ms,
+            cell_wake: Some(cell_wake),
+            on_background_cell,
+            ready_gate,
             on_restore,
             on_background_work_settled,
             on_unavailable_skills,
             on_bootstrap_result,
         },
     ))
+}
+
+/// The websearch skill's kernel env, only when a websearch skill is loaded:
+/// the selected provider (`PRIME_AGENT_WEBSEARCH_PROVIDER`, so the settings
+/// choice stays host-side) and, per TS `_addWebsearchKeyEnv`
+/// (agent-session.ts:11137-11158), the provider's stored key under its env
+/// var when the ambient env does not already carry a nonblank one and the
+/// stored credential is an api key that resolves non-empty. The websearch
+/// skill's own `!command` key refs cannot resolve in-kernel, so the host
+/// resolves them here; the caller reads the credential and runs this off the
+/// async runtime, because a `!command` key can block.
+#[must_use]
+pub(crate) fn websearch_env(
+    skills: &[Skill],
+    provider: crate::settings::WebSearchProvider,
+    credential: Option<crate::auth::AuthCredential>,
+) -> Vec<(String, String)> {
+    if !skills.iter().any(|skill| skill.name == "websearch") {
+        return Vec::new();
+    }
+    let mut env = vec![(
+        "PRIME_AGENT_WEBSEARCH_PROVIDER".to_string(),
+        provider.id().to_string(),
+    )];
+    if std::env::var(provider.api_key_env()).is_ok_and(|value| !value.trim().is_empty()) {
+        return env;
+    }
+    let key = match credential {
+        Some(crate::auth::AuthCredential::ApiKey { key, .. }) => {
+            crate::auth::resolve_config_value::resolve_config_value(&key)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        }
+        _ => None,
+    };
+    if let Some(key) = key {
+        env.push((provider.api_key_env().to_string(), key));
+    }
+    env
 }
 
 impl IpythonKernelProvisioner for KernelProvisioner {
@@ -257,21 +368,37 @@ impl IpythonKernelProvisioner for KernelProvisioner {
             // wraps it in its own abort signal.
             let signal = signal.map(crate::kernel::cancellation::AbortSignal::from_token);
             let manager = this.ensure(on_progress, signal).await?;
-            Ok(Box::new(KernelManagerExecutor { manager }) as Box<dyn KernelExecutor>)
+            let cell_timeout_ms = this.cell_timeout_ms();
+            let cell_wake = this.cell_wake();
+            let on_background_cell = this.on_background_cell();
+            Ok(Box::new(KernelManagerExecutor {
+                manager,
+                cell_timeout_ms,
+                cell_wake,
+                on_background_cell,
+            }) as Box<dyn KernelExecutor>)
         })
     }
 
     fn kill(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let this = self.clone();
-        Box::pin(async move {
-            this.kill();
-        })
+        Box::pin(async move { this.kill_and_wait().await })
+    }
+
+    fn take_kernel_restart_note(&self) -> bool {
+        self.take_kernel_restart_note()
     }
 }
 
 /// Adapts the kernel manager to the ipython tool's executor contract.
 struct KernelManagerExecutor {
     manager: crate::kernel::manager::ReplKernelManager,
+    /// The session's default cell wait budget (`None`: never armed; `0`: disabled).
+    cell_timeout_ms: Option<u64>,
+    /// The session's shared cell wake (`None`: waits never end early).
+    cell_wake: Option<Arc<crate::kernel::cell_wake::CellWake>>,
+    /// Receives auto-backgrounded cells' late completions (`None`: dropped).
+    on_background_cell: Option<crate::kernel::shared::BackgroundCellCallback>,
 }
 
 impl KernelExecutor for KernelManagerExecutor {
@@ -279,16 +406,20 @@ impl KernelExecutor for KernelManagerExecutor {
         &self,
         code: &str,
         options: KernelExecuteOptions<'_>,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<crate::tools::ipython::ExecuteResult, KernelExecError>>
-                + Send,
-        >,
-    > {
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<crate::tools::ipython::ExecuteResult>> + Send>>
+    {
         let manager = self.manager.clone();
         let code = code.to_string();
         let signal = options.signal;
         let on_late_sent_agent_message = options.on_late_sent_agent_message;
+        // The session decides whether cells are budgeted at all; the model's
+        // per-call `timeout` only replaces the default budget.
+        let cell_timeout_ms = self
+            .cell_timeout_ms
+            .filter(|ms| *ms > 0)
+            .map(|default_ms| options.timeout_ms.unwrap_or(default_ms));
+        let cell_wake = self.cell_wake.clone();
+        let on_background_cell = self.on_background_cell.clone();
         Box::pin(async move {
             let result = manager
                 .execute(
@@ -296,13 +427,27 @@ impl KernelExecutor for KernelManagerExecutor {
                     crate::kernel::shared::ExecuteOptions {
                         signal: signal.map(crate::kernel::cancellation::AbortSignal::from_token),
                         on_late_sent_agent_message,
+                        cell_timeout_ms,
+                        wake: cell_wake,
+                        on_background_cell,
                         ..Default::default()
                     },
                 )
-                .await
-                .map_err(KernelExecError::Other)?;
+                .await?;
             Ok(convert_execute_result(result))
         })
+    }
+}
+
+/// Whether the cell time limit arms for this session. Daemonless sessions
+/// keep `await bash()` unbounded by design (#3523): every over-limit cell
+/// there would be a sanctioned long await with no background lane to move
+/// to, so the limit arms only in daemon-backed sessions.
+pub(crate) fn arm_cell_timeout_ms(daemonless: bool, settings_ms: u64) -> Option<u64> {
+    if daemonless {
+        None
+    } else {
+        Some(settings_ms)
     }
 }
 
@@ -318,7 +463,10 @@ fn convert_status(
     }
 }
 
-fn convert_execute_result(
+/// The ONE kernel-to-tool settled-result conversion: the foreground tool
+/// result and the background completion notice both compose through it,
+/// so the two lanes share one result shape and one formatter.
+pub(crate) fn convert_execute_result(
     result: crate::kernel::shared::ExecuteResult,
 ) -> crate::tools::ipython::ExecuteResult {
     crate::tools::ipython::ExecuteResult {
@@ -342,8 +490,13 @@ fn convert_execute_result(
                 data: attachment.data,
             })
             .collect(),
+        diffs: result.diffs.unwrap_or_default(),
         sent_agent_messages: result.sent_agent_messages.unwrap_or_default(),
         bash_commands: result.bash_commands,
+        transcript_reads: result.transcript_reads.unwrap_or_default(),
+        inbox_messages: result.inbox_messages.unwrap_or_default(),
+        detached: result.detached,
+        ended_turn: result.ended_turn,
     }
 }
 
@@ -355,7 +508,113 @@ pub fn ipython_tool_options(
 ) -> IpythonToolOptions {
     IpythonToolOptions {
         provisioner,
-        ui: None,
         on_late_sent_agent_message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cron::store::AgentCronJobStore;
+    use crate::kernel::shared::{host_handler, HostRequestHandlers};
+    use serde_json::Value;
+
+    fn cron_wiring(dir: &std::path::Path) -> KernelCronWiring {
+        KernelCronWiring {
+            store: Arc::new(AgentCronJobStore::new(dir.join("jobs.json"))),
+            binding: None,
+            mutation_hook: None,
+        }
+    }
+
+    /// An engine build without cron wiring (print/RPC) serves no
+    /// `rlm_heartbeat.*` requests: no scheduler fires the jobs they create.
+    #[test]
+    fn without_cron_wiring_the_rlm_heartbeat_handlers_stay_unregistered() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionManager::in_memory(dir.path());
+        let wiring = wire_session_runtime(session, dir.path(), RlmWiring::default(), None, None);
+        assert!(wiring.handlers.get("rlm_heartbeat.create").is_none());
+        assert!(wiring.handlers.get("rlm_heartbeat.list").is_none());
+        // The goal surface needs no scheduler and stays registered.
+        assert!(wiring.handlers.get("goal.get").is_some());
+    }
+
+    #[test]
+    fn with_cron_wiring_the_rlm_heartbeat_handlers_register() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionManager::in_memory(dir.path());
+        let wiring = wire_session_runtime(
+            session,
+            dir.path(),
+            RlmWiring::default(),
+            None,
+            Some(cron_wiring(dir.path())),
+        );
+        assert!(wiring.handlers.get("rlm_heartbeat.create").is_some());
+    }
+
+    fn skill_named(name: &str) -> crate::skills::Skill {
+        use crate::skills::{create_synthetic_source_info, SkillKind, SourceScope};
+        crate::skills::Skill {
+            name: name.to_string(),
+            description: "a skill".to_string(),
+            file_path: std::path::PathBuf::from("/skills/SKILL.md"),
+            base_dir: std::path::PathBuf::from("/skills"),
+            source_info: create_synthetic_source_info("/skills", "user", SourceScope::User, None),
+            disable_model_invocation: false,
+            kind: SkillKind::Markdown,
+            python: None,
+        }
+    }
+
+    /// A controller-backed bundled skill whose host request is not
+    /// registered drops out; the registered ones and plain skills stay.
+    #[test]
+    fn model_visible_skills_follow_the_handler_registry() {
+        let skills = vec![
+            skill_named("agent-message"),
+            skill_named("agent-observe"),
+            skill_named("rlm-heartbeat"),
+            skill_named("websearch"),
+        ];
+        let mut handlers = HostRequestHandlers::default();
+        handlers.register(
+            "agent_message.send",
+            host_handler(|_payload| Box::pin(async { Ok(Value::Null) })),
+        );
+        let visible = model_visible_skills(skills, &handlers);
+        let names: Vec<&str> = visible.iter().map(|skill| skill.name.as_str()).collect();
+        assert_eq!(names, ["agent-message", "websearch"]);
+
+        handlers.register(
+            "agent_observe.list",
+            host_handler(|_payload| Box::pin(async { Ok(Value::Null) })),
+        );
+        handlers.register(
+            "rlm_heartbeat.create",
+            host_handler(|_payload| Box::pin(async { Ok(Value::Null) })),
+        );
+        let visible = model_visible_skills(
+            vec![
+                skill_named("agent-message"),
+                skill_named("agent-observe"),
+                skill_named("rlm-heartbeat"),
+            ],
+            &handlers,
+        );
+        assert_eq!(visible.len(), 3);
+    }
+
+    #[test]
+    fn cell_timeout_arms_only_in_daemon_backed_sessions() {
+        // Daemonless sessions keep `await bash()` unbounded by design
+        // (#3523): their over-limit cells are sanctioned long awaits.
+        assert_eq!(arm_cell_timeout_ms(true, 60_000), None);
+        assert_eq!(arm_cell_timeout_ms(true, 0), None);
+        assert_eq!(arm_cell_timeout_ms(false, 60_000), Some(60_000));
+        // A zero setting is the explicit disable: it must reach the
+        // executor as an armed zero budget, not fall back to a default.
+        assert_eq!(arm_cell_timeout_ms(false, 0), Some(0));
     }
 }

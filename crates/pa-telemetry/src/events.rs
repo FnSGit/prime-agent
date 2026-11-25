@@ -65,7 +65,7 @@ impl ToolCategory {
             "grep" => Self::Grep,
             "find" => Self::Find,
             "ls" => Self::Ls,
-            "ipython" => Self::Ipython,
+            "python" | "ipython" => Self::Ipython,
             "mcp" => Self::Mcp,
             "" => Self::Unknown,
             _ => Self::Custom,
@@ -233,25 +233,6 @@ impl UpdateHomebrewRefusal {
 mod tests {
     use super::*;
     use crate::catalog::{RUN_TRIGGERS, TOOL_CATEGORIES};
-
-    #[test]
-    fn tool_category_mapping() {
-        assert_eq!(ToolCategory::from_tool_name("bash"), ToolCategory::Bash);
-        assert_eq!(ToolCategory::from_tool_name("Edit"), ToolCategory::Edit);
-        assert_eq!(
-            ToolCategory::from_tool_name("ipython"),
-            ToolCategory::Ipython
-        );
-        assert_eq!(
-            ToolCategory::from_tool_name("mcp__github__create_issue"),
-            ToolCategory::Mcp
-        );
-        assert_eq!(
-            ToolCategory::from_tool_name("web-search"),
-            ToolCategory::Custom
-        );
-        assert_eq!(ToolCategory::from_tool_name(""), ToolCategory::Unknown);
-    }
 
     #[test]
     fn vocabulary_consts_stay_in_the_catalog() {

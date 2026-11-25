@@ -15,11 +15,14 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use pa_core::prompts::layers::{self, CORE_LAYER, OPINIONATED_LAYER, PER_MODEL_MAP, USAGE_LAYER};
+use pa_core::prompts::layers::{CORE_LAYER, OPINIONATED_LAYER, USAGE_LAYER};
+use pa_core::prompts::model_prompts::MODEL_PROMPTS_TOML;
 use pa_core::prompts::system_prompt::{
     system_prompt_breakdown, BuildSystemPromptOptions, SegmentKind,
 };
-use pa_core::skills::load_skills_from_dir;
+use pa_core::resources::{ContextFile, LoadedResources};
+use pa_core::settings::{Settings, SettingsManager};
+use pa_core::skills::{load_skills_from_dir, Skill};
 
 /// The workspace bundled skills directory (source-checkout layout):
 /// pa-core lives at `<root>/crates/pa-core`.
@@ -31,13 +34,41 @@ fn bundled_skills_dir() -> std::path::PathBuf {
         .join("skills")
 }
 
-fn sorted_bundled_skills() -> Vec<pa_core::skills::Skill> {
+fn sorted_bundled_skills() -> Vec<Skill> {
     let skills_dir = bundled_skills_dir();
     let mut loaded = load_skills_from_dir(&skills_dir, "package");
     loaded
         .skills
         .sort_by(|left, right| left.name.cmp(&right.name));
     loaded.skills
+}
+
+fn default_settings() -> SettingsManager {
+    SettingsManager::in_memory(&Settings::default())
+}
+
+/// A root daemon session's prompt inputs over borrowed settings,
+/// resources, and skills.
+fn session_options<'a>(
+    settings: &'a SettingsManager,
+    resources: &'a LoadedResources,
+    skills: &'a [Skill],
+) -> BuildSystemPromptOptions<'a> {
+    BuildSystemPromptOptions {
+        settings,
+        resources,
+        skills,
+        selected_tools: vec!["python_repl"],
+        model_prompt_extras: None,
+        model_input: &[],
+        cwd: "/w".to_string(),
+        messages_path: Some("/log.jsonl".to_string()),
+        generic_mcp_servers: Vec::new(),
+        rlm_depth: 0,
+        factory_child: false,
+        daemonless: false,
+        can_spawn: false,
+    }
 }
 
 // Cache safety
@@ -52,7 +83,6 @@ const DYNAMIC_ONLY_MARKERS: &[&str] = &[
     "<available_skills>",
     "Enabled generic MCP servers:",
     "# Project Context",
-    "# Additional Guidance",
     "Pre-installed Python packages:",
     "You are a child agent spawned by",
 ];
@@ -63,7 +93,7 @@ fn static_layers_contain_no_dynamic_content() {
         ("core", CORE_LAYER),
         ("usage", USAGE_LAYER),
         ("opinionated", OPINIONATED_LAYER),
-        ("per-model", PER_MODEL_MAP),
+        ("model-prompts", MODEL_PROMPTS_TOML),
     ] {
         for marker in DYNAMIC_ONLY_MARKERS {
             assert!(
@@ -77,24 +107,32 @@ fn static_layers_contain_no_dynamic_content() {
 
 #[test]
 fn cached_prefix_is_stable_across_sessions() {
-    let mut options = BuildSystemPromptOptions {
-        cwd: "/first/cwd".to_string(),
-        messages_path: Some("/first/session.jsonl".to_string()),
-        model: Some("mock/mock-1"),
-        skills: sorted_bundled_skills(),
-        selected_tools: Some(vec!["ipython"]),
-        ..Default::default()
-    };
+    let skills = sorted_bundled_skills();
+    let settings = default_settings();
+    let resources = LoadedResources::default();
+    let mut options = session_options(&settings, &resources, &skills);
+    options.cwd = "/first/cwd".to_string();
+    options.messages_path = Some("/first/session.jsonl".to_string());
+    options.model_prompt_extras = Some("model guidance.");
     let first = system_prompt_breakdown(&options);
 
+    let other_settings = SettingsManager::in_memory(
+        &serde_json::from_value(serde_json::json!({ "agentInbox": { "enabled": false } })).unwrap(),
+    );
+    let other_resources = LoadedResources {
+        agents_files: vec![ContextFile {
+            path: "AGENTS.md".into(),
+            content: "Never commit main.".into(),
+        }],
+        append_system_prompt: vec!["And one more thing.".into()],
+        ..Default::default()
+    };
+    let mut options = session_options(&other_settings, &other_resources, &skills);
     options.cwd = "/completely/different".into();
     options.messages_path = None;
-    options.rlm_depth = Some(3);
-    options.rlm_parent_agent = Some("orchestrator");
+    options.model_prompt_extras = Some("model guidance.");
+    options.rlm_depth = 3;
     options.generic_mcp_servers = vec!["slack".into(), "github".into()];
-    options.context_files = vec![("AGENTS.md".into(), "Never commit main.".into())];
-    options.prompt_guidelines = Some(vec!["prefer tabs".into()]);
-    options.append_system_prompt = Some("And one more thing.".into());
     let second = system_prompt_breakdown(&options);
 
     assert_eq!(first.cached_prefix_len, second.cached_prefix_len);
@@ -104,7 +142,12 @@ fn cached_prefix_is_stable_across_sessions() {
     );
     assert_eq!(
         &first.assembled[..first.cached_prefix_len],
-        layers::static_prefix(Some("mock/mock-1"))
+        &format!(
+            "{}\n\n{}\n\n{}\n\nmodel guidance.",
+            CORE_LAYER.trim(),
+            USAGE_LAYER.trim(),
+            OPINIONATED_LAYER.trim()
+        )
     );
 
     let first_tail = &first.assembled[first.cached_prefix_len..];
@@ -117,9 +160,8 @@ fn cached_prefix_is_stable_across_sessions() {
     assert!(second_tail.contains("/completely/different"));
     assert!(second_tail.contains("Enabled generic MCP servers: `github`, `slack`."));
     assert!(second_tail.contains("Recursive agent depth: 3 (not root)"));
-    assert!(second_tail.contains("You are a child agent spawned by orchestrator."));
+    assert!(second_tail.contains("You are a child agent spawned by your parent agent."));
     assert!(second_tail.contains("# Project Context"));
-    assert!(second_tail.contains("# Additional Guidance"));
     assert!(second_tail.ends_with("And one more thing."));
 
     for segment in &first.segments {
@@ -140,8 +182,18 @@ fn cached_prefix_is_stable_across_sessions() {
 
 /// Host-request types that are host-internal plumbing, not model-facing
 /// programmatic tools (the prompt must not document them).
-const INTERNAL_HOST_REQUESTS: &[&str] =
-    &["model.info", "mcp.config", "mcp.refresh", "mcp.begin_login"];
+const INTERNAL_HOST_REQUESTS: &[&str] = &[
+    "model.info",
+    "mcp.config",
+    "mcp.refresh",
+    "mcp.begin_login",
+    // The runtime's detached-bash notice pair (the kernel's bash module
+    // fires them; the model never calls them).
+    "bash.completed",
+    "bash.consumed",
+    // The factory module reports run milestones; the model never calls it.
+    "factory.progress",
+];
 
 /// Map one registered host-request type to the prompt token that documents
 /// it. `None` when the request is host-internal.
@@ -156,6 +208,7 @@ fn prompt_token_for_host_request(request: &str) -> Option<String> {
             "agent_observe.list" | "agent_message.list_agents" => "agent_observe.list_agents",
             "agent_observe.get" => "agent_observe.get_agent",
             "agent_observe.recent" => "agent_observe.recent_messages",
+            "agent_observe.session_messages" => "rlm.session.messages",
             other => other,
         }
         .to_string(),
@@ -171,9 +224,11 @@ const KERNEL_LOCAL_TOKENS: &[&str] = &[
     "mcp.describe_tool",
 ];
 
-/// The harness-state API of the vendored runtime (`rlm.harness` CRUD and
-/// `rlm.get_harness_state`). Update together with the runtime sidecar.
+/// The vendored runtime's harness-state API (`rlm.harness` CRUD and
+/// `rlm.get_harness_state`) plus its sanctioned terminal turn call
+/// (`rlm.end_turn`). Update together with the runtime sidecar.
 const HARNESS_TOKENS: &[&str] = &[
+    "rlm.end_turn",
     "rlm.harness.create_memory",
     "rlm.harness.update_memory",
     "rlm.harness.delete_memory",
@@ -227,12 +282,17 @@ fn registered_host_requests() -> BTreeSet<String> {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("read source");
-            // Direct registrations: the first string literal after each
-            // `.register(` (the request type comes first in the call).
+            // Direct registrations: the request type is the FIRST
+            // argument of each `.register(` — a literal right at the
+            // call's head counts; anything after a non-literal first
+            // argument is not the request type.
             for remainder in source.split(".register(").skip(1) {
-                if let Some(literal) = first_string_literal(remainder) {
-                    if is_request_type_literal(&literal) {
-                        found.insert(literal);
+                let rest = remainder.trim_start();
+                if rest.starts_with('"') {
+                    if let Some(literal) = first_string_literal(rest) {
+                        if is_request_type_literal(&literal) {
+                            found.insert(literal);
+                        }
                     }
                 }
             }
@@ -281,7 +341,7 @@ fn all_string_literals(text: &str) -> Vec<String> {
 /// Kernel-bound REPL names from the real bootstrap code (`rlm`, `bash`,
 /// `mcp`), derived from `build_rlm_bootstrap_code`.
 fn kernel_bound_names() -> BTreeSet<String> {
-    let code = pa_core::kernel::bootstrap::build_rlm_bootstrap_code(&[]);
+    let code = pa_core::kernel::bootstrap::build_rlm_bootstrap_code(&[], false);
     let mut names = BTreeSet::new();
     for line in code.lines() {
         let line = line.trim_start();
@@ -344,10 +404,21 @@ fn auth_gated_bundled_skills() -> BTreeSet<String> {
         .collect()
 }
 
+/// Conditionally-available bundled skills: the websearch skill rides with its
+/// credential (an unset `bundledSkills.websearch` resolves with the selected
+/// provider's stored or ambient key), so keyless installs exclude it — it must never be
+/// documented as static core-tool surface; the dynamic skills inventory
+/// renders it only on installs where it resolves enabled.
+fn settings_gated_bundled_skills() -> BTreeSet<String> {
+    ["websearch".to_string()].into_iter().collect()
+}
+
 /// (import name, public functions) for every bundled Python skill that is
-/// always available (auth-gated integrations excluded).
+/// always available (auth-gated integrations and the conditionally-available
+/// websearch skill excluded).
 fn bundled_python_skills() -> Vec<(String, Vec<String>)> {
     let gated = auth_gated_bundled_skills();
+    let settings_gated = settings_gated_bundled_skills();
     sorted_bundled_skills()
         .into_iter()
         .filter(|skill| {
@@ -356,6 +427,7 @@ fn bundled_python_skills() -> Vec<(String, Vec<String>)> {
                 .as_ref()
                 .is_none_or(|python| !gated.contains(&python.import_name))
         })
+        .filter(|skill| !settings_gated.contains(&skill.name))
         .filter_map(|skill| {
             let python = skill.python?;
             let mut functions = python_skill_functions(&python.package_path)
@@ -482,42 +554,44 @@ fn core_layer_documents_the_real_tool_surface() {
     }
 }
 
-// Packaged-set parity (TS packages/coding-agent/skills)
+// Packaged-set discovery
 
-/// The packaged skill set at TS tip `f62dae4d0` (`packages/coding-agent/skills/`): 12 skills — the
-/// generic `mcp` doc skill in, the per-service linear/notion pair out (TS removed theirs when the
-/// generic MCP surface landed).
-const TS_PACKAGED_SKILL_SET: &[&str] = &[
-    "agent-message",
-    "agent-observe",
-    "attach-image",
-    "compact",
-    "edit",
-    "goal",
-    "mcp",
-    "prime-intellect",
-    "refine",
-    "rlm-heartbeat",
-    "skill-creator",
-    "websearch",
-];
-
-/// The bundled skills directory matches the TS packaged set name-for-name: the generic `mcp` skill
-/// is present and markdown-only, and the retired per-service pair (linear/notion) is gone.
+/// Every shipped skill directory is discoverable: the bundled `skills/` tree
+/// loads name-for-name through the real discovery path, so a broken SKILL.md
+/// (frontmatter that fails to parse, an empty description) fails here instead
+/// of silently vanishing from the prompt and `/skill:<name>` lookup.
 #[test]
-fn bundled_skills_match_the_ts_packaged_set() {
-    let skills = sorted_bundled_skills();
-    let names: Vec<&str> = skills.iter().map(|skill| skill.name.as_str()).collect();
-    let mut expected = TS_PACKAGED_SKILL_SET.to_vec();
-    expected.sort_unstable();
-    assert_eq!(
-        names, expected,
-        "the packaged skill set must match the TS packaged set"
-    );
+fn every_shipped_skill_is_discoverable() {
+    let skills_dir = bundled_skills_dir();
+    let mut shipped: Vec<String> = std::fs::read_dir(&skills_dir)
+        .expect("bundled skills directory")
+        .filter_map(|entry| {
+            let entry = entry.expect("skill dir entry");
+            (entry.path().join("SKILL.md").is_file())
+                .then(|| entry.file_name().to_string_lossy().into_owned())
+        })
+        .collect();
+    shipped.sort_unstable();
     assert!(
-        !names.contains(&"linear") && !names.contains(&"notion"),
-        "the per-service MCP skills retired with the generic mcp skill"
+        !shipped.is_empty(),
+        "the bundled skills directory must ship skills"
     );
+
+    let skills = sorted_bundled_skills();
+    let loaded: Vec<String> = skills.iter().map(|skill| skill.name.clone()).collect();
+    assert_eq!(
+        loaded, shipped,
+        "every shipped skill directory must be discoverable"
+    );
+    for skill in &skills {
+        assert_eq!(
+            skill.file_path,
+            skills_dir.join(&skill.name).join("SKILL.md"),
+            "skill {} must load from its shipped directory",
+            skill.name
+        );
+    }
+
     let mcp_skill = skills
         .iter()
         .find(|skill| skill.name == "mcp")
@@ -526,10 +600,25 @@ fn bundled_skills_match_the_ts_packaged_set() {
         mcp_skill.python.is_none(),
         "the mcp skill is documentation for the pre-imported runtime module, not a Python package"
     );
-    assert_eq!(
-        mcp_skill.description,
-        "Use external MCP services generically from Python - search the supported-service catalog, inspect the user's connections, discover live tool schemas, and call tools on any connection (Notion, Linear, Slack, and the rest of the catalog) without per-service packages."
-    );
+}
+
+/// The bounded-await contract renders wherever the Python REPL does: every session kind, daemon
+/// or daemonless, registers the bash completion notice the degrade relies on.
+#[test]
+fn bounded_await_contract_renders_in_daemon_and_daemonless_sessions() {
+    let skills = sorted_bundled_skills();
+    let settings = default_settings();
+    let resources = LoadedResources::default();
+    let mut options = session_options(&settings, &resources, &skills);
+    for daemonless in [false, true] {
+        options.daemonless = daemonless;
+        let prompt = system_prompt_breakdown(&options).assembled;
+        assert!(
+            prompt.contains("`r.running` is True")
+                && prompt.contains("`r.exit_code` is None"),
+            "daemonless={daemonless}: the prompt must carry the bounded-await result contract: {prompt}"
+        );
+    }
 }
 
 /// The generic mcp skill loads through the normal markdown discovery and renders in the
@@ -537,14 +626,10 @@ fn bundled_skills_match_the_ts_packaged_set() {
 /// location]`-style XML the TS `formatSkillsForPrompt` emits, without a `python_import` line.
 #[test]
 fn generic_mcp_skill_renders_in_the_prompt_inventory() {
-    let mut options = BuildSystemPromptOptions {
-        cwd: "/w".to_string(),
-        messages_path: Some("/log.jsonl".to_string()),
-        model: Some("mock/mock-1"),
-        skills: sorted_bundled_skills(),
-        selected_tools: Some(vec!["ipython"]),
-        ..Default::default()
-    };
+    let skills = sorted_bundled_skills();
+    let settings = default_settings();
+    let resources = LoadedResources::default();
+    let mut options = session_options(&settings, &resources, &skills);
     let breakdown = system_prompt_breakdown(&options);
     let inventory = breakdown
         .segments
@@ -573,4 +658,17 @@ fn generic_mcp_skill_renders_in_the_prompt_inventory() {
     assert!(second
         .assembled
         .contains("await mcp.list_tools(\"notion\")"));
+}
+
+// Async turn discipline
+
+/// Since #3580 every session kind wakes on bash completion: daemonless runs
+/// get a queued `[bash-done]` turn, so the static usage layer must not carry
+/// the pre-#3580 rule to await commands before ending the turn.
+#[test]
+fn usage_layer_has_no_await_before_turn_end_rule() {
+    assert!(
+        !USAGE_LAYER.contains("await commands before ending the turn"),
+        "every session kind has completion notifications: the await-before-turn-end rule is stale"
+    );
 }

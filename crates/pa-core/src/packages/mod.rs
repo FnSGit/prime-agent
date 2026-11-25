@@ -20,7 +20,7 @@ pub use manager::{
     ProgressAction, ProgressEvent, ProgressEventKind, UserOrProject,
 };
 pub use resolve::{
-    MetadataSource, MissingSourceAction, PathMetadata, ResolvedPaths, ResolvedResource,
+    DisabledBy, MetadataSource, MissingSourceAction, PathMetadata, ResolvedPaths, ResolvedResource,
     ResourceOrigin, ResourceType,
 };
 pub use source::{parse_git_url, GitSource, LocalSource, NpmSource, ParsedSource, SourceScope};
@@ -112,7 +112,8 @@ pub(crate) fn source_checkout_root() -> Option<&'static std::path::Path> {
 /// `getBundledSkillsDir`): `skills/` next to the executable (the packaged
 /// layout), falling back to the workspace `skills/` for source checkouts
 /// (TS keeps built-in skills at the package root next to `src/`).
-pub(crate) fn get_bundled_skills_dir() -> PathBuf {
+#[must_use]
+pub fn get_bundled_skills_dir() -> PathBuf {
     let packaged = package_dir().join("skills");
     if packaged.is_dir() {
         return packaged;

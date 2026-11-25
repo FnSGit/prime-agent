@@ -9,6 +9,8 @@ use serde_json::Value;
 
 use crate::kernel::bootstrap::KernelPythonSkill;
 
+/// Per-cell stdout/stderr cap. `HeadTailBuffer` splits it between head and
+/// tail, so a long failing run keeps its printed verdict.
 pub const DEFAULT_MAX_OUTPUT_CHARS: usize = 65_536;
 pub const HOST_REQUEST_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 pub const KERNEL_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
@@ -27,8 +29,16 @@ pub const BOOTSTRAP_EXECUTION_TIMEOUT_MS: u64 = 500;
 pub const KERNEL_ABORT_GRACE_MS: u64 = 1_000;
 pub const KERNEL_BUSY_REUSE_WAIT_MS: u64 = 5_000;
 pub const KERNEL_BUSY_INTERRUPT_INTERVAL_MS: u64 = 500;
+/// How long a wait whose wake level was already pending at the write
+/// settles for before detaching: a quick cell answers its own tool result
+/// inline (one model turn saved), while a long cell backgrounds promptly
+/// and the steer proceeds.
+pub const KERNEL_LEVEL_WAKE_SETTLE_MS: u64 = 250;
 pub const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS: usize = 256;
 pub const KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE: &str = "The Python kernel is still running the previously interrupted cell. Wait and try again, or kill the kernel to start fresh.";
+/// The message when a state request or the runtime bootstrap cannot start
+/// because a backgrounded cell is still running (user cells run beside it).
+pub const KERNEL_BUSY_BACKGROUND_CELL_MESSAGE: &str = "The Python kernel is still running a backgrounded cell, so this request cannot start until it settles. Read the cell's completion notice when it arrives. The user can cancel backgrounded work; a cell that ignores the cancel's interrupt has its kernel retired.";
 
 /// Cap for unattributed background output buffered between and during cells.
 pub const MAX_BACKGROUND_OUTPUT_CHARS: usize = 64 * 1024;
@@ -65,6 +75,20 @@ pub const AGENT_MESSAGE_DISPLAY_MIME: &str = "application/vnd.prime-agent.agent-
 pub const BASH_ACTIVITY_DISPLAY_MIME: &str = "application/vnd.prime-agent.bash-activity+json";
 /// One `bash()` call's command text (capped) and non-blank line count.
 pub const BASH_COMMAND_DISPLAY_MIME: &str = "application/vnd.prime-agent.bash-command+json";
+/// One `rlm.session.messages` read: `{returned, first, total, roles}`.
+pub const TRANSCRIPT_READ_DISPLAY_MIME: &str = "application/vnd.prime-agent.transcript-read+json";
+/// One message an `rlm.inbox.read` returned, as its wire dict (display only).
+pub const INBOX_MESSAGE_DISPLAY_MIME: &str = "application/vnd.prime-agent.inbox-message+json";
+/// The kernel host request that reports a background bash completion
+/// (the `[bash-done]` lane). The daemon registers the handler
+/// (`bash_notices`), and the provisioner keys the bounded-await bootstrap
+/// default on its presence.
+pub const BASH_COMPLETED_REQUEST_TYPE: &str = "bash.completed";
+
+/// The kernel host request that ends the turn from inside a cell
+/// (`rlm.end_turn()`). The host-request dispatch answers it by marking
+/// the executing cell's result, so the turn ends once the batch settles.
+pub const END_TURN_REQUEST_TYPE: &str = "rlm.end_turn";
 
 pub const EXECUTE_STATUS_OK: &str = "ok";
 pub const EXECUTE_STATUS_ERROR: &str = "error";
@@ -199,12 +223,98 @@ pub struct ExecuteResult {
     pub sent_agent_messages: Option<Vec<KernelSentAgentMessage>>,
     /// The `bash()` commands this cell started, summarized for display.
     pub bash_commands: Option<KernelBashCommands>,
+    /// The cell's `rlm.session.messages` reads, one display record each.
+    pub transcript_reads: Option<Vec<Value>>,
+    /// The messages the cell's `rlm.inbox.read` calls returned, in order.
+    pub inbox_messages: Option<Vec<Value>>,
     /// Output that arrived without this cell's id (user threads, other cells' leftovers, raw fd writes).
     pub background_output: Option<String>,
+    /// The cell called the sanctioned `rlm.end_turn()`: the host marked
+    /// this execution, and the turn ends once the batch settles.
+    pub ended_turn: bool,
     pub status: ExecuteStatus,
     pub error: Option<KernelError>,
     pub duration_ms: u64,
+    /// `Some` when this call did not wait for the cell: the wait returned
+    /// early (a wake, or the wait budget) and the cell keeps running. `None`
+    /// when the cell settled within the call.
+    pub detached: Option<DetachedCell>,
 }
+
+/// Why a running cell's wait returned early. The cell is never signalled;
+/// it keeps running either way, and its completion arrives as a notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetachReason {
+    /// A user message or inbox arrival interrupted the wait.
+    Interrupted,
+    /// The cell outlived this call's wait budget (milliseconds).
+    WaitBudget(u64),
+}
+
+/// The early-return marker on an [`ExecuteResult`]: the call did not wait
+/// for the cell, which keeps running in the kernel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetachedCell {
+    pub reason: DetachReason,
+    /// The cell's request id; the completion notice names it.
+    pub cell_id: String,
+}
+
+/// One auto-backgrounded cell's late completion, handed to the session's
+/// callback so the embedding can land a notice (the daemon routes it into
+/// the inbox).
+#[derive(Debug, Clone)]
+pub struct BackgroundCellOutcome {
+    pub cell_id: String,
+    pub reason: DetachReason,
+    pub result: ExecuteResult,
+}
+
+/// The session's count of detached cells whose terminal outcome is not yet
+/// admitted: the residency gates' live-work term. The count is shared with
+/// every manager the owning provisioner creates, so a defunct-manager
+/// replacement cannot hide an older pending notice.
+#[derive(Debug, Default)]
+pub struct PendingDetachedCompletions {
+    count: std::sync::atomic::AtomicUsize,
+}
+
+impl PendingDetachedCompletions {
+    /// The number of detached cells awaiting their terminal admission.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn acquire(self: &std::sync::Arc<Self>) -> DetachedCompletionHold {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        DetachedCompletionHold {
+            owner: std::sync::Arc::clone(self),
+        }
+    }
+
+    fn release(&self) {
+        self.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// One detached cell's residency hold: acquired before the detached result
+/// returns and released exactly once on drop — the normal path releases by
+/// dropping after the synchronous terminal sink call, and the error,
+/// absent-sink, dropped-task, and unwound-callback paths release the same
+/// way (a panic inside the sink must not strand the session-wide count).
+pub struct DetachedCompletionHold {
+    owner: std::sync::Arc<PendingDetachedCompletions>,
+}
+
+impl Drop for DetachedCompletionHold {
+    fn drop(&mut self) {
+        self.owner.release();
+    }
+}
+
+/// Receives [`BackgroundCellOutcome`]s.
+pub type BackgroundCellCallback = Arc<dyn Fn(BackgroundCellOutcome) + Send + Sync>;
 
 /// Options for one `execute` call.
 #[derive(Default)]
@@ -221,21 +331,31 @@ pub struct ExecuteOptions {
     pub internal: bool,
     /// The protocol repair's own request; exempt from waiting on the repair it belongs to.
     pub protocol_repair: bool,
+    /// The session's shared cell wake: when it fires while the cell runs, this
+    /// call returns early ([`ExecuteResult::detached`]) and the cell keeps
+    /// running. `None` leaves the call unbounded by wakes.
+    pub wake: Option<Arc<crate::kernel::cell_wake::CellWake>>,
+    /// Receives the late completion of a detached cell; `None` drops it (the
+    /// cell still runs on).
+    pub on_background_cell: Option<BackgroundCellCallback>,
+    /// Wait budget in milliseconds for this call, measured from the request
+    /// going on the wire (queue wait and kernel boot excluded). A cell that
+    /// outlives it is detached, not interrupted: this call returns early with
+    /// [`ExecuteResult::detached`] (reason [`DetachReason::WaitBudget`]), the
+    /// cell keeps running, and its completion goes to `on_background_cell`.
+    /// `None` and zero disable it; the runtime bootstrap and state ops never
+    /// arm it.
+    pub cell_timeout_ms: Option<u64>,
 }
-
-/// The error raised when a new cell cannot start because the previously
-/// interrupted cell is still running.
-#[derive(Debug, thiserror::Error)]
-#[error("{KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE}")]
-pub struct KernelBusyAfterInterruptError;
 
 /// A typed request from Python code running in the kernel to the host.
 #[derive(Debug, Clone)]
 pub struct HostRequestPayload {
-    /// The request payload with `cellSourceCode` merged in when known.
+    /// The request payload: the WHOLE request object, carrying the
+    /// envelope's routing `type` key beside any request fields — a
+    /// handler that deserializes the body into a strict struct must
+    /// strip that transport key itself (see the inbox read handler).
     pub data: Value,
-    /// Source of the cell that triggered the request, when attributable.
-    pub cell_source_code: Option<String>,
 }
 
 pub type HostHandlerFuture = Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>;
@@ -340,6 +460,12 @@ pub struct KernelManagerOptions {
     /// Fires when the last live background `bash()` handle settles (its activity
     /// track empties or the kernel tears down), so owed continuations can resume.
     pub on_background_work_settled: Option<BackgroundWorkSettledCallback>,
+    /// The session-scoped count of detached cells awaiting their terminal
+    /// admission (the residency gates' live-work term): shared with every
+    /// manager the owning provisioner creates, so a replacement manager
+    /// cannot hide an older pending notice. `None` gives the manager its own
+    /// private count (a direct manager owns its default count).
+    pub pending_detached_completions: Option<std::sync::Arc<PendingDetachedCompletions>>,
     /// Persist/revive the user namespace across kernel restarts and session resume.
     pub snapshot: Option<KernelSnapshotConfig>,
     /// Runtime bootstrap re-run on a protocol-repaired kernel so live handles (rlm, bash, skills) exist again.

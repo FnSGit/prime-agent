@@ -1,8 +1,11 @@
-//! Python syntax highlighting for expanded ipython cells, the
-//! highlight.js python grammar's scope coloring. Cell-level scope
-//! coloring only: one color per cell. F-string substitutions and
+//! Python syntax highlighting for expanded ipython cells and markdown
+//! fences, the highlight.js python grammar's scope coloring. Cell-level
+//! scope coloring only: one color per cell. F-string substitutions and
 //! backslash escapes keep the string color (cli-highlight renders those
-//! scopes with the identity function).
+//! scopes with the identity function). Bash fences live in `highlight/bash.rs`.
+
+mod bash;
+pub(crate) use bash::highlight_bash;
 
 use crate::theme::{Theme, ThemeColor};
 use crate::{Line, Span};
@@ -48,6 +51,7 @@ pub(crate) enum Scope {
     Comment,
     Title,
     Params,
+    Variable,
 }
 
 impl Scope {
@@ -60,7 +64,7 @@ impl Scope {
             Scope::String => Some(palette.string),
             Scope::Comment => Some(palette.comment),
             Scope::Title => Some(palette.function),
-            Scope::Params => Some(palette.variable),
+            Scope::Params | Scope::Variable => Some(palette.variable),
         }
     }
 }
@@ -371,10 +375,9 @@ fn string_at(text: &str, i: usize) -> Option<usize> {
     let mut cursor = end + if triple { 3 } else { 1 };
     while cursor < text.len() {
         let rest = &text[cursor..];
-        if rest.starts_with('\\') {
+        if let Some(escaped) = rest.strip_prefix('\\') {
             // Backslash escape: consumed inside the string.
-            let escaped = rest.char_indices().nth(1).map_or(1, |(idx, _)| idx + 1);
-            cursor += escaped;
+            cursor += 1 + escaped.chars().next().map_or(0, char::len_utf8);
             continue;
         }
         let ch = rest.chars().next()?;
@@ -411,11 +414,16 @@ fn quote_char(byte: u8) -> char {
 /// Highlight python `code` into per-line spans. The whole block is one
 /// highlight.js pass, so multi-line strings carry across lines.
 pub(crate) fn highlight_python(code: &str, palette: &SyntaxPalette) -> Vec<Line> {
+    scoped_lines(code, tokenize(code), palette)
+}
+
+/// Split the token stream of `code` into per-line spans; a token that
+/// spans line breaks carries its style onto every line it covers.
+fn scoped_lines(code: &str, tokens: Vec<(String, Scope)>, palette: &SyntaxPalette) -> Vec<Line> {
     let mut lines: Vec<Line> = Vec::new();
     let mut current: Line = Vec::new();
-    for (text, scope) in tokenize(code) {
+    for (text, scope) in tokens {
         let style = scope.style(palette);
-        // A token carries at most one line break (comments stop at it).
         for (index, part) in text.split('\n').enumerate() {
             if index > 0 {
                 lines.push(std::mem::take(&mut current));
@@ -519,8 +527,12 @@ fn header_mode(
 ) -> Option<usize> {
     let mut i = at + keyword_len;
     let gap_start = i;
-    while code[i..].starts_with(|c: char| c.is_whitespace()) && !code[i..].starts_with('\n') {
-        i += 1;
+    while let Some(c) = code[i..]
+        .chars()
+        .next()
+        .filter(|c| c.is_whitespace() && *c != '\n')
+    {
+        i += c.len_utf8();
     }
     let name_len = code[i..]
         .char_indices()
@@ -588,6 +600,8 @@ fn header_mode(
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
     use crate::theme::{ColorMode, Theme};
 
@@ -615,6 +629,32 @@ mod tests {
                 (")".into(), Scope::Plain),
             ]
         );
+    }
+
+    #[test]
+    fn multibyte_chars_after_escapes_and_headers_stay_whole() {
+        assert!(scopes(r#"s = r"\é""#).contains(&(r#"r"\é""#.into(), Scope::String)));
+        assert!(scopes("def\u{a0}f():").contains(&("f".into(), Scope::Title)));
+    }
+
+    fn fragment() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => prop::sample::select(vec![
+                "'", "\"", "'''", "\"\"\"", "\\", "r", "b", "f", "u", "def", "class", "def ",
+                "class ", "#", "0", "7", "1.5e", "0x", "(", ")", "\n", " ", "é", "界", "\u{a0}",
+                "\u{3000}", "\u{1f980}",
+            ])
+            .prop_map(str::to_string),
+            1 => any::<char>().prop_map(String::from),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn highlight_python_never_panics(parts in prop::collection::vec(fragment(), 0..24)) {
+            let code = parts.concat();
+            prop_assert!(!highlight_python(&code, &SyntaxPalette::from_theme(&theme())).is_empty());
+        }
     }
 
     #[test]

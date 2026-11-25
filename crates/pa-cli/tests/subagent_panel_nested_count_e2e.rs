@@ -23,7 +23,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pa_core::session_engine::rlm_host::{RlmSpawnRequest, RlmSubagentHost};
+use pa_core::session_engine::rlm_host::{RlmSpawnKind, RlmSpawnRequest, RlmSubagentHost};
 use pa_daemon::rlm_children::{ParentIdentity, SupervisorChildSessions};
 use pa_daemon::supervisor_link::SupervisorLink;
 use pa_tui::subagents::{count_descendants, SessionIdentity};
@@ -203,6 +203,7 @@ fn children_host(
             agent_dir.to_path_buf(),
             /*telemetry_disabled*/ true,
         )),
+        String::new(),
     );
     sessions.set_identity(ParentIdentity {
         rlm_depth: depth,
@@ -224,8 +225,10 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
         name: Some(name.to_string()),
         model: None,
         thinking: None,
-        cell_source_code: None,
+        cwd: None,
+        kind: RlmSpawnKind::Subagent,
         spawned_by_request_id: None,
+        factory: None,
     }
 }
 

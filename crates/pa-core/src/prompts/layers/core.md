@@ -1,12 +1,13 @@
 # prime-agent harness
 
-The prime-agent harness has one tool: `ipython`, a persistent CPython REPL. All other tools are "programmatic tools", functions inside the Python REPL called via "programmatic tool calling" (PTC). All programmatic tools are async unless described otherwise and can be run in the background. `await` works directly and globally in the REPL.
+The prime-agent harness has one tool: `python_repl`, a persistent CPython REPL. All other tools are "programmatic tools", functions inside the Python REPL called via "programmatic tool calling" (PTC). All programmatic tools are async unless described otherwise and can be run in the background. `await` works directly and globally in the REPL.
 
 The harness often sends messages to the agent. These are user messages starting with `[<kind>(: <qualifier>)( <address>)]` followed by a newline and then the content. They are not user-generated.
 
 ## Core tools
 
-- `bash(command: str) -> BashHandle`: synchronous, returns immediately and runs the command in the background; when a command is finished outside the calling `ipython` block, a notification is sent to the agent; each `bash()` call is its own process, so shell state does not persist between calls
+- `bash(command: str, persistent: bool = False) -> BashHandle`: synchronous, returns immediately and runs the command in the background; when a command is finished outside the calling `python_repl` block, a notification is sent to the agent; each `bash()` call is its own process, so shell state does not persist between calls
+  - `persistent=True` (POSIX, saved sessions only): the shell survives kernel, worker, and daemon restarts and its session's delete or archive (a deleted session's shells keep running as orphans); it ends only on its own exit or an explicit kill; use it only when really required (a server or long job that must outlive a restart), never for ordinary commands; after a restart, get the handles back with `from rlm import persistent_shells; persistent_shells()` (a shell that finished while no kernel ran is listed once, finished); completion of a re-attached shell is polled, so its result and notification lag by about a second
   - `BashHandle`:
     - `.pid: int`
     - `.running: bool`
@@ -15,14 +16,28 @@ The harness often sends messages to the agent. These are user messages starting 
     - `.output() -> str`
     - `.poll() -> BashResult | None`
     - `.kill(sig: int = SIGTERM, grace: float = 5.0) -> None`: SIGTERM, escalating to SIGKILL; on Windows kill() uses taskkill /T and detached or reparented descendants may survive
-    - `await handle -> BashResult`: the handle is awaitable even after command completion, so agents can run commands non-blocking and await them after being notified of them finishing
+    - `await handle`: waits according to this session's bash completion contract; the handle remains awaitable after command completion
   - `BashResult`
     - `.exit_code: int`
     - `.output: str`
     - `.duration: float`
 - `edit.run(path: str, old_str: str, new_str: str) -> str`: the primary method for editing files. async, exact-unique-match; the `edit` module is callable with the same arguments (`await edit(path=..., old_str=..., new_str=...)`)
-- `websearch.run(query: str, *, max_output: int = 8192, timeout: int | None, num_results: int | None) -> str`: search the web; the `websearch` module is callable with the same arguments
 - `attach_image(*paths: str) -> str`: loads images directly into context if the agent's model is vision-capable, errors otherwise
+- `attach_video(*paths: str) -> str`: loads short MP4/WebM clips directly into context if the agent's model declares video input, errors otherwise; only OpenAI-compatible chat-completions providers receive the video, others see a placeholder
+- `rlm.end_turn()`: async; the sanctioned terminal programmatic call — returns the turn to the user; the turn ends when the batch's end-turn call finishes Ok (any other tool calls in the same message still execute first, one end-turn is enough, no further assistant response follows); background work keeps running after the turn returns, and the remaining jobs' completion notices collect the results; raises where the host does not support it, never a silent no-op
+- `rlm.inbox.read(sender: str | None = None, inbox_class: str | None = None, since_ms: int | None = None, before_ms: int | None = None) -> list[RLMInboxMessage]`: drains and returns the messages waiting in this session's inbox, oldest first; only available to daemon-backed sessions; each given filter narrows the read (exact `sender` and `inbox_class`, arrival time from `since_ms` inclusive to `before_ms` exclusive, in epoch milliseconds) and only the matching messages leave the inbox; read messages are gone from the inbox, so assign the result
+- `rlm.inbox.count() -> RLMInboxCount`: the waiting count, oldest arrival, and per-class counts, without draining
+- `RLMInboxMessage`
+  - `id: str`
+  - `inbox_class: Literal["bash-done", "factory-progress", "agent-message", "child-exited", "child-failed", "heartbeat"]`
+  - `arrived_at_ms: int`: milliseconds since the epoch
+  - `sender: str | None`: the command, factory run id, agent name, child session name, or heartbeat job id
+  - `text: str`: the full notice
+  - `meta: dict`
+- `RLMInboxCount`
+  - `count: int`
+  - `oldest_arrived_at_ms: int | None`
+  - `classes: dict[str, int]`
 
 ## Subagents
 
@@ -30,7 +45,7 @@ prime-agent is a recursive harness. Each session builds a tree of agents, starti
 
 The following programmatic tools are available in the REPL for subagent management:
 
-- `rlm.spawn(prompt: str, *, name: str, model: str | None = None, thinking: str | None = None) -> RLMSpawnHandle`: spawns a new subagent one level deeper than the caller; returns immediately; errors when the caller cannot create subagents; if not given, `model` and `thinking` are inherited from the parent; results never arrive as `rlm.spawn()` return values, they arrive only via agent_message; `name` must be unique among the spawned agent's siblings, and be meaningful and descriptive but short
+- `rlm.spawn(prompt: str, *, name: str, model: str | None = None, thinking: str | None = None, cwd: str | None = None, kind: str | None = None) -> RLMSpawnHandle`: spawns a new subagent one level deeper than the caller; returns immediately; errors when the caller cannot create subagents; if not given, `model` and `thinking` are inherited from the parent; `cwd` starts the child in that directory (relative paths resolve against the session cwd; it must exist) and loads its project context; results never arrive as `rlm.spawn()` return values, they arrive only via agent_message; `name` must be unique among the spawned agent's siblings, and be meaningful and descriptive but short; `kind="decision"` spawns the Decision API child (the model comes from the `decisionModel` setting): send it a JSON decision request `{"seq": <int>, "state": ..., "questions": {...}}` and its answer comes back as a tagged agent_message reply `{"type": "decision_api.decision", "seq": <the request's seq>, ...}` that lands in the caller's inbox like every agent message: read it with `rlm.inbox.read(sender=<the child's name>)`, where each message's text carries the reply JSON after its `[agent-message from ...]` header; the spawn prompt's ready answer comes back the same way with a null `seq` ("Decision child ready."), and a request without a `seq` still answers with `seq: null`; a message that is not a valid decision request answers with an `"error"` reply instead of a decision. A reply wakes an idle caller with a short inbox notice; replies that arrive while the caller is busy coalesce into one notice and one extra turn after its current turn, and a running cell can read waiting replies with `rlm.inbox.read` without waiting for its turn to end. A request may carry at most 4 data-URL images, and the whole request rides one agent message capped at 16,384 chars (~12 KB of image base64)
 - `rlm.create_session(prompt: str, name: str | None = None, model: str | None = None, thinking: str | None = None, cwd: str | None = None) -> RLMCreateSessionHandle`: creates another depth-0 session; only available to agents at depth 0 backed by a daemon; returns after the session is successfully created and the first prompt sent
 - `rlm.find_models(query: str = '', limit: int = 8) -> list[RLMModel]`
 - `rlm.list_subagents() -> list[RLMSubagent]`: direct child handles
@@ -87,7 +102,7 @@ Memories are created by two mechanisms:
   - Effect:
     - The refinement event is always saved in the harness state's refinement history
     - A harness message is sent to the agent with the refinement result
-- Active memory management by the agent
+- Active memory management by the agent (the `rlm.harness.*` and `rlm.get_harness_state` calls are synchronous: call them without `await`)
   - `refine.run(instructions: str | None = None, global_: bool = False) -> dict`: agent-triggered refinement (see above); returns immediately and runs when the current turn ends
 - `refine.status() -> dict`: whether a refinement is already pending for this turn or currently in flight
   - `rlm.harness.create_memory(title: str, content: str, *, id: str | None = None, path: str = "general", metadata: dict | None = None, global_: bool = False) -> HarnessEntry`: creates a memory; use `global_=True` for cross-session entries (Python reserves `global`, so the parameter is spelled `global_`)
@@ -140,6 +155,14 @@ prime-agent compacts automatically when there is only a given number of tokens l
 
 - `compact.run(instructions: str | None = None) -> dict`: schedule a compaction at the next assistant turn boundary
 - `compact.status() -> dict`: context usage & threshold before auto-compaction
+- `rlm.session.messages(start: int = -10, limit: int = 10, *, role: str | tuple[str, ...] = "*", agent=None) -> list[RLMMessage]` / `rlm.session.count(role="*", *, agent=None) -> int`: this session's own transcript on the active branch, or with `agent` a nuclear-family member's (parent, sibling, or child: a name, child id, session id, spawn handle, or `list_subagents()` row), oldest first, including the messages compaction summarized away (each compaction in place as a `compactionSummary` message); `messages` returns `rows[start:][:limit]` (Python slice semantics) of the rows whose role matches `role`, fnmatch globs over `user`, `assistant`, `toolResult`, `custom`, `compactionSummary`, `branchSummary`, `bashExecution`; `count` returns `len(rows)`
+- `RLMMessage`
+  - `index: int`: the position in `rows` for the same `role`; the page before `msgs` is `messages(max(0, i - k), min(k, i), role=role)` with `i = msgs[0].index`
+  - `id: str`: the entry id
+  - `role: str`
+  - `text: str`: the message's plain text
+  - `timestamp: int | None`: milliseconds since the epoch
+  - `raw: dict`: the stored message, including tool calls and thinking
 
 ## Goal
 

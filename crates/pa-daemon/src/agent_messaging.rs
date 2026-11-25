@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use pa_core::session_engine::agent_messaging::{
     AgentFamilyMember, AgentFamilyRelationship, AgentFamilyStatus, AgentMessageController,
     AgentMessageDeliveryStatus, AgentMessageReceipt, AgentMessageSendInput, AgentObserveActivity,
-    AgentObserveController, AgentObserveMessagePreview, AgentObserveSummary,
+    AgentObserveController, AgentObserveListResult, AgentObserveMessagePreview,
+    AgentObserveRecentMessagesResult, AgentObserveSummary, AGENT_OBSERVE_PREVIEW_MAX_CHARS,
 };
 
 use crate::supervisor_link::SupervisorLink;
@@ -190,7 +191,7 @@ mod message;
 mod observe;
 
 pub use message::LinkAgentMessageController;
-pub(crate) use observe::LinkAgentObserveController;
+pub use observe::LinkAgentObserveController;
 
 #[cfg(test)]
 mod controller_tests;

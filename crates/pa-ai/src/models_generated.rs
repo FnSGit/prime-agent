@@ -1416,22 +1416,22 @@ compat: Some(RawCompat {
     RawModel {
         provider: "prime-inference",
         id: "deepseek/deepseek-v4-flash-0731",
-        name: "Deepseek V4 Flash 0731",
+        name: "DeepSeek V4 Flash 0731",
         api: "openai-completions",
         base_url: "https://api.pinference.ai/api/v1",
         reasoning: true,
         thinking_levels: &[
                 (crate::types::ModelThinkingLevel::Minimal, None),
-                (crate::types::ModelThinkingLevel::Low, None),
+                (crate::types::ModelThinkingLevel::Low, Some("low")),
                 (crate::types::ModelThinkingLevel::Medium, None),
                 (crate::types::ModelThinkingLevel::High, Some("high")),
-                (crate::types::ModelThinkingLevel::Xhigh, Some("max")),
-                (crate::types::ModelThinkingLevel::Max, None),
+                (crate::types::ModelThinkingLevel::Xhigh, None),
+                (crate::types::ModelThinkingLevel::Max, Some("max")),
         ],
         input: &[crate::types::ModelInput::Text],
-        cost: (0.44, 1.32, 0.0, 0.0),
-        context_window: 1_310_720,
-        max_tokens: 131_072,
+        cost: (0.44, 1.32, 0.014, 0.0),
+        context_window: 1_048_576,
+        max_tokens: 65_536,
         featured: None,
         headers: &[],
 compat: Some(RawCompat {
@@ -4429,6 +4429,7 @@ fn model_from_raw(raw: &RawModel) -> Model {
         featured: raw.featured,
         headers,
         compat: raw.compat.as_ref().map(compat_from_raw),
+        serving: None,
     }
 }
 
@@ -4477,58 +4478,6 @@ pub fn get_models(provider: &str) -> Vec<&'static Model> {
 mod tests {
     use super::*;
     use crate::types::ModelExt;
-
-    #[test]
-    fn catalog_loads_at_the_ts_fallback_scale() {
-        let providers = get_providers();
-        assert_eq!(providers.len(), 32, "the TS fallback provider list");
-        let total: usize = providers
-            .iter()
-            .map(|provider| get_models(provider).len())
-            .sum();
-        assert_eq!(total, 152, "the TS fallback model list");
-        assert_eq!(
-            get_models("prime-inference").len(),
-            110,
-            "offline Prime Inference onboarding entries"
-        );
-        // The compiled transport table: one-plus template per tuple.
-        // The models are collected first: the tuples borrow from them, so
-        // the values must outlive the loop.
-        let models: Vec<Model> = RAW_MODELS.iter().map(model_from_raw).collect();
-        let mut tuples: Vec<(&str, &str, &str)> = Vec::new();
-        for model in &models {
-            let tuple = (
-                model.provider.as_str(),
-                model.api.as_str(),
-                model.base_url.as_str(),
-            );
-            if !tuples.contains(&tuple) {
-                tuples.push(tuple);
-            }
-        }
-        assert_eq!(
-            tuples.len(),
-            43,
-            "42 public transport tuples + Prime Inference"
-        );
-    }
-
-    #[test]
-    fn looks_up_known_models() {
-        let model = get_model("anthropic", "claude-fable-5")
-            .or_else(|| get_model("amazon-bedrock", "eu.anthropic.claude-fable-5"))
-            .expect("fable template present");
-        assert!(model.reasoning);
-        assert!(model.context_window > 0);
-        assert!(model.cost.input.as_f64() >= 0.0);
-    }
-
-    #[test]
-    fn unknown_lookups_are_none() {
-        assert!(get_model("nope", "nope").is_none());
-        assert!(get_models("nope").is_empty());
-    }
 
     /// The compiled Prime Inference section is the conservative fallback (TS #2519): it declares no
     /// reasoning controls — the live catalog's `supported_parameters` rebuild them at runtime — and

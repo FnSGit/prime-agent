@@ -60,19 +60,18 @@
 //! 250ms — measured: the raced suspend's teardown waits to ~250ms on a
 //! silent pty and lands at its dispatch on every answered class).
 //!
-//! DIVERGENCE FROM TS (the shift-modified printable bug class): this port
-//! never arms modifyOtherKeys mode 2 and instead resets it
-//! (`\x1b[>4;0m`) at every surface start. TS parses the resulting
-//! `CSI 27;<mods>;<key>~` sequences itself (keys.ts
-//! `parseModifyOtherKeysSequence`), but crossterm 0.28 has no case for
-//! them and drops the whole pending input buffer on the parse error
-//! (`Parser::advance` clears on `Err`) — a terminal in mode 2 (a sticky
-//! mode any other pane or process may have armed) makes shift-modified
-//! printables like `shift+=` vanish entirely. The reset returns such
-//! terminals to legacy encodings (shift+= arrives as the produced `+`),
-//! and the kitty path covers the enhanced-reporting surface crossterm
-//! can parse (kitty CSI-u with shifted alternates resolves to the
-//! produced character in crossterm's own parser).
+//! THE OSC 7501 QUERY: the same probe carries the Program Status
+//! Protocol's feature detection (`OSC 7501 ; ? ST` ahead of the kitty
+//! query), so ONE primary-device-attributes reply concludes both queries
+//! and two in-flight DA1 replies can never be confused. Terminals answer
+//! in order: the 7501 reply arriving before the DA1 means supported, the
+//! DA1 alone means unsupported, and a silent pty settles unsupported at
+//! the window's deadline (see `program_status`). Known kitty terminals
+//! skip only the kitty query: every class runs the probe once.
+//!
+//! We reset modifyOtherKeys mode 2 at each surface start to keep legacy
+//! printable-key behavior. Some terminals still emit modifyOtherKeys for
+//! modified control keys; the vendored parser accepts those reports.
 //!
 //! Every mode-flag transition is serialized (a module-wide lock pairs each
 //! flag write with its escape write), and the force-quit exit path marks
@@ -83,7 +82,7 @@
 use anyhow::Result;
 use std::io::{IsTerminal, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-// The probe's answer channel is unix-only (see `spawn_kitty_probe`).
+// The probe's answer channel is unix-only (see `spawn_terminal_probe`).
 #[cfg(unix)]
 use std::sync::mpsc;
 use std::time::Duration;
@@ -151,16 +150,18 @@ fn lock_modes() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Whether the kitty probe's answer window is open. The input reader keys
-/// its bounded poll cadence on this so its park cannot starve the probe.
-pub(crate) fn query_in_flight() -> bool {
-    QUERY_IN_FLIGHT.load(Ordering::SeqCst)
+/// Whether Kitty setup or its probe is pending. Keep input polls bounded even
+/// before the first draw starts the probe, so an idle reader cannot starve it.
+pub(crate) fn kitty_probe_pending() -> bool {
+    !KITTY_PROBED.load(Ordering::SeqCst) || QUERY_IN_FLIGHT.load(Ordering::SeqCst)
 }
 
 /// Mark the terminal released for process exit, before writing the restore
-/// sequences: no probe push can land after the final pop.
+/// sequences: no probe push can land after the final pop, and a probe
+/// answer writes no program status report.
 pub(crate) fn release_for_exit() {
     EXIT_RELEASE.store(true, Ordering::SeqCst);
+    crate::program_status::release_for_exit();
 }
 
 /// What one `enable` does about the kitty protocol, decided from the process-global state.
@@ -283,6 +284,11 @@ pub(crate) fn enable(out: &mut Stdout) -> Result<()> {
         write_all(out, ENABLE_BRACKETED_PASTE)?;
     }
     write_all(out, MODIFY_OTHER_KEYS_RESET)?;
+    // Ghostty keeps keyboard flags per screen. The first draw enables Kitty once
+    // the alternate screen is painted; bracketed paste is already safe to enable.
+    if !crate::altscreen::active() {
+        return Ok(());
+    }
     match kitty_action(
         KITTY_SUPPORTED.load(Ordering::SeqCst),
         KITTY_PROBED.load(Ordering::SeqCst),
@@ -290,13 +296,18 @@ pub(crate) fn enable(out: &mut Stdout) -> Result<()> {
         QUERY_IN_FLIGHT.load(Ordering::SeqCst),
     ) {
         KittyAction::Probe => {
-            // Known direct terminals need no query. Ambiguous terminals use
+            // Known direct terminals need no kitty query; ambiguous ones add
+            // it to the terminal probe, which every class runs once for the
+            // OSC 7501 detection query (see `program_status`). The probe uses
             // the bounded crossterm reader so typeahead stays in its queue.
-            match local_keyboard_capability() {
+            let capability = local_keyboard_capability();
+            KITTY_PROBED.store(true, Ordering::SeqCst);
+            QUERY_IN_FLIGHT.store(true, Ordering::SeqCst);
+            spawn_terminal_probe(capability == KeyboardCapability::Unknown);
+            match capability {
                 KeyboardCapability::Supported => {
-                    KITTY_PROBED.store(true, Ordering::SeqCst);
                     record_kitty_supported();
-                    if !KITTY_ACTIVE.swap(true, Ordering::SeqCst) {
+                    if !KITTY_ACTIVE.load(Ordering::SeqCst) {
                         // The stale-level drain: clear the levels a
                         // killed session (or a miscounting relay) left
                         // before this process's own push (see
@@ -305,21 +316,14 @@ pub(crate) fn enable(out: &mut Stdout) -> Result<()> {
                             write_all(out, POP_KITTY_FLAGS)?;
                         }
                         write_all(out, ENABLE_KITTY_FLAGS)?;
+                        KITTY_ACTIVE.store(true, Ordering::SeqCst);
                     }
                 }
-                KeyboardCapability::Unsupported => {
-                    KITTY_PROBED.store(true, Ordering::SeqCst);
-                }
-                KeyboardCapability::Unknown => {
-                    if !QUERY_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-                        KITTY_PROBED.store(true, Ordering::SeqCst);
-                        spawn_kitty_probe();
-                    }
-                }
+                KeyboardCapability::Unsupported | KeyboardCapability::Unknown => {}
             }
         }
         KittyAction::PushFlags => {
-            if !KITTY_ACTIVE.swap(true, Ordering::SeqCst) {
+            if !KITTY_ACTIVE.load(Ordering::SeqCst) {
                 // The stale-level drain (see STALE_LEVEL_DRAIN): a
                 // suspend's pop and resume's re-push stay balanced; a
                 // stale level from a killed session levels out here.
@@ -327,6 +331,7 @@ pub(crate) fn enable(out: &mut Stdout) -> Result<()> {
                     write_all(out, POP_KITTY_FLAGS)?;
                 }
                 write_all(out, ENABLE_KITTY_FLAGS)?;
+                KITTY_ACTIVE.store(true, Ordering::SeqCst);
             }
         }
         KittyAction::None => {}
@@ -476,7 +481,7 @@ fn write_all(out: &mut Stdout, sequence: &[u8]) -> Result<()> {
 /// arrives). Skipped when the surface that started the probe is already
 /// gone — a stray enable would leave the flags pushed over the next
 /// surface's own setup. Unix only: the kitty probe is the unix surface
-/// (see `spawn_kitty_probe`).
+/// (see `spawn_terminal_probe`).
 #[cfg(unix)]
 fn enable_kitty(out: &mut Stdout) {
     // The capability is the durable truth: a later start re-applies the
@@ -487,13 +492,13 @@ fn enable_kitty(out: &mut Stdout) {
     if EXIT_RELEASE.load(Ordering::SeqCst) {
         return;
     }
-    if !KITTY_ACTIVE.swap(true, Ordering::SeqCst) {
+    if !KITTY_ACTIVE.load(Ordering::SeqCst) {
         // The stale-level drain (see STALE_LEVEL_DRAIN): the probe
         // answer's push drains the stale levels too.
         for _ in 0..STALE_LEVEL_DRAIN {
             let _ = write_all(out, POP_KITTY_FLAGS);
         }
-        let _ = write_all(out, ENABLE_KITTY_FLAGS);
+        KITTY_ACTIVE.store(write_all(out, ENABLE_KITTY_FLAGS).is_ok(), Ordering::SeqCst);
     }
 }
 
@@ -518,65 +523,75 @@ pub(crate) fn pop_stale_levels(out: &mut Stdout) {
 }
 
 /// The probe thread: hold the query open for the TS fallback window,
-/// then settle. An answer within crossterm's patched 250ms query window
-/// enables kitty; no answer settles with no enhanced modes (this port
-/// never arms the modifyOtherKeys fallback — see the module docs).
+/// then settle. `keyboard` adds the kitty query: an answer within
+/// crossterm's patched 250ms query window enables kitty; no answer settles
+/// with no enhanced modes (this port never arms the modifyOtherKeys
+/// fallback — see the module docs). Every probe carries the OSC 7501
+/// detection query; its outcome settles with the same answer.
 /// Unix only: the kitty keyboard protocol is a unix terminal surface
 /// (the vendored crossterm exposes the raw-read check unix-only); the
 /// Windows console arm settles no-kitty below — the capability stays
 /// unresolved there, never armed.
 #[cfg(unix)]
-fn spawn_kitty_probe() {
+fn spawn_terminal_probe(keyboard: bool) {
     let probe = std::thread::Builder::new()
-        .name("tui-kitty-probe".to_string())
-        .spawn(|| {
+        .name("tui-terminal-probe".to_string())
+        .spawn(move || {
             let (answer_tx, answer_rx) = mpsc::channel();
-            // crossterm's support check sends the query and blocks on the answer for
+            // crossterm's probe sends the queries and blocks on the answer for
             // at most 250ms (the vendored crossterm patch). It reads the tty through
             // the shared internal reader, so user keys stay queued for the app reader.
             let reader = std::thread::Builder::new()
-                .name("tui-kitty-probe-read".to_string())
+                .name("tui-terminal-probe-read".to_string())
                 .spawn(move || {
                     // Neither a dying process nor a raced suspend may start the support
                     // check: crossterm brackets raw mode itself, re-arming raw on a
                     // handed-back terminal and stealing the raw-mode save slot. Settle
-                    // no-kitty instead. The probe takes
-                    // `supports_keyboard_enhancement_checked_raw`, so nothing in this thread
+                    // unsupported instead. The probe takes
+                    // `probe_terminal_checked_raw`, so nothing in this thread
                     // can re-arm raw mode; the mode lock serializes the guard with the
                     // suspend's mode releases.
                     let modes = lock_modes();
                     let raw_bracket_on =
                         crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
                     if EXIT_RELEASE.load(Ordering::SeqCst) || !raw_bracket_on {
-                        let _ = answer_tx.send(Ok(false));
+                        let _ = answer_tx.send(Err(std::io::Error::other(
+                            "the terminal was released before the probe",
+                        )));
                         return;
                     }
-                    let _ = answer_tx
-                        .send(crossterm::terminal::supports_keyboard_enhancement_checked_raw());
+                    let _ =
+                        answer_tx.send(crossterm::terminal::probe_terminal_checked_raw(keyboard));
                     // The guard releases at this scope's end; the answer
                     // path's `enable_kitty` takes the lock after it.
                     drop(modes);
                 });
             match answer_rx.recv_timeout(KITTY_QUERY_FALLBACK) {
-                Ok(Ok(true)) => {
-                    enable_kitty(&mut std::io::stdout());
-                    QUERY_IN_FLIGHT.store(false, Ordering::SeqCst);
-                }
-                Ok(_) => {
-                    // No kitty: settle with no enhanced modes (the mode-2 fallback is never armed —
-                    // see the module docs).
-                    QUERY_IN_FLIGHT.store(false, Ordering::SeqCst);
+                Ok(answer) => {
+                    let answer = answer.ok();
+                    if keyboard
+                        && answer
+                            .as_ref()
+                            .is_some_and(|probe| probe.keyboard_enhancement)
+                    {
+                        enable_kitty(&mut std::io::stdout());
+                    }
+                    // No kitty settles with no enhanced modes (the mode-2 fallback is never
+                    // armed — see the module docs).
+                    settle_probe(answer);
                 }
                 Err(_) => {
                     // Keep waiting for the answer past the window: the
                     // detached reader settles the upgrade when it lands.
                     std::thread::Builder::new()
-                        .name("tui-kitty-probe-late".to_string())
+                        .name("tui-terminal-probe-late".to_string())
                         .spawn(move || {
-                            let answer = answer_rx.recv().unwrap_or(Err(std::io::Error::other(
-                                "the kitty probe reader exited",
-                            )));
-                            if let Ok(true) = answer {
+                            let answer = answer_rx.recv().ok().and_then(Result::ok);
+                            if keyboard
+                                && answer
+                                    .as_ref()
+                                    .is_some_and(|probe| probe.keyboard_enhancement)
+                            {
                                 // The capability outlives the surface the answer arrived on:
                                 // record it even when the push stands down (a suspended
                                 // surface's resume re-applies the flags).
@@ -585,7 +600,7 @@ fn spawn_kitty_probe() {
                                     enable_kitty(&mut std::io::stdout());
                                 }
                             }
-                            QUERY_IN_FLIGHT.store(false, Ordering::SeqCst);
+                            settle_probe(answer);
                         })
                         .ok();
                 }
@@ -596,17 +611,24 @@ fn spawn_kitty_probe() {
         });
     if probe.is_err() {
         // Out of thread resources: no probe, no modes — plain key input.
-        QUERY_IN_FLIGHT.store(false, Ordering::SeqCst);
+        settle_probe(None);
     }
 }
 
-/// Windows has no kitty keyboard protocol probe (the vendored crossterm
-/// ships the raw-read support check unix-only): the capability settles as
-/// probed-but-unsupported — the same settle the no-answer probe path takes —
-/// and the query window closes.
+/// Close the probe window with its answer (`None`: no answer).
+#[cfg(unix)]
+fn settle_probe(answer: Option<crossterm::terminal::TerminalProbe>) {
+    crate::program_status::detected(answer.and_then(|probe| probe.program_status));
+    QUERY_IN_FLIGHT.store(false, Ordering::SeqCst);
+}
+
+/// Windows has no terminal probe (the vendored crossterm ships the raw-read
+/// check unix-only): the kitty capability settles as probed-but-unsupported —
+/// the same settle the no-answer probe path takes —, OSC 7501 settles
+/// unsupported, and the query window closes.
 #[cfg(not(unix))]
-fn spawn_kitty_probe() {
-    KITTY_PROBED.store(true, Ordering::SeqCst);
+fn spawn_terminal_probe(_keyboard: bool) {
+    crate::program_status::detected(None);
     QUERY_IN_FLIGHT.store(false, Ordering::SeqCst);
 }
 

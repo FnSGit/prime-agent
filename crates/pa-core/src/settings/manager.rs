@@ -1,9 +1,10 @@
 //! `SettingsManager`: loads global + project settings, merges them, tracks
 //! modified fields, and writes back only what this session changed.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 
 use super::load::from_value_lenient;
 use super::merge::{deep_merge, migrate};
@@ -14,8 +15,6 @@ use super::types::{
 
 pub const RECENT_MODELS_LIMIT: usize = 20;
 pub const DEFAULT_IDLE_EVICTION_MINUTES: u64 = 90;
-pub const DEFAULT_SESSION_ARCHIVE_MAX_AGE_DAYS: u64 = 30;
-pub const DEFAULT_SESSION_ARCHIVE_MAX_SESSIONS: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct SettingsError {
@@ -26,7 +25,9 @@ pub struct SettingsError {
 pub struct SettingsManager {
     storage: Arc<dyn SettingsStorage>,
     global: Settings,
+    pending_global_fields: BTreeSet<&'static str>,
     project: Settings,
+    project_raw: Option<serde_json::Value>,
     merged: Settings,
     runtime_overrides: Settings,
     errors: Vec<SettingsError>,
@@ -34,7 +35,7 @@ pub struct SettingsManager {
     /// gate distinguishes an ABSENT `allowedModels` key (unrestricted) from a
     /// PRESENT-but-malformed one (fails closed); typed `Settings` drops both to `None`.
     global_raw: Option<serde_json::Value>,
-    /// Load failures per scope; a scope whose file failed to parse is never written back.
+    /// Load failures per scope; a scope whose file failed to load is never written back.
     global_load_error: Option<String>,
     project_load_error: Option<String>,
 }
@@ -44,13 +45,15 @@ impl SettingsManager {
         let mut errors = Vec::new();
         let (global, global_raw, global_load_error) =
             load_scope(storage.as_ref(), SettingsScope::Global, &mut errors);
-        let (project, _, project_load_error) =
+        let (project, project_raw, project_load_error) =
             load_scope(storage.as_ref(), SettingsScope::Project, &mut errors);
         let merged = deep_merge(&global, &project);
         Self {
             storage,
             global,
+            pending_global_fields: BTreeSet::new(),
             project,
+            project_raw,
             merged,
             runtime_overrides: Settings::default(),
             global_raw,
@@ -118,6 +121,18 @@ impl SettingsManager {
         &self.project
     }
 
+    /// Project package entries remain available for an explicit removal, but
+    /// never participate in session resource resolution or update checks.
+    #[must_use]
+    pub(crate) fn project_packages_for_removal(&self) -> Vec<serde_json::Value> {
+        self.project_raw
+            .as_ref()
+            .and_then(|value| value.get("packages"))
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     #[must_use]
     pub fn errors(&self) -> &[SettingsError] {
         &self.errors
@@ -137,10 +152,12 @@ impl SettingsManager {
         let mut errors = std::mem::take(&mut self.errors);
         let (global, global_raw, global_load_error) =
             load_scope(self.storage.as_ref(), SettingsScope::Global, &mut errors);
-        let (project, _, project_load_error) =
+        let (project, project_raw, project_load_error) =
             load_scope(self.storage.as_ref(), SettingsScope::Project, &mut errors);
         self.global = global;
+        self.pending_global_fields.clear();
         self.project = project;
+        self.project_raw = project_raw;
         self.global_raw = global_raw;
         self.global_load_error = global_load_error;
         self.project_load_error = project_load_error;
@@ -163,8 +180,8 @@ impl SettingsManager {
     /// # Errors
     ///
     /// Returns an error when the global settings file cannot be written.
-    pub(crate) fn save_global_scope(&mut self) -> Result<()> {
-        self.save_global()
+    pub(crate) fn save_global_scope(&mut self, fields: &[&'static str]) -> Result<()> {
+        self.save_global(fields)
     }
 
     // -- persisted setters --------------------------------------------------
@@ -174,7 +191,7 @@ impl SettingsManager {
     /// Returns an error when the global settings file cannot be written.
     pub fn set_default_provider(&mut self, provider: String) -> Result<()> {
         self.global.default_provider = Some(provider);
-        self.save_global()
+        self.save_global(&["defaultProvider"])
     }
 
     /// # Errors
@@ -182,7 +199,7 @@ impl SettingsManager {
     /// Returns an error when the global settings file cannot be written.
     pub fn set_default_model(&mut self, model: String) -> Result<()> {
         self.global.default_model = Some(model);
-        self.save_global()
+        self.save_global(&["defaultModel"])
     }
 
     /// # Errors
@@ -192,7 +209,7 @@ impl SettingsManager {
         self.global.default_provider = Some(provider.to_string());
         self.global.default_model = Some(model.to_string());
         self.record_model_use(provider, model);
-        self.save_global()
+        self.save_global(&["defaultProvider", "defaultModel", "recentModels"])
     }
 
     /// `markdown.codeBlockIndent`: the string the chat markdown renderer
@@ -272,6 +289,7 @@ impl SettingsManager {
         }
         recent.truncate(RECENT_MODELS_LIMIT);
         self.global.recent_models = Some(recent);
+        self.pending_global_fields.insert("recentModels");
     }
 
     /// # Errors
@@ -279,7 +297,7 @@ impl SettingsManager {
     /// Returns an error when the global settings file cannot be written.
     pub fn set_steering_mode(&mut self, mode: QueueModeSetting) -> Result<()> {
         self.global.steering_mode = Some(mode);
-        self.save_global()
+        self.save_global(&["steeringMode"])
     }
 
     /// # Errors
@@ -287,7 +305,7 @@ impl SettingsManager {
     /// Returns an error when the global settings file cannot be written.
     pub fn set_follow_up_mode(&mut self, mode: QueueModeSetting) -> Result<()> {
         self.global.follow_up_mode = Some(mode);
-        self.save_global()
+        self.save_global(&["followUpMode"])
     }
 
     /// # Errors
@@ -295,7 +313,7 @@ impl SettingsManager {
     /// Returns an error when the global settings file cannot be written.
     pub fn set_theme(&mut self, theme: String) -> Result<()> {
         self.global.theme = Some(theme);
-        self.save_global()
+        self.save_global(&["theme"])
     }
 
     /// # Errors
@@ -303,7 +321,7 @@ impl SettingsManager {
     /// Returns an error when the global settings file cannot be written.
     pub fn set_update_channel(&mut self, channel: UpdateChannel) -> Result<()> {
         self.global.update_channel = Some(channel);
-        self.save_global()
+        self.save_global(&["updateChannel"])
     }
 
     /// # Errors
@@ -311,7 +329,7 @@ impl SettingsManager {
     /// Returns an error when the global settings file cannot be written.
     pub fn set_default_thinking_level(&mut self, level: ThinkingLevelSetting) -> Result<()> {
         self.global.default_thinking_level = Some(level);
-        self.save_global()
+        self.save_global(&["defaultThinkingLevel"])
     }
 
     /// The auto-retry toggle (`retry.enabled`).
@@ -324,7 +342,7 @@ impl SettingsManager {
             .retry
             .get_or_insert_with(Default::default)
             .enabled = Some(enabled);
-        self.save_global()
+        self.save_global(&["retry.enabled"])
     }
 
     /// The auto-compaction toggle (`compaction.enabled`): a daemon restart re-seeds
@@ -338,7 +356,7 @@ impl SettingsManager {
             .compaction
             .get_or_insert_with(Default::default)
             .enabled = Some(enabled);
-        self.save_global()
+        self.save_global(&["compaction.enabled"])
     }
 
     /// # Errors
@@ -346,7 +364,7 @@ impl SettingsManager {
     /// Returns an error when the global settings file cannot be written.
     pub fn set_transport(&mut self, transport: TransportSetting) -> Result<()> {
         self.global.transport = Some(transport);
-        self.save_global()
+        self.save_global(&["transport"])
     }
 
     /// # Errors
@@ -354,7 +372,7 @@ impl SettingsManager {
     /// Returns an error when the global settings file cannot be written.
     pub fn set_rlm_max_depth(&mut self, depth: u64) -> Result<()> {
         self.global.rlm_max_depth = Some(depth);
-        self.save_global()
+        self.save_global(&["rlmMaxDepth"])
     }
 
     /// # Errors
@@ -363,7 +381,7 @@ impl SettingsManager {
     pub fn set_telemetry_enabled(&mut self, enabled: bool) -> Result<()> {
         let telemetry = self.global.telemetry.get_or_insert_with(Default::default);
         telemetry.enabled = Some(enabled);
-        self.save_global()
+        self.save_global(&["telemetry.enabled"])
     }
 
     /// # Errors
@@ -372,7 +390,7 @@ impl SettingsManager {
     pub fn set_telemetry_notice_shown(&mut self, shown: bool) -> Result<()> {
         let telemetry = self.global.telemetry.get_or_insert_with(Default::default);
         telemetry.notice_shown = Some(shown);
-        self.save_global()
+        self.save_global(&["telemetry.noticeShown"])
     }
 
     /// # Errors
@@ -380,7 +398,7 @@ impl SettingsManager {
     /// Returns an error when the global settings file cannot be written.
     pub fn set_onboarding_shown(&mut self, shown: bool) -> Result<()> {
         self.global.onboarding_shown = Some(shown);
-        self.save_global()
+        self.save_global(&["onboardingShown"])
     }
 
     /// # Errors
@@ -388,7 +406,7 @@ impl SettingsManager {
     /// Returns an error when the global settings file cannot be written.
     pub fn set_onboarding_completed(&mut self, completed: bool) -> Result<()> {
         self.global.onboarding_completed = Some(completed);
-        self.save_global()
+        self.save_global(&["onboardingCompleted"])
     }
 
     /// The shown flag with the legacy completed flag as fallback.
@@ -440,7 +458,7 @@ impl SettingsManager {
             .agent_traces
             .get_or_insert_with(Default::default);
         traces.enabled = Some(enabled);
-        self.save_global()
+        self.save_global(&["agentTraces.enabled"])
     }
 
     pub fn set_packages(&mut self, packages: Vec<serde_json::Value>) {
@@ -454,12 +472,16 @@ impl SettingsManager {
     }
 
     pub fn set_project_packages(&mut self, packages: Vec<serde_json::Value>) {
-        self.project.packages = Some(packages.clone());
-        self.persist_scope_field(
-            SettingsScope::Project,
-            "packages",
-            &serde_json::Value::Array(packages),
-        );
+        // Preserve project package entries for explicit removal. They never
+        // become active, including in this manager.
+        let value = serde_json::Value::Array(packages);
+        self.persist_scope_field(SettingsScope::Project, "packages", &value);
+        if let serde_json::Value::Object(project_raw) = self
+            .project_raw
+            .get_or_insert_with(|| serde_json::json!({}))
+        {
+            project_raw.insert("packages".into(), value);
+        }
         self.merged = deep_merge(&self.global, &self.project);
     }
 
@@ -519,25 +541,28 @@ impl SettingsManager {
             self.errors.push(SettingsError {
                 scope,
                 message: format!(
-                    "{label} settings not saved: settings file failed to parse: {message}"
+                    "{label} settings not saved: settings file failed to load: {message}"
                 ),
             });
             return;
         }
-        let result = self.storage.with_lock(scope, &mut |current| {
-            let mut map: serde_json::Map<String, serde_json::Value> = current
-                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-                .and_then(|value| match value {
-                    serde_json::Value::Object(mut map) => {
-                        super::merge::migrate(&mut map);
-                        Some(map)
+        let mut failure = None;
+        let result =
+            self.storage.with_lock(
+                scope,
+                &mut |current| match settings_document(current.as_deref()).and_then(|mut map| {
+                    map.insert(field.to_string(), value.clone());
+                    serde_json::to_string_pretty(&serde_json::Value::Object(map))
+                        .map_err(Into::into)
+                }) {
+                    Ok(content) => Some(content),
+                    Err(error) => {
+                        failure = Some(error);
+                        None
                     }
-                    _ => None,
-                })
-                .unwrap_or_default();
-            map.insert(field.to_string(), value.clone());
-            serde_json::to_string_pretty(&serde_json::Value::Object(map)).ok()
-        });
+                },
+            );
+        let result = result.and_then(|()| failure.map_or(Ok(()), Err));
         if let Err(error) = result {
             self.errors.push(SettingsError {
                 scope,
@@ -615,7 +640,7 @@ impl SettingsManager {
             ServiceTier::Priority => "priority",
         };
         self.global.default_service_tier = Some(name.to_string());
-        self.save_global()
+        self.save_global(&["defaultServiceTier"])
     }
 
     /// Service tier a fresh session records as its preference.
@@ -640,6 +665,64 @@ impl SettingsManager {
     #[must_use]
     pub fn get_recent_models(&self) -> Vec<String> {
         self.merged.recent_models.clone().unwrap_or_default()
+    }
+
+    /// The default time limit for user `python_repl` cells, in
+    /// milliseconds (`0` disables; the default is 60s). Daemonless
+    /// sessions never arm it.
+    #[must_use]
+    pub fn get_python_cell_timeout_ms(&self) -> u64 {
+        self.merged
+            .python_cell_timeout_ms
+            .unwrap_or(crate::settings::types::DEFAULT_PYTHON_CELL_TIMEOUT_MS)
+    }
+
+    /// The agent-inbox kill switch (`agentInbox.enabled`, default on):
+    /// `false` restores direct notice-row steering. Global scope only, so a
+    /// project cannot flip the daemon's delivery route.
+    #[must_use]
+    pub fn get_agent_inbox_enabled(&self) -> bool {
+        self.global
+            .agent_inbox
+            .as_ref()
+            .and_then(|inbox| inbox.enabled)
+            .unwrap_or(true)
+    }
+
+    /// The inbox reminder's repeat interval in milliseconds
+    /// (`agentInbox.reminderIntervalMs`; default 10 minutes, `0`
+    /// disables the reminder). Global scope only, so a project cannot
+    /// drive the reminder loop.
+    #[must_use]
+    pub fn get_agent_inbox_reminder_interval_ms(&self) -> u64 {
+        self.global
+            .agent_inbox
+            .as_ref()
+            .and_then(|inbox| inbox.reminder_interval_ms)
+            .unwrap_or(crate::settings::types::DEFAULT_AGENT_INBOX_REMINDER_INTERVAL_MS)
+    }
+
+    /// The idle wake debounce window in milliseconds
+    /// (`agentInbox.idleDebounceMs`; default 5 s). Global scope only, like
+    /// the other `agentInbox` keys.
+    #[must_use]
+    pub fn get_agent_inbox_idle_debounce_ms(&self) -> u64 {
+        self.global
+            .agent_inbox
+            .as_ref()
+            .and_then(|inbox| inbox.idle_debounce_ms)
+            .unwrap_or(crate::settings::types::DEFAULT_AGENT_INBOX_IDLE_DEBOUNCE_MS)
+    }
+
+    /// How long an idle wake caused only by successful bash completions is
+    /// held (`agentInbox.successHoldMs`; default 30 s). Global scope only.
+    #[must_use]
+    pub fn get_agent_inbox_success_hold_ms(&self) -> u64 {
+        self.global
+            .agent_inbox
+            .as_ref()
+            .and_then(|inbox| inbox.success_hold_ms)
+            .unwrap_or(crate::settings::types::DEFAULT_AGENT_INBOX_SUCCESS_HOLD_MS)
     }
 
     /// The steering queue's delivery mode: `all` co-delivers every queued message at
@@ -799,34 +882,6 @@ impl SettingsManager {
         }
     }
 
-    /// Resolved session-archiving policy: both rules are independent — a session is
-    /// archived when EITHER fires; `None` on a field disables that rule.
-    #[must_use]
-    pub fn get_session_archive_policy(&self) -> SessionArchivePolicy {
-        let max_age_days = match &self.global.session_archive_max_age_days {
-            Some(serde_json::Value::String(text)) if text == "off" || text == "none" => None,
-            Some(serde_json::Value::Number(number)) => Some(
-                number
-                    .as_u64()
-                    .filter(|days| *days > 0)
-                    .unwrap_or(DEFAULT_SESSION_ARCHIVE_MAX_AGE_DAYS),
-            ),
-            _ => Some(DEFAULT_SESSION_ARCHIVE_MAX_AGE_DAYS),
-        };
-        let max_sessions = match &self.global.session_archive_max_sessions {
-            Some(serde_json::Value::String(text)) if text == "off" || text == "none" => None,
-            Some(serde_json::Value::Number(number)) => number
-                .as_u64()
-                .filter(|count| *count > 0)
-                .map(|count| count as usize),
-            _ => Some(DEFAULT_SESSION_ARCHIVE_MAX_SESSIONS),
-        };
-        SessionArchivePolicy {
-            max_age_days,
-            max_sessions,
-        }
-    }
-
     #[must_use]
     pub fn get_transport(&self) -> TransportSetting {
         self.merged.transport.unwrap_or(TransportSetting::Auto)
@@ -892,30 +947,88 @@ impl SettingsManager {
 
     /// Write the global scope back (project scope is host-written, not
     /// user-set), then re-derive the effective settings.
-    fn save_global(&mut self) -> Result<()> {
-        let content = serde_json::to_string_pretty(&self.global)?;
+    fn save_global(&mut self, fields: &[&'static str]) -> Result<()> {
+        self.merged = deep_merge(&self.global, &self.project);
+        self.pending_global_fields.extend(fields.iter().copied());
+        if let Some(message) = &self.global_load_error {
+            self.errors.push(SettingsError {
+                scope: SettingsScope::Global,
+                message: format!(
+                    "Global settings not saved: settings file failed to load: {message}"
+                ),
+            });
+            return Ok(());
+        }
+        let snapshot = serde_json::to_value(&self.global)?;
+        let mut failure = None;
+        let mut saved = None;
         self.storage
             .with_lock(SettingsScope::Global, &mut |current| {
-                let _ = current;
-                Some(content.clone())
+                let result = (|| -> Result<String> {
+                    let mut document = settings_document(current.as_deref())?;
+                    for field in &self.pending_global_fields {
+                        let (map, key, value) = if let Some((parent, child)) = field.split_once('.')
+                        {
+                            let nested = document
+                                .entry(parent.to_string())
+                                .or_insert_with(|| serde_json::json!({}));
+                            if !nested.is_object() {
+                                *nested = serde_json::json!({});
+                            }
+                            (
+                                nested.as_object_mut().unwrap(),
+                                child,
+                                &snapshot[parent][child],
+                            )
+                        } else {
+                            (&mut document, *field, &snapshot[*field])
+                        };
+                        if value.is_null() {
+                            map.remove(key);
+                        } else {
+                            map.insert(key.to_string(), value.clone());
+                        }
+                    }
+                    let value = serde_json::Value::Object(document);
+                    let content = serde_json::to_string_pretty(&value)?;
+                    saved = Some(value);
+                    Ok(content)
+                })();
+                match result {
+                    Ok(content) => Some(content),
+                    Err(error) => {
+                        failure = Some(error);
+                        None
+                    }
+                }
             })?;
-        self.merged = deep_merge(&self.global, &self.project);
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        self.global_raw = saved;
+        self.pending_global_fields.clear();
         Ok(())
     }
+}
+
+/// Parse inside the storage lock; malformed or non-object documents must never
+/// be replaced with defaults, including when another writer changed them after load.
+fn settings_document(current: Option<&str>) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let value: serde_json::Value = serde_json::from_str(current.unwrap_or("{}"))
+        .context("parsing settings.json; settings not saved")?;
+    let serde_json::Value::Object(mut map) = value else {
+        return Err(anyhow!(
+            "settings.json must contain a JSON object; settings not saved"
+        ));
+    };
+    migrate(&mut map);
+    Ok(map)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdleEviction {
     Minutes(u64),
     Off,
-}
-
-/// Resolved session-archiving settings: the age rule (sessions untouched for
-/// `max_age_days` days) and the count rule (keep the newest `max_sessions`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionArchivePolicy {
-    pub max_age_days: Option<u64>,
-    pub max_sessions: Option<usize>,
 }
 
 fn strings(array: &[serde_json::Value]) -> Vec<String> {
@@ -971,13 +1084,64 @@ fn load_scope(
         }
         other => other,
     };
-    (from_value_lenient(&migrated), Some(migrated), None)
+    let mut settings = from_value_lenient(&migrated);
+    if scope == SettingsScope::Project {
+        // A repository can supply this file before the user opens it. Keep its
+        // document on disk, but never let it select session storage or executable
+        // settings through an effective settings read.
+        settings.session_dir = None;
+        settings.shell_path = None;
+        settings.shell_command_prefix = None;
+        settings.npm_command = None;
+        settings.packages = None;
+        settings.mcp_servers = None;
+        settings.mcp_catalog_sources = None;
+    }
+    (settings, Some(migrated), None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::types::MarkdownSettings;
+    use crate::settings::types::{MarkdownSettings, DEFAULT_PYTHON_CELL_TIMEOUT_MS};
+
+    #[test]
+    #[cfg(unix)]
+    fn project_settings_cannot_copy_a_linked_auth_document() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let agent_dir = root.path().join("global");
+        let project_settings = project.join(".prime/agent/settings.json");
+        let auth = agent_dir.join("auth.json");
+        std::fs::create_dir_all(project_settings.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let secret = r#"{"prime-inference":{"type":"api_key","key":"sensitive-key"}}"#;
+        std::fs::write(&auth, secret).unwrap();
+        std::os::unix::fs::symlink("../../../global/auth.json", &project_settings).unwrap();
+
+        let mut manager = SettingsManager::create(&project, &agent_dir);
+        manager.set_project_packages(vec![serde_json::json!({"source": "example"})]);
+
+        assert!(std::fs::symlink_metadata(&project_settings)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&auth).unwrap(), secret);
+        let messages: Vec<&str> = manager
+            .errors()
+            .iter()
+            .filter(|error| error.scope == SettingsScope::Project)
+            .map(|error| error.message.as_str())
+            .collect();
+        assert!(!messages.is_empty());
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.contains("outside the project root")
+                    && !message.contains("failed to parse")),
+            "{messages:?}"
+        );
+    }
 
     #[test]
     fn in_memory_loads_merges_and_saves() {
@@ -993,6 +1157,56 @@ mod tests {
         );
         manager.reload().unwrap();
         assert_eq!(manager.get_default_model(), Some("z-ai/glm-5.3"));
+    }
+
+    /// `agentInbox.enabled` defaults ON (the kill switch is opt-out) and
+    /// `reminderIntervalMs` defaults to 10 minutes; `0` disables the
+    /// reminder.
+    #[test]
+    fn agent_inbox_settings_default_and_kill_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let manager = SettingsManager::create(dir.path(), agent_dir.clone());
+        assert!(manager.get_agent_inbox_enabled(), "unset reads as enabled");
+        assert_eq!(
+            manager.get_agent_inbox_reminder_interval_ms(),
+            crate::settings::types::DEFAULT_AGENT_INBOX_REMINDER_INTERVAL_MS
+        );
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"agentInbox": {"enabled": false, "reminderIntervalMs": 0, "idleDebounceMs": 250, "successHoldMs": 900}}"#,
+        )
+        .unwrap();
+        let manager = SettingsManager::create(dir.path(), agent_dir);
+        assert!(!manager.get_agent_inbox_enabled());
+        assert_eq!(manager.get_agent_inbox_reminder_interval_ms(), 0);
+        assert_eq!(manager.get_agent_inbox_idle_debounce_ms(), 250);
+        assert_eq!(manager.get_agent_inbox_success_hold_ms(), 900);
+    }
+
+    /// Both `agentInbox` keys read the GLOBAL scope only: a cloned repo's
+    /// project settings can neither flip the route nor set the reminder
+    /// interval.
+    #[test]
+    fn agent_inbox_settings_read_the_global_scope_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("cwd");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(cwd.join(".prime/agent")).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            cwd.join(".prime/agent/settings.json"),
+            r#"{"agentInbox": {"enabled": false, "reminderIntervalMs": 1}}"#,
+        )
+        .unwrap();
+
+        let manager = SettingsManager::create(&cwd, &agent_dir);
+        assert!(manager.get_agent_inbox_enabled());
+        assert_eq!(
+            manager.get_agent_inbox_reminder_interval_ms(),
+            crate::settings::types::DEFAULT_AGENT_INBOX_REMINDER_INTERVAL_MS
+        );
     }
 
     /// `factory.enabled` reads the GLOBAL scope only (the agent-dir
@@ -1190,30 +1404,23 @@ mod tests {
     }
 
     #[test]
-    fn session_archive_policy_semantics() {
-        let mut manager = SettingsManager::in_memory(&Settings::default());
+    fn python_cell_timeout_reads_setting_or_default() {
+        let manager = SettingsManager::in_memory(&Settings::default());
         assert_eq!(
-            manager.get_session_archive_policy(),
-            SessionArchivePolicy {
-                max_age_days: Some(DEFAULT_SESSION_ARCHIVE_MAX_AGE_DAYS),
-                max_sessions: Some(DEFAULT_SESSION_ARCHIVE_MAX_SESSIONS),
-            }
+            manager.get_python_cell_timeout_ms(),
+            DEFAULT_PYTHON_CELL_TIMEOUT_MS
         );
-        manager.global.session_archive_max_age_days = Some(serde_json::json!("off"));
-        assert_eq!(manager.get_session_archive_policy().max_age_days, None);
-        manager.global.session_archive_max_age_days = Some(serde_json::json!(0));
-        assert_eq!(
-            manager.get_session_archive_policy().max_age_days,
-            Some(DEFAULT_SESSION_ARCHIVE_MAX_AGE_DAYS)
-        );
-        manager.global.session_archive_max_age_days = Some(serde_json::json!(14));
-        assert_eq!(manager.get_session_archive_policy().max_age_days, Some(14));
-        manager.global.session_archive_max_sessions = Some(serde_json::json!("none"));
-        assert_eq!(manager.get_session_archive_policy().max_sessions, None);
-        manager.global.session_archive_max_sessions = Some(serde_json::json!(0));
-        assert_eq!(manager.get_session_archive_policy().max_sessions, None);
-        manager.global.session_archive_max_sessions = Some(serde_json::json!(50));
-        assert_eq!(manager.get_session_archive_policy().max_sessions, Some(50));
+        let manager = SettingsManager::in_memory(&Settings {
+            python_cell_timeout_ms: Some(90_000),
+            ..Settings::default()
+        });
+        assert_eq!(manager.get_python_cell_timeout_ms(), 90_000);
+        // Zero is the explicit disable, not the default.
+        let manager = SettingsManager::in_memory(&Settings {
+            python_cell_timeout_ms: Some(0),
+            ..Settings::default()
+        });
+        assert_eq!(manager.get_python_cell_timeout_ms(), 0);
     }
 
     #[test]

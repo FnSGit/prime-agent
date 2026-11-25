@@ -1,65 +1,38 @@
 //! The dispatch surface: command routing, the command handlers,
 //! and the abort family.
 use super::{
-    json, persist_custom_row, response_failure, response_success, KillCloseReason, Lane,
-    QueueCheckpoint, QueuedItem, Result, SessionFile, TurnSettle, VecDeque, Worker,
-    PROMPT_ABORTED_BEFORE_DELIVERY, SIDE_QUESTION_SETTLE_TIMEOUT,
+    clear_withdrawn_progress_note, json, persist_custom_row, response_failure, response_success,
+    KillCloseReason, Lane, QueueCheckpoint, QueuedItem, Result, SessionFile, TurnSettle, VecDeque,
+    Worker, PROMPT_ABORTED_BEFORE_DELIVERY, SIDE_QUESTION_SETTLE_TIMEOUT,
 };
 
 use serde_json::Value;
 
 use crate::protocol::DaemonResponse;
+use crate::session_store::SessionMessagesQuery;
 
 impl Worker {
     pub(crate) async fn dispatch(&self, command_type: &str, payload: &Value) -> DaemonResponse {
         // Only operations that inspect or change historical branches need hydration.
         // Cancellation is deliberately excluded: it must reach the live turn immediately.
-        if matches!(
-            command_type,
-            "get_session_tree"
-                | "get_context_tree"
-                | "get_user_messages_for_forking"
-                | "set_session_entry_label"
-                | "navigate_tree"
-                | "fork"
-                | "export_html"
-                | "export_jsonl"
-        ) && self
-            .core
-            .lock()
-            .unwrap()
-            .store
-            .as_ref()
-            .is_some_and(|store| store.window.is_some())
+        let history_page = command_type == "get_messages"
+            && transcript_page(payload).is_some_and(|page| page.reads_history());
+        if history_page
+            || matches!(
+                command_type,
+                "get_session_tree"
+                    | "get_context_tree"
+                    | "get_user_messages_for_forking"
+                    | "set_session_entry_label"
+                    | "navigate_tree"
+                    | "fork"
+                    | "export_html"
+                    | "export_jsonl"
+            )
         {
-            let path = self
-                .core
-                .lock()
-                .unwrap()
-                .store
-                .as_ref()
-                .unwrap()
-                .path
-                .clone();
-            let load_path = path.clone();
-            let hydrated = tokio::task::spawn_blocking(move || SessionFile::open(&load_path))
-                .await
-                .map_err(anyhow::Error::from)
-                .and_then(|result| result);
-            match hydrated {
-                Ok(full) => {
-                    let mut core = self.core.lock().unwrap();
-                    if let Some(store) = core.store.as_mut().filter(|store| store.path == path) {
-                        store.install_full_history(full);
-                    }
-                }
-                Err(error) => {
-                    return response_failure(None, command_type, &error.to_string(), None);
-                }
+            if let Err(error) = self.hydrate_history().await {
+                return response_failure(None, command_type, &error.to_string(), None);
             }
-            // The hydrated full file was a transient whole-file copy on
-            // top of the installed history: release its freed heap.
-            pa_types::memory_release::trim_freed_heap();
         }
         match command_type {
             "create" => self.handle_create(payload).await,
@@ -69,7 +42,7 @@ impl Worker {
             "prompt_and_wait" => self.handle_prompt(payload, true).await,
             "steer" => self.handle_queue(payload, Lane::Steering),
             "follow_up" => self.handle_queue(payload, Lane::FollowUp),
-            "abort" => self.handle_abort(),
+            "abort" => self.handle_abort(payload),
             "abort_and_send_queued" => self.handle_abort_and_send_queued(),
             "start_side_question" => {
                 if let Err(response) = self.require_created("start_side_question") {
@@ -88,13 +61,14 @@ impl Worker {
                 self.compaction.abort();
                 response_success(None, "abort_compaction", None)
             }
-            "set_auto_compaction" => self.handle_set_auto_compaction(payload),
+            "set_auto_compaction" => self.handle_set_auto_compaction(payload).await,
             "wait_for_idle" => self.handle_wait_for_idle(payload).await,
             "wait_for_headless_completion" => {
                 self.handle_wait_for_headless_completion(payload).await
             }
             "get_state" => self.handle_get_state(),
-            "get_messages" => self.handle_get_messages(),
+            "get_messages" => self.handle_get_messages(payload),
+            "get_session_messages" => self.handle_get_session_messages(payload).await,
             "get_session_header" => self.handle_get_session_header(),
             "get_session_stats" => self.handle_get_session_stats(),
             "get_model_catalog" => self.handle_get_model_catalog(),
@@ -118,7 +92,7 @@ impl Worker {
             "worker_deliver_message" => self.handle_worker_deliver_message(payload),
             "update_snapshot" => self.handle_update_snapshot(),
             "kill" => self.handle_kill(payload).await,
-            "shutdown" => self.handle_shutdown().await,
+            "shutdown" => self.handle_shutdown(payload).await,
             "rename" => self.handle_rename("rename", payload),
             "set_session_name" => self.handle_rename("set_session_name", payload),
             "mark_anthropic_warning_shown" => self.handle_mark_anthropic_warning_shown(),
@@ -152,7 +126,7 @@ impl Worker {
             "factory_activity" => self.handle_factory_activity(payload).await,
             "execute_bash" => self.handle_execute_bash(payload),
             "execute_bash_and_wait" => self.handle_execute_bash_and_wait(payload).await,
-            "abort_bash" => self.handle_abort_bash().await,
+            "abort_bash" => self.handle_abort_bash(),
             "list_kernel_bash" | "tail_kernel_bash" | "kill_kernel_bash" => {
                 self.handle_kernel_bash_activity(command_type, payload)
                     .await
@@ -161,7 +135,7 @@ impl Worker {
             "restore_next_turn" => self.handle_restore_next_turn(payload),
             "restore_actions" => self.handle_restore_actions(payload),
             "refine" => self.handle_refine(payload).await,
-            "reload" => self.handle_reload(),
+            "reload" => self.handle_reload().await,
             "cancel_rlm_child" => self.handle_cancel_rlm_child(payload).await,
             "delete_rlm_subagent" => self.handle_delete_rlm_subagent(payload).await,
             // The engine call blocks on the engine runtime, so it
@@ -223,7 +197,10 @@ impl Worker {
 
     /// `navigate_tree` with the reload's announcement: announced before the
     /// response reaches the client, so surfaces never show the pre-navigation goal.
+    /// The whole navigation runs under the queued-work pause (TS
+    /// `_navigateTree`'s `acquireQueuedWorkPause` + `waitForIdle`).
     async fn handle_navigate_tree(&self, payload: &Value) -> DaemonResponse {
+        let _queued_work = self.hold_queued_work_pause("navigate");
         let response = self.tree_navigation.navigate_tree(payload).await;
         if response.success {
             if let Some(goal) = self.engine.goal_update_after_rebuild() {
@@ -313,13 +290,15 @@ impl Worker {
     /// flowing — the armed steering rows co-deliver, then the follow-up drains.
     ///
     /// SANCTIONED DIVERGENCE (operator ruling 2026-09-25): TS parks the queue
-    /// whenever nothing is armable; here the abort resumes. Returns whether
-    /// the queue was resumed.
+    /// whenever nothing is armable; here the abort resumes. The same divergence
+    /// covers a held admission pause: the abort clears the suspension and the
+    /// pump's own pause gate holds the delivery until the release re-notifies
+    /// it. Returns whether the queue was resumed.
     pub(crate) fn abort_and_send_queued(&self) -> bool {
-        // TS `canResume`: no admission pause held — the arm only
-        // fires in the send arm.
-        let can_resume =
-            !self.input_pauses.paused() && !self.core.lock().unwrap().shutdown_requested;
+        // TS `canResume` also parks under an admission pause; the pump's own
+        // pause gate is the one hold that matters, so only a shutting-down
+        // worker (whose queue survives via the restart journal) stays parked.
+        let can_resume = !self.core.lock().unwrap().shutdown_requested;
         if !can_resume {
             self.request_abort();
             return false;
@@ -348,6 +327,7 @@ impl Worker {
         {
             let mut core = self.core.lock().unwrap();
             core.abort_requested = true;
+            core.turn_cancelled = true;
             // The queue parks and a plain prompt is rejected until a
             // resume site fires.
             core.queued_input_suspended = true;
@@ -379,6 +359,7 @@ impl Worker {
             };
             cancel(&mut core.steering);
             cancel(&mut core.follow_up);
+            clear_withdrawn_progress_note(&core, self.engine.as_ref());
         }
         // A withdrawn continuation's pending guard already released at ITS admission,
         // so the withdraw clears nothing (a mirror clear could drop an unrelated guard).
@@ -386,11 +367,39 @@ impl Worker {
         // The in-flight turn's fetch cancels now, not at its next
         // streamed event.
         self.engine.abort_in_flight_turn();
+        // An idle withdrawal has no turn-end event to refresh the roster.
+        self.push_roster_delta();
     }
 
-    fn handle_abort(&self) -> DaemonResponse {
-        self.request_abort();
-        response_success(None, "abort", None)
+    fn handle_abort(&self, payload: &Value) -> DaemonResponse {
+        // The scoped arm runs before any queue mutation: `background_cell`
+        // targets ONLY the session's detached (backgrounded) kernel cell and
+        // never touches the queues, the running turn, or the suspension —
+        // the idle cancel contract. An unknown scope is rejected without any
+        // abort, and the scoped arm never falls back to the full funnel.
+        match payload.get("scope").and_then(Value::as_str) {
+            None => {
+                self.request_abort();
+                response_success(None, "abort", None)
+            }
+            Some("background_cell") => {
+                let stopped = self.engine.abort_background_cell();
+                // The report: the idle cancel says whether it stopped a
+                // parked cell, so the frontend can note the outcome
+                // instead of answering success either way.
+                response_success(
+                    None,
+                    "abort",
+                    Some(json!({ "stoppedBackgroundCell": stopped })),
+                )
+            }
+            Some(unknown) => response_failure(
+                None,
+                "abort",
+                &format!("unknown abort scope: {unknown}"),
+                None,
+            ),
+        }
     }
 
     fn handle_abort_and_send_queued(&self) -> DaemonResponse {
@@ -406,11 +415,18 @@ impl Worker {
         }
         let (core, inputs) = self.summary_inputs();
         let summary = self.summary_locked(&core, inputs);
-        response_success(
-            None,
-            "get_state",
-            Some(serde_json::to_value(&summary).unwrap_or(Value::Null)),
-        )
+        drop(core);
+        let mut data = serde_json::to_value(&summary).unwrap_or(Value::Null);
+        // The owed background completions ride every state read: a child
+        // with a detached cell (or a queued completion) is not idle, and the
+        // parent's busy check reads the count.
+        if let Some(object) = data.as_object_mut() {
+            object.insert(
+                "pendingBackgroundCompletions".to_string(),
+                json!(self.pending_background_completions()),
+            );
+        }
+        response_success(None, "get_state", Some(data))
     }
 
     /// `get_session_header`: the persisted session header line (TS wraps it
@@ -454,17 +470,139 @@ impl Worker {
         response_success(None, "get_session_stats", Some(stats))
     }
 
-    fn handle_get_messages(&self) -> DaemonResponse {
+    fn handle_get_messages(&self, payload: &Value) -> DaemonResponse {
         if let Err(response) = self.require_created("get_messages") {
             return response;
         }
+        let page = transcript_page(payload);
+        let capabilities = payload
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map(|capabilities| {
+                capabilities
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let core = self.core.lock().unwrap();
-        let messages: Vec<Value> = core
+        let Some(page) = page else {
+            let mut messages = core
+                .store
+                .as_ref()
+                .map(SessionFile::messages)
+                .unwrap_or_default();
+            if crate::snapshot_stream::wants_image_elision(&capabilities) {
+                crate::snapshot_stream::elide_snapshot_image_payloads(&mut messages);
+            }
+            return response_success(None, "get_messages", Some(json!({ "messages": messages })));
+        };
+        let Some(store) = core.store.as_ref() else {
+            return response_failure(None, "get_messages", "History branch changed", None);
+        };
+        // Validate ancestry atomically with the page read. Appends keep the
+        // attached leaf on this branch; navigation to another branch does not.
+        let history_leaf = match payload.get("historyLeafId").map(Value::as_str) {
+            Some(Some(leaf)) if store.branch_contains(leaf) => leaf.to_string(),
+            Some(_) => {
+                return response_failure(None, "get_messages", "History branch changed", None);
+            }
+            None => store.leaf_id().unwrap_or_default().to_string(),
+        };
+        let Some(mut rows) = store.transcript_page(&page) else {
+            return response_failure(None, "get_messages", "History branch changed", None);
+        };
+        if crate::snapshot_stream::wants_image_elision(&capabilities) {
+            crate::snapshot_stream::elide_snapshot_image_payloads(&mut rows.messages);
+        }
+        response_success(
+            None,
+            "get_messages",
+            Some(json!({
+                "messages": rows.messages,
+                "firstEntryId": rows.first_entry_id,
+                "lastEntryId": rows.last_entry_id,
+                "more": rows.more,
+                "historyLeafId": history_leaf,
+            })),
+        )
+    }
+
+    /// `get_session_messages`: one slice of the session's display transcript, filtered by
+    /// role globs; a slice into a windowed store's unloaded prefix hydrates the store first.
+    async fn handle_get_session_messages(&self, payload: &Value) -> DaemonResponse {
+        const NAME: &str = "get_session_messages";
+        if let Err(response) = self.require_created(NAME) {
+            return response;
+        }
+        let roles: Vec<String> = payload
+            .get("roles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect();
+        let query = match SessionMessagesQuery::new(
+            payload.get("start").and_then(Value::as_i64).unwrap_or(0),
+            payload.get("limit").and_then(Value::as_u64).unwrap_or(0),
+            &roles,
+        ) {
+            Ok(query) => query,
+            Err(error) => return response_failure(None, NAME, &error.to_string(), None),
+        };
+        let read = || {
+            let mut core = self.core.lock().unwrap();
+            let core = &mut *core;
+            let slice = core
+                .store
+                .as_mut()
+                .and_then(|store| query.read(store, &core.running_tool_calls));
+            slice
+        };
+        let mut slice = read();
+        if slice.is_none() {
+            if let Err(error) = self.hydrate_history().await {
+                return response_failure(None, NAME, &error.to_string(), None);
+            }
+            slice = read();
+        }
+        let Some(slice) = slice else {
+            return response_failure(None, NAME, "Session history is unavailable", None);
+        };
+        response_success(None, NAME, Some(slice.into_reply()))
+    }
+
+    /// Load a windowed store's full history in place; a full store stays as it is.
+    async fn hydrate_history(&self) -> Result<()> {
+        let Some(path) = self
+            .core
+            .lock()
+            .unwrap()
             .store
             .as_ref()
-            .map(crate::session_store::SessionFile::messages)
-            .unwrap_or_default();
-        response_success(None, "get_messages", Some(json!({ "messages": messages })))
+            .filter(|store| store.window.is_some())
+            .map(|store| store.path.clone())
+        else {
+            return Ok(());
+        };
+        let load_path = path.clone();
+        let full = tokio::task::spawn_blocking(move || SessionFile::open(&load_path)).await??;
+        if let Some(store) = self
+            .core
+            .lock()
+            .unwrap()
+            .store
+            .as_mut()
+            .filter(|store| store.path == path)
+        {
+            store.install_full_history(full);
+        }
+        // The hydrated full file was a transient whole-file copy on
+        // top of the installed history: release its freed heap.
+        pa_types::memory_release::trim_freed_heap();
+        Ok(())
     }
 
     fn handle_get_queue(&self) -> DaemonResponse {
@@ -489,18 +627,36 @@ impl Worker {
             return response;
         }
         let mut core = self.core.lock().unwrap();
-        let drain_lane = |lane: &mut VecDeque<QueuedItem>| -> Vec<String> {
-            lane.drain(..)
-                .map(|item| {
-                    if let Some(id) = item.admission_id.as_deref() {
-                        self.prompt_admissions.clear(id);
-                    }
-                    item.message
-                })
-                .collect()
+        // The dropped agent-message rows bounce to their senders: a queued
+        // row's sender otherwise never learns its message will not deliver.
+        let mut dropped_agent_rows = Vec::new();
+        // The inbox arrival row stays: it covers mail that is still
+        // waiting unannounced, and nothing else would wake the agent for
+        // it.
+        let is_arrival_row = |item: &QueuedItem| {
+            item.queue_key.as_deref() == Some(crate::worker::INBOX_ARRIVAL_QUEUE_KEY)
         };
-        let steering: Vec<String> = drain_lane(&mut core.steering);
-        let follow_up: Vec<String> = drain_lane(&mut core.follow_up);
+        let drain_lane =
+            |lane: &mut VecDeque<QueuedItem>, dropped_agent_rows: &mut Vec<Value>| -> Vec<String> {
+                let (kept, cleared): (VecDeque<_>, VecDeque<_>) =
+                    lane.drain(..).partition(is_arrival_row);
+                *lane = kept;
+                cleared
+                    .into_iter()
+                    .map(|item| {
+                        if let Some(id) = item.admission_id.as_deref() {
+                            self.prompt_admissions.clear(id);
+                        }
+                        if item.agent_message.is_some() {
+                            dropped_agent_rows.extend(item.custom_message);
+                        }
+                        item.message
+                    })
+                    .collect()
+            };
+        let steering: Vec<String> = drain_lane(&mut core.steering, &mut dropped_agent_rows);
+        let follow_up: Vec<String> = drain_lane(&mut core.follow_up, &mut dropped_agent_rows);
+        clear_withdrawn_progress_note(&core, self.engine.as_ref());
         let snapshot = Self::snapshot_locked(&core);
         drop(core);
         // The verdict refresh rides the same checkpoint as the snapshot: a stale
@@ -509,11 +665,62 @@ impl Worker {
             operation: "queue_cleared",
         });
         let _ = self.emit_action_update(&snapshot);
+        for row in &dropped_agent_rows {
+            self.bounce_cleared_agent_message(row);
+        }
         response_success(
             None,
             "clear_queue",
             Some(json!({ "steering": steering, "followUp": follow_up })),
         )
+    }
+
+    /// One dropped agent-message row's sender notice: the row's own
+    /// `details` name the sender and the body, and the bounce rides the
+    /// supervisor `send_message` route from this session. Spawned off the
+    /// clear's response path — a failed bounce is logged, never retried.
+    fn bounce_cleared_agent_message(&self, row: &Value) {
+        let Some(details) = row.get("details") else {
+            return;
+        };
+        let sender = details
+            .get("from")
+            .and_then(|from| from.get("activeSessionId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let Some(sender) = sender else {
+            // CLI-origin senders carry no session to bounce to.
+            return;
+        };
+        let message = details
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        // The cleared queue is this worker's own; its identity — not the
+        // row's delivery-time copy — names the receiver.
+        let receiver = {
+            let core = self.core.lock().unwrap();
+            core.store
+                .as_ref()
+                .and_then(|store| store.session_name().map(str::to_string))
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| self.config.active_session_id.clone())
+        };
+        let command = json!({
+            "type": "send_message",
+            "targetActiveSessionId": sender,
+            "message": cleared_agent_message_bounce_text(&receiver, message),
+            "fromActiveSessionId": self.config.active_session_id,
+            "agentOrigin": true,
+        });
+        let link = std::sync::Arc::clone(&self.roster_link);
+        let sender = sender.to_string();
+        let timeout = std::time::Duration::from_millis(crate::messaging::WORKER_REQUEST_TIMEOUT_MS);
+        tokio::spawn(async move {
+            if let Err(error) = link.request_success(command, timeout).await {
+                eprintln!("pa-daemon: cleared agent-message bounce to {sender} failed: {error:#}");
+            }
+        });
     }
 
     fn handle_abort_and_clear_queue(&self) -> DaemonResponse {
@@ -523,6 +730,7 @@ impl Worker {
         }
         let mut core = self.core.lock().unwrap();
         core.abort_requested = true;
+        core.turn_cancelled = true;
         // The same TS `requestAbort()` suspension as the bare `abort`.
         core.queued_input_suspended = true;
         drop(core);
@@ -536,13 +744,17 @@ impl Worker {
             return response;
         }
         let core = self.core.lock().unwrap();
+        // The newest non-empty assistant text: an ended turn's final
+        // assistant row may hold only the tool call, so the answer sits in
+        // the last assistant row with text (the file fallback's rule).
         let text = core.store.as_ref().and_then(|store| {
             store
                 .messages()
                 .into_iter()
                 .rev()
-                .find(|message| crate::types::message_role(message) == Some("assistant"))
+                .filter(|message| crate::types::message_role(message) == Some("assistant"))
                 .map(|message| crate::types::message_text(&message))
+                .find(|text| !text.is_empty())
         });
         response_success(
             None,
@@ -612,6 +824,7 @@ impl Worker {
         {
             let mut core = self.core.lock().unwrap();
             core.abort_requested = true;
+            core.turn_cancelled = true;
             core.steering.clear();
             core.follow_up.clear();
         }
@@ -634,14 +847,7 @@ impl Worker {
         let active_session_id = self.core.lock().unwrap().active_session_id.clone();
         let _ = self.emit_session_closed(&active_session_id, reason.session_closed_reason());
         let _ = self.record_recovery(false, reason.recovery_operation());
-        let lease = self
-            .core
-            .lock()
-            .unwrap()
-            .store
-            .as_mut()
-            .and_then(|store| store.lease.take());
-        drop(lease);
+        self.release_session_lease();
         // The session runtime ended (TS `prime-agent stop <agent>`): the
         // pane reporter releases its pane as the last write on the wire —
         // no report may reclaim it afterwards. The slot is taken out
@@ -705,8 +911,8 @@ impl Worker {
         // commands run concurrently, so a second lock scope here could
         // interleave another command's writes between the name and its
         // notice, ordering the notice against a contradicted name history.
-        // The broadcast (the client frames) runs after the lock drops, in
-        // the `session_info_changed` order TS emits.
+        // The frames share that lock so a compaction cannot include the
+        // notice before its broadcast; `session_info_changed` still comes first.
         let renamed_notice = previous
             .as_deref()
             .filter(|previous| *previous != name)
@@ -729,24 +935,75 @@ impl Worker {
         if let Some(notice) = renamed_notice.as_ref() {
             persist_custom_row(&mut core, notice);
         }
+        // `session_info_changed` makes every attached client re-read the name.
+        super::emit_worker_event_locked(
+            &mut core,
+            &self.events,
+            serde_json::json!({ "type": "session_info_changed", "name": name }),
+        );
+        if let Some(notice) = renamed_notice.as_ref() {
+            super::broadcast_custom_row_locked(&mut core, &self.events, notice);
+        }
         drop(core);
-        // `session_info_changed` makes every attached client re-read
-        // the name.
-        self.emit_worker_event(serde_json::json!({
-            "type": "session_info_changed",
-            "name": name,
-        }));
         // The sender identity follows the live name.
         if let Ok(summary_value) = serde_json::to_value(&summary) {
             self.engine.set_session_summary(summary_value);
-        }
-        if let Some(notice) = renamed_notice.as_ref() {
-            self.broadcast_custom_row(notice);
         }
         response_success(
             None,
             command,
             Some(serde_json::to_value(&summary).unwrap_or(Value::Null)),
         )
+    }
+}
+
+/// The bounce body: the receiver label, the fact, and the dropped body —
+/// truncated so the whole notice stays inside the delivery size limit the
+/// receiving `worker_deliver_message` enforces.
+fn cleared_agent_message_bounce_text(receiver: &str, message: &str) -> String {
+    let limit = pa_core::session_engine::agent_messaging::DEFAULT_AGENT_MESSAGE_MAX_CHARS;
+    let opening = "Your agent message was cleared from ";
+    let ending = "'s queue before delivery: ";
+    // Session names are unbounded. Reserve the notice itself before fitting
+    // the receiver label, then spend the remaining characters on the body.
+    let receiver_budget = limit.saturating_sub(opening.chars().count() + ending.chars().count());
+    let receiver: String = receiver.chars().take(receiver_budget).collect();
+    let prefix = format!("{opening}{receiver}{ending}");
+    let budget = limit.saturating_sub(prefix.chars().count());
+    let body: String = message.chars().take(budget).collect();
+    format!("{prefix}{body}")
+}
+
+/// The display-transcript page a `get_messages` payload asks for, if any.
+fn transcript_page(payload: &Value) -> Option<pa_types::daemon::TranscriptPage> {
+    serde_json::from_value(payload.get("page")?.clone()).ok()
+}
+
+#[cfg(test)]
+mod bounce_text_tests {
+    use super::cleared_agent_message_bounce_text;
+    use pa_core::session_engine::agent_messaging::DEFAULT_AGENT_MESSAGE_MAX_CHARS;
+
+    #[test]
+    fn bounce_text_limits_receiver_and_body_without_losing_the_notice() {
+        for (receiver, message) in [
+            (
+                "target".to_string(),
+                "界".repeat(DEFAULT_AGENT_MESSAGE_MAX_CHARS),
+            ),
+            (
+                "界".repeat(DEFAULT_AGENT_MESSAGE_MAX_CHARS + 1),
+                "body".to_string(),
+            ),
+            (
+                "界".repeat(DEFAULT_AGENT_MESSAGE_MAX_CHARS + 1),
+                String::new(),
+            ),
+        ] {
+            let text = cleared_agent_message_bounce_text(&receiver, &message);
+            assert_eq!(text.chars().count(), DEFAULT_AGENT_MESSAGE_MAX_CHARS);
+            assert!(text.starts_with("Your agent message was cleared from "));
+            assert!(text.contains("'s queue before delivery: "));
+        }
     }
 }

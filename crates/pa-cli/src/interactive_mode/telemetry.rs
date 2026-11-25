@@ -1,10 +1,10 @@
 //! The interaction-telemetry concern: the pa-tui interactive loop reports
 //! through the `InteractionTelemetry` trait. Interactions only count into
-//! the session run's counters, which ride its one `tui exit` event. Two
-//! standalone events remain their own (TS parity, plus one upstream
-//! addition): `agent command used`, and `tui ipython bash rendered` —
-//! the settled-shell-cell metric upstream #3307 tracks per render, kept
-//! intact from main.
+//! the session run's counters, which ride its one `tui exit` event. The
+//! standalone events remain their own (TS parity, plus upstream additions):
+//! `agent command used`, `tui ipython bash rendered` — the
+//! settled-shell-cell metric upstream #3307 tracks per render, kept intact
+//! from main.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -12,10 +12,9 @@ use std::sync::Mutex;
 use super::{Future, PathBuf, Pin};
 
 /// The interactive client's telemetry: per-session-run adoption counters
-/// flushed with `tui exit`, plus the two standalone events — the TS
-/// `agent command used`, and the upstream #3307 `tui ipython bash
-/// rendered` — each on a one-shot client. Telemetry must never fail the
-/// session: opt-out or a broken install id drops the events.
+/// flushed with `tui exit`, plus the standalone events — the TS
+/// `agent command used`, the upstream #3307 `tui ipython bash rendered` — each on a one-shot client. Telemetry must
+/// never fail the session: opt-out or a broken install id drops the events.
 pub(super) struct CliInteractionTelemetry {
     pub(super) cwd: PathBuf,
     pub(super) agent_dir: PathBuf,
@@ -173,6 +172,11 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
         })
     }
 
+    fn live_tool_timer_started(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.count("tui_live_tool_timer_count");
+        Box::pin(std::future::ready(()))
+    }
+
     fn scroll_used(
         &self,
         _action: &'static str,
@@ -251,9 +255,12 @@ impl pa_tui::interactive::InteractionTelemetry for CliInteractionTelemetry {
 
     fn agents_view_action(
         &self,
-        _action: &'static str,
+        action: &'static str,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         self.count("tui_agents_action_count");
+        if action == "content_search" {
+            self.count("tui_agents_content_search_count");
+        }
         Box::pin(std::future::ready(()))
     }
 
@@ -384,6 +391,8 @@ mod tests {
         let telemetry = CliInteractionTelemetry::new(dir.path().to_path_buf(), agent_dir.clone());
         telemetry.scroll_used("page", false).await;
         telemetry.hyperlinks_active(true).await;
+        telemetry.agents_view_action("renamed").await;
+        telemetry.agents_view_action("content_search").await;
         telemetry.client_exit("session_request", false).await;
         telemetry.client_exit("ctrl_d", false).await;
         let mirror = std::fs::read_to_string(agent_dir.join("telemetry.jsonl")).unwrap();
@@ -395,6 +404,8 @@ mod tests {
         assert_eq!(exits.len(), 2);
         assert_eq!(exits[0]["properties"]["tui_scroll_count"], 1);
         assert_eq!(exits[0]["properties"]["tui_hyperlinks_enabled"], true);
+        assert_eq!(exits[0]["properties"]["tui_agents_action_count"], 2);
+        assert_eq!(exits[0]["properties"]["tui_agents_content_search_count"], 1);
         assert!(exits[1]["properties"].get("tui_scroll_count").is_none());
         assert!(exits[1]["properties"]
             .get("tui_hyperlinks_enabled")

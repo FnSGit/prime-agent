@@ -3,13 +3,10 @@
 //! by-model attribution computations.
 use super::{json, ModelRegistry, Value};
 
-/// The worker's model registry (auth storage + `models.json`, the
-/// private-authorization cache adopted so create-time resolution agrees).
+/// The worker's model registry (auth storage + `models.json`).
 pub(crate) fn worker_model_registry(agent_dir: &std::path::Path) -> ModelRegistry {
     let auth = pa_core::auth::AuthStorage::create(agent_dir);
-    let mut registry = ModelRegistry::create(auth, agent_dir.join("models.json"));
-    registry.load_private_authorization_from_cache();
-    registry
+    ModelRegistry::create(auth, agent_dir.join("models.json"))
 }
 
 /// The TS `Usage` wire shape (the TS `emptyUsage`).
@@ -28,6 +25,11 @@ pub(crate) fn empty_usage() -> Value {
             "total": 0,
         },
     })
+}
+
+/// A typed usage block in the wire shape the folds below add.
+fn usage_value(usage: &pa_types::ai::Usage) -> Value {
+    serde_json::to_value(usage).unwrap_or_else(|_| empty_usage())
 }
 
 /// TS `addAssistantUsage`: fold one usage block into a running total.
@@ -82,6 +84,20 @@ fn subtract_usage(total: &mut Value, usage: &Value) {
     }
 }
 
+/// The attribution rows own usage counts, each id once: a retried durable
+/// append can land the same id twice (bytes written, fsync errored), and the
+/// second row must not subtract its batch again. First occurrence wins; a row
+/// without an id carries no identity to dedupe by.
+fn unique_attribution_rows(
+    all_entries: &[crate::session_store::SessionEntry],
+) -> impl Iterator<Item = &crate::session_store::SessionEntry> + '_ {
+    let mut seen = std::collections::HashSet::new();
+    all_entries.iter().filter(move |entry| {
+        entry.type_ == "child_usage_attributed"
+            && (entry.id.is_empty() || seen.insert(entry.id.clone()))
+    })
+}
+
 /// The branch's cumulative assistant usage (`totalUsage`) minus the child
 /// usage attributions targeting those assistants (`ownUsage`). Totals stay
 /// cumulative across compactions — compaction shrinks the context, not the spend.
@@ -102,17 +118,12 @@ pub(crate) fn compute_own_and_total_usage(
                     add_usage(&mut total, usage);
                 }
             }
-        } else if matches!(entry.type_.as_str(), "compaction" | "branch_summary") {
-            if let Some(usage) = entry.fields.get("usage") {
-                add_usage(&mut total, usage);
-            }
+        } else if let Some(row) = crate::session_usage::billed_store_row(entry) {
+            add_usage(&mut total, &usage_value(&row.usage));
         }
     }
     let mut own = total.clone();
-    for entry in all_entries {
-        if entry.type_ != "child_usage_attributed" {
-            continue;
-        }
+    for entry in unique_attribution_rows(all_entries) {
         let Some(target_id) = entry.fields.get("targetId").and_then(Value::as_str) else {
             continue;
         };
@@ -161,7 +172,7 @@ pub(crate) fn compute_own_usage_by_model(
             Some(at)
         };
     for entry in branch {
-        let usage = match entry.type_.as_str() {
+        match entry.type_.as_str() {
             "model_change" => {
                 let provider = entry
                     .fields
@@ -175,7 +186,6 @@ pub(crate) fn compute_own_usage_by_model(
                     .unwrap_or_default();
                 current = (!provider.is_empty() && !model_id.is_empty())
                     .then(|| (provider.to_string(), model_id.to_string()));
-                continue;
             }
             "message" => {
                 let Some(message) = entry.fields.get("message") else {
@@ -210,33 +220,24 @@ pub(crate) fn compute_own_usage_by_model(
                     }
                     None => unresolved = true,
                 }
-                continue;
             }
-            "compaction" | "branch_summary" => entry.fields.get("usage"),
-            _ => continue,
-        };
-        if let Some(usage) = usage {
-            // A summary row's recorded serving model (TS #2411's auxiliary routing)
-            // outranks the timeline: the timeline names the current model, not the one billed.
-            let row_model = (|| {
-                let provider = entry.fields.get("provider")?.as_str()?;
-                let model_id = entry.fields.get("modelId")?.as_str()?;
-                (!provider.is_empty() && !model_id.is_empty())
-                    .then(|| (provider.to_string(), model_id.to_string()))
-            })();
-            match bucket_for(row_model.or_else(|| current.clone()), &mut buckets) {
-                Some(at) => add_usage(&mut buckets[at], usage),
-                None => unresolved = true,
+            _ => {
+                let Some(row) = crate::session_usage::billed_store_row(entry) else {
+                    continue;
+                };
+                // A billed row's recorded serving model (TS #2411's auxiliary routing)
+                // outranks the timeline: the timeline names the current model, not the one billed.
+                match bucket_for(row.model.or_else(|| current.clone()), &mut buckets) {
+                    Some(at) => add_usage(&mut buckets[at], &usage_value(&row.usage)),
+                    None => unresolved = true,
+                }
             }
         }
     }
     if unresolved {
         return None;
     }
-    for entry in all_entries {
-        if entry.type_ != "child_usage_attributed" {
-            continue;
-        }
+    for entry in unique_attribution_rows(all_entries) {
         let Some(target_id) = entry.fields.get("targetId").and_then(Value::as_str) else {
             continue;
         };
@@ -278,6 +279,53 @@ pub(crate) fn compute_own_usage_by_model(
     )
 }
 
+/// A transcript's own usage split by model: the same branch fold `/context`
+/// renders for a live child, kept only when it reconciles with `summary`
+/// (the whole-file snapshot a delete bills), so a deleted child's buckets
+/// always add up to its billed spend. `None` when the file is unreadable,
+/// a usage row resolves to no model, or the two folds disagree (a
+/// branched transcript).
+pub(crate) fn own_usage_by_model_of(
+    path: &std::path::Path,
+    summary: &crate::session_usage::SessionUsageSummary,
+) -> Option<Vec<crate::session_usage::ModelUsageSummary>> {
+    let store = crate::session_store::SessionFile::open(path).ok()?;
+    let branch = store.branch_bridged();
+    let (own_usage, _) = compute_own_and_total_usage(&branch, store.entries());
+    let buckets = compute_own_usage_by_model(
+        &branch,
+        store.entries(),
+        &own_usage,
+        store.window_boundary_model().as_ref(),
+    )?;
+    let tokens = |usage: &Value, field: &str| usage[field].as_u64().unwrap_or_default();
+    let by_model: Vec<crate::session_usage::ModelUsageSummary> = buckets
+        .iter()
+        .map(|bucket| {
+            let usage = &bucket["ownUsage"];
+            crate::session_usage::ModelUsageSummary {
+                provider: bucket["provider"].as_str().unwrap_or_default().to_string(),
+                id: bucket["id"].as_str().unwrap_or_default().to_string(),
+                input: tokens(usage, "input"),
+                output: tokens(usage, "output"),
+                cache_read: tokens(usage, "cacheRead"),
+                cache_write: tokens(usage, "cacheWrite"),
+                cost: usage["cost"]["total"].as_f64().unwrap_or_default(),
+            }
+        })
+        .collect();
+    let input: u64 = by_model
+        .iter()
+        .map(|model| model.input + model.cache_read + model.cache_write)
+        .sum();
+    let output: u64 = by_model.iter().map(|model| model.output).sum();
+    let cost: f64 = by_model.iter().map(|model| model.cost).sum();
+    let reconciles = input == summary.input_tokens
+        && output == summary.output_tokens
+        && (cost - summary.cost).abs() <= 1e-9 * (1.0 + cost.max(summary.cost));
+    reconciles.then_some(by_model)
+}
+
 #[cfg(test)]
 mod usage_tests {
     use super::*;
@@ -317,11 +365,10 @@ mod usage_tests {
                 .collect(),
         };
         let assistant_entry = entry(&assistant, "m1");
-        let attribution_entry = entry(&attribution, "a1");
         let entries = vec![
             assistant_entry.clone(),
-            attribution_entry.clone(),
-            attribution_entry.clone(),
+            entry(&attribution, "a1"),
+            entry(&attribution, "a2"),
         ];
         let branch_refs: Vec<&crate::session_store::SessionEntry> = entries.iter().collect();
         let (own, total) = compute_own_and_total_usage(&branch_refs, &entries);
@@ -331,11 +378,11 @@ mod usage_tests {
         // Subtraction clamps at zero instead of going negative (TS attribution-drift guard).
         let entries_more = vec![
             assistant_entry,
-            attribution_entry.clone(),
-            attribution_entry.clone(),
-            attribution_entry.clone(),
-            attribution_entry.clone(),
-            attribution_entry,
+            entry(&attribution, "a1"),
+            entry(&attribution, "a2"),
+            entry(&attribution, "a3"),
+            entry(&attribution, "a4"),
+            entry(&attribution, "a5"),
         ];
         let branch_refs_more: Vec<&crate::session_store::SessionEntry> =
             entries_more.iter().collect();
@@ -344,10 +391,61 @@ mod usage_tests {
         assert_eq!(own["cost"]["total"].as_f64(), Some(0.0));
     }
 
-    /// A `branch_summary` row served by an auxiliary model (TS #2411) bills on
-    /// the model its entry records, not the timeline's current model.
+    /// A duplicated attribution id — a retried durable append whose bytes
+    /// landed but whose fsync errored — is subtracted once: own usage keeps
+    /// one batch, the total keeps its last-wins aggregate.
     #[test]
-    fn branch_summary_usage_bills_on_the_row_recorded_auxiliary_model() {
+    fn a_duplicated_attribution_id_is_subtracted_once() {
+        let assistant = json!({
+            "type": "message", "id": "m1",
+            "message": {
+                "role": "assistant", "content": "text",
+                "usage": {
+                    "input": 100, "output": 10, "cacheRead": 0, "cacheWrite": 0,
+                    "totalTokens": 110,
+                    "cost": { "input": 1, "output": 2, "cacheRead": 0, "cacheWrite": 0, "total": 3 },
+                },
+            },
+        });
+        let attribution = json!({
+            "type": "child_usage_attributed", "id": "a1",
+            "targetId": "m1",
+            "childUsage": {
+                "input": 40, "output": 5, "cacheRead": 0, "cacheWrite": 0,
+                "totalTokens": 45,
+                "cost": { "input": 0.5, "output": 1, "cacheRead": 0, "cacheWrite": 0, "total": 1.5 },
+            },
+        });
+        let entry = |value: &Value, id: &str| crate::session_store::SessionEntry {
+            type_: value["type"].as_str().expect("type").to_string(),
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: "2024-01-01T00:00:00.000Z".to_string(),
+            fields: value
+                .as_object()
+                .expect("object")
+                .clone()
+                .into_iter()
+                .collect(),
+        };
+        // The retry's second row carries the same id and the same bytes.
+        let entries = vec![
+            entry(&assistant, "m1"),
+            entry(&attribution, "a1"),
+            entry(&attribution, "a1"),
+        ];
+        let branch: Vec<&crate::session_store::SessionEntry> = entries.iter().collect();
+        let (own, total) = compute_own_and_total_usage(&branch, &entries);
+        assert_eq!(total["input"], json!(100));
+        assert_eq!(own["input"], json!(60), "the duplicated id subtracts once");
+        assert_eq!(own["cost"]["total"].as_f64(), Some(1.5));
+    }
+
+    /// A `branch_summary` row served by an auxiliary model (TS #2411) and a
+    /// `model_usage` row bill on the model their entry records, not the
+    /// timeline's current model.
+    #[test]
+    fn billed_rows_bill_on_the_row_recorded_model() {
         let entry = |value: &Value, id: &str| crate::session_store::SessionEntry {
             type_: value["type"].as_str().expect("type").to_string(),
             id: id.to_string(),
@@ -389,12 +487,21 @@ mod usage_tests {
                 }),
                 "b1",
             ),
+            entry(
+                &json!({
+                    "type": "custom",
+                    "customType": "model_usage",
+                    "data": {"source": "side_question", "provider": "openai", "modelId": "gpt-b", "usage": usage(20, 2)},
+                }),
+                "u1",
+            ),
         ];
         let branch: Vec<&crate::session_store::SessionEntry> = entries.iter().collect();
         let (own, _) = compute_own_and_total_usage(&branch, &entries);
+        assert_eq!(own["totalTokens"], json!(110 + 55 + 22));
         let breakdown =
             compute_own_usage_by_model(&branch, &entries, &own, None).expect("resolved");
-        assert_eq!(breakdown.len(), 2);
+        assert_eq!(breakdown.len(), 3);
         assert_eq!(breakdown[0]["provider"], json!("openai"));
         assert_eq!(breakdown[0]["id"], json!("gpt-a"));
         assert_eq!(breakdown[0]["ownUsage"]["totalTokens"], json!(110));
@@ -402,6 +509,8 @@ mod usage_tests {
         assert_eq!(breakdown[1]["provider"], json!("anthropic"));
         assert_eq!(breakdown[1]["id"], json!("aux-opus-4"));
         assert_eq!(breakdown[1]["ownUsage"]["totalTokens"], json!(55));
+        assert_eq!(breakdown[2]["id"], json!("gpt-b"));
+        assert_eq!(breakdown[2]["ownUsage"]["totalTokens"], json!(22));
     }
 
     /// A windowed load seeds the timeline with the retained-window boundary's

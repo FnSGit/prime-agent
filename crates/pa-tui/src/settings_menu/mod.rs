@@ -134,7 +134,26 @@ pub fn settings_menu_rows(current: &SettingsCurrentValues) -> Vec<SettingsMenuRo
             idle_values[1..].sort_by_key(|value| value.parse::<u32>().unwrap_or(0));
         }
     }
+    let percent =
+        if pa_types::compaction::is_valid_threshold_percent(current.compaction_threshold_percent) {
+            current.compaction_threshold_percent
+        } else {
+            95.0
+        };
+    let mut thresholds: Vec<f64> = (5..=100).step_by(5).map(f64::from).collect();
+    if !thresholds.contains(&percent) {
+        thresholds.push(percent);
+        thresholds.sort_by(f64::total_cmp);
+    }
     vec![
+        SettingsMenuRow {
+            id: "autocompact-threshold",
+            label: "Auto-compact threshold (%)",
+            description: "Context percentage (1–100); retained history and model output budgets bound the trigger",
+            current: percent.to_string(),
+            values: Some(thresholds.into_iter().map(|value| value.to_string()).collect()),
+            submenu: None,
+        },
         SettingsMenuRow {
             id: "autocompact",
             label: "Auto-compact",
@@ -176,6 +195,22 @@ pub fn settings_menu_rows(current: &SettingsCurrentValues) -> Vec<SettingsMenuRo
             submenu: None,
         },
         SettingsMenuRow {
+            id: "harness-refinements",
+            label: "Harness refinements",
+            description: "Create and load harness refinements; prior replies and summaries retain their influence",
+            current: current.harness_refinements.to_string(),
+            values: Some(bool_value()),
+            submenu: None,
+        },
+        SettingsMenuRow {
+            id: "web-search-provider",
+            label: "Web search provider",
+            description: "Service the websearch skill queries in new sessions; add its API key via /mcp",
+            current: current.web_search_provider.clone(),
+            values: Some(vec!["serper".into(), "eco".into()]),
+            submenu: None,
+        },
+        SettingsMenuRow {
             id: "builtin-skills",
             label: "Built-in skills",
             description: "Load built-in skills shipped with prime-agent (takes effect after reload)",
@@ -205,6 +240,14 @@ pub fn settings_menu_rows(current: &SettingsCurrentValues) -> Vec<SettingsMenuRo
             description: "Max visible items in autocomplete dropdown (3-20)",
             current: current.autocomplete_max_visible.to_string(),
             values: Some(vec!["3".into(), "5".into(), "7".into(), "10".into(), "15".into(), "20".into()]),
+            submenu: None,
+        },
+        SettingsMenuRow {
+            id: "emoji-shortcodes",
+            label: "Emoji shortcodes",
+            description: "Suggest emoji when typing :name in the editor",
+            current: current.emoji_shortcodes.to_string(),
+            values: Some(bool_value()),
             submenu: None,
         },
         SettingsMenuRow {
@@ -323,12 +366,16 @@ pub fn settings_menu_rows(current: &SettingsCurrentValues) -> Vec<SettingsMenuRo
 #[derive(Debug, Clone, Default)]
 pub struct SettingsCurrentValues {
     pub autocompact: bool,
+    pub compaction_threshold_percent: f64,
     pub show_images: bool,
     pub auto_resize_images: bool,
     pub block_images: bool,
     pub skill_commands: bool,
     pub builtin_skills: bool,
+    pub harness_refinements: bool,
+    pub web_search_provider: String,
     pub hardware_cursor: bool,
+    pub emoji_shortcodes: bool,
     pub editor_padding: u64,
     pub autocomplete_max_visible: u64,
     pub clear_on_shrink: bool,

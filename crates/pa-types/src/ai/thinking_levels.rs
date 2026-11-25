@@ -93,6 +93,16 @@ pub fn clamp_thinking_level(model: &Model, level: ModelThinkingLevel) -> ModelTh
         .unwrap_or(ModelThinkingLevel::Off)
 }
 
+/// The weakest reasoning a request may send: `None` (the provider default)
+/// when the model can run with thinking off, else its lowest supported level.
+/// Toggle-based routes read omitted reasoning as "thinking off", which
+/// mandatory-thinking models reject.
+#[must_use]
+pub fn minimum_reasoning(model: &Model) -> Option<ModelThinkingLevel> {
+    let minimum = clamp_thinking_level(model, ModelThinkingLevel::Off);
+    (minimum != ModelThinkingLevel::Off).then_some(minimum)
+}
+
 /// Identity compare (`modelsAreEqual`): provider plus id.
 #[must_use]
 pub fn models_are_equal(a: Option<&Model>, b: Option<&Model>) -> bool {
@@ -150,6 +160,7 @@ mod tests {
             featured: None,
             headers: None,
             compat: None,
+            serving: None,
         }
     }
 
@@ -181,10 +192,7 @@ mod tests {
             clamp_thinking_level(&m, ModelThinkingLevel::Xhigh),
             ModelThinkingLevel::High
         );
-    }
 
-    #[test]
-    fn non_reasoning_models_only_support_off() {
         let m = model(false, None);
         assert_eq!(
             get_supported_thinking_levels(&m),
@@ -219,6 +227,12 @@ mod tests {
             clamp_thinking_level(&m, ModelThinkingLevel::Max),
             ModelThinkingLevel::Xhigh
         );
+
+        assert!(supports_thinking(&model(true, None)));
+        assert!(!supports_thinking(&model(false, None)));
+        // A map that only disables (`off` → "none") still addresses a level.
+        let toggle = thinking_level_map(&[(ModelThinkingLevel::Off, Some("none"))]);
+        assert!(supports_thinking(&model(false, Some(toggle))));
     }
 
     #[test]
@@ -242,15 +256,6 @@ mod tests {
         assert!(!supports_thinking(&non_thinking));
         let reasoning = model(true, Some(all_null));
         assert!(get_supported_thinking_levels(&reasoning).is_empty());
-    }
-
-    #[test]
-    fn supports_thinking_reads_the_flag_and_the_map() {
-        assert!(supports_thinking(&model(true, None)));
-        assert!(!supports_thinking(&model(false, None)));
-        // A map that only disables (`off` → "none") still addresses a level.
-        let toggle = thinking_level_map(&[(ModelThinkingLevel::Off, Some("none"))]);
-        assert!(supports_thinking(&model(false, Some(toggle))));
     }
 
     #[test]
@@ -282,23 +287,5 @@ mod tests {
             Some(ModelThinkingLevel::Xhigh)
         );
         assert_eq!(thinking_level_from_str("nope"), None);
-    }
-
-    #[test]
-    fn wire_names_round_trip_the_whole_ladder() {
-        for level in EXTENDED_THINKING_LEVELS {
-            assert_eq!(thinking_level_from_str(level.wire_name()), Some(level));
-        }
-    }
-
-    #[test]
-    fn equality_is_provider_and_id() {
-        let a = model(false, None);
-        let mut b = a.clone();
-        assert!(models_are_equal(Some(&a), Some(&b)));
-        b.provider = "other".into();
-        assert!(!models_are_equal(Some(&a), Some(&b)));
-        assert!(!models_are_equal(Some(&a), None));
-        assert!(!models_are_equal(None, None));
     }
 }

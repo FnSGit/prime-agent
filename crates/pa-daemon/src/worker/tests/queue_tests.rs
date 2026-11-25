@@ -291,10 +291,11 @@ fn legacy_queue_record_priority_defaults_by_row_and_keeps_order() {
     }))
     .unwrap();
     journal
-        .record_queue_snapshot("legacy", &[machine, human, future], &[])
+        .record_queue_snapshot("legacy", &[machine, human, future], &[], false)
         .unwrap();
+    drop(journal);
     let reopened = WorkerRecoveryJournal::open(&path).unwrap();
-    let (lane, _) = restore_queue_snapshot(&reopened, "legacy");
+    let (lane, _, _) = restore_queue_snapshot(&reopened, "legacy");
     assert_eq!(
         lane.iter()
             .map(|item| item.message.as_str())
@@ -334,6 +335,8 @@ fn queue_snapshot_round_trips_through_the_recovery_journal() {
         queue_key: Some("heartbeat:hb-1".to_string()),
         queue_visible: true,
         policy: "injected".to_string(),
+        forced_batch: false,
+        images: Vec::new(),
     };
     let plain = crate::journal::WorkerQueueItemRecord {
         message: "follow-me".to_string(),
@@ -343,17 +346,21 @@ fn queue_snapshot_round_trips_through_the_recovery_journal() {
         queue_key: None,
         queue_visible: true,
         policy: "queued".to_string(),
+        forced_batch: false,
+        images: Vec::new(),
     };
     journal
         .record_queue_snapshot(
             "session-a",
             std::slice::from_ref(&heartbeat),
             std::slice::from_ref(&plain),
+            false,
         )
         .unwrap();
     // A reopen (respawned worker) reads the latest snapshot per session.
+    drop(journal);
     let reloaded = WorkerRecoveryJournal::open(&journal_path).unwrap();
-    let (steering, follow_up) = restore_queue_snapshot(&reloaded, "session-a");
+    let (steering, follow_up, _) = restore_queue_snapshot(&reloaded, "session-a");
     assert_eq!(steering.len(), 1);
     assert_eq!(steering[0].message, heartbeat.message);
     assert_eq!(steering[0].priority, QueuePriority::Background);
@@ -366,12 +373,14 @@ fn queue_snapshot_round_trips_through_the_recovery_journal() {
     assert_eq!(follow_up[0].priority, QueuePriority::Human);
     // Compaction (triggered by an all-idle record) keeps the snapshot
     // with its full rows.
+    drop(reloaded);
     let mut compacting = WorkerRecoveryJournal::open(&journal_path).unwrap();
     compacting
         .record("session-a", "s1", None, false, "idle")
         .unwrap();
+    drop(compacting);
     let compacted = WorkerRecoveryJournal::open(&journal_path).unwrap();
-    let (steering, _) = restore_queue_snapshot(&compacted, "session-a");
+    let (steering, _, _) = restore_queue_snapshot(&compacted, "session-a");
     assert_eq!(steering.len(), 1);
     assert_eq!(steering[0].custom_message, heartbeat.custom_message);
     let _ = std::fs::remove_dir_all(&dir);
@@ -389,7 +398,7 @@ fn a_version_one_queue_snapshot_restores_as_plain_rows() {
     )
     .unwrap();
     let journal = WorkerRecoveryJournal::open(&journal_path).unwrap();
-    let (steering, follow_up) = restore_queue_snapshot(&journal, "session-b");
+    let (steering, follow_up, _) = restore_queue_snapshot(&journal, "session-b");
     assert_eq!(steering.len(), 1);
     assert_eq!(steering[0].message, "steer-me");
     assert_eq!(steering[0].preview, None);
@@ -494,4 +503,94 @@ async fn forced_batch_arming_classifies_the_visible_plain_rows() {
             "no item carries the armed flag"
         );
     }
+}
+
+/// The "all" steering mode co-delivers the whole parked run as ONE batch: the
+/// wake may move the delivery moment earlier (a steer ends a running cell's
+/// wait), but the batch rule itself is unchanged.
+#[test]
+fn steering_all_mode_co_delivers_the_whole_parked_run() {
+    let mut core = SessionCore::test_core(None, "/tmp".to_string());
+    core.steering_mode = "all".to_string();
+    for text in ["steer one", "steer two", "steer three"] {
+        core.steering
+            .push_back(priority_test_item(text, TurnPolicy::Queued));
+    }
+    let batch = gather_delivery_batch(&mut core, Lane::Steering);
+    let messages: Vec<&str> = batch.iter().map(|item| item.message.as_str()).collect();
+    assert_eq!(messages, ["steer one", "steer two", "steer three"]);
+    assert!(
+        core.steering.is_empty(),
+        "the whole parked run leaves the lane as one batch"
+    );
+}
+
+/// `requireBusy` steering never starts a turn: an idle session queues
+/// nothing, while a running turn takes the message before it goes idle.
+#[tokio::test]
+async fn require_busy_steer_queues_only_into_a_running_turn() {
+    let dir = std::env::temp_dir().join(format!("pa-worker-require-busy-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = WorkerConfig {
+        socket_path: dir.join("worker.sock"),
+        supervisor_socket_path: PathBuf::new(),
+        token: "token".to_string(),
+        worker_instance_id: String::new(),
+        active_session_id: "require-busy-session".to_string(),
+        agent_dir: dir.join("agent"),
+        recovery_journal_path: dir.join("recovery.jsonl"),
+        telemetry_disabled: None,
+        script: Some(json!({
+            "engine": "faux",
+            "responses": [{ "text": "held reply", "delayMs": 3000 }, "steered reply"],
+        })),
+    };
+    let worker = std::sync::Arc::new(Worker::new(config, None));
+    let created = worker
+        .dispatch(
+            "create",
+            &json!({ "noSession": true, "cwd": "/tmp", "name": "require-busy" }),
+        )
+        .await;
+    assert!(created.success, "create failed: {created:?}");
+    let steer = |message: &str| json!({ "message": message, "requireBusy": true });
+
+    let idle = worker.dispatch("steer", &steer("idle note")).await;
+    assert!(idle.success, "idle steer failed: {idle:?}");
+    assert_eq!(idle.data, Some(json!({ "queued": false })));
+    {
+        let core = worker.core.lock().unwrap();
+        assert!(core.steering.is_empty() && core.follow_up.is_empty());
+        assert!(!core.busy, "a refused steer must not start a turn");
+    }
+
+    let prompt = worker
+        .dispatch("prompt", &json!({ "message": "held turn" }))
+        .await;
+    assert!(prompt.success, "prompt failed: {prompt:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !worker.core.lock().unwrap().busy {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the held turn was never admitted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let busy = worker.dispatch("steer", &steer("mid-turn note")).await;
+    assert_eq!(busy.data, Some(json!({ "queued": true })), "{busy:?}");
+
+    let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+    assert!(idle.success, "wait_for_idle failed: {idle:?}");
+    let messages = worker.dispatch("get_messages", &json!({})).await;
+    let texts: Vec<String> = messages
+        .data
+        .as_ref()
+        .and_then(|data| data.get("messages"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|message| crate::types::message_role(message) == Some("user"))
+        .map(crate::types::message_text)
+        .collect();
+    assert_eq!(texts, ["held turn", "mid-turn note"]);
 }

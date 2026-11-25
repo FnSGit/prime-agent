@@ -51,9 +51,10 @@ impl Generation {
 }
 /// The snapshot format version: a sidecar serves only at exactly this
 /// version (any other version is rebuilt by the full walk). A served
-/// snapshot's `WindowStats` already folds the child usage attributions,
-/// and unread keys are ignored on load (no `deny_unknown_fields`).
-pub(super) const SNAPSHOT_VERSION: u32 = 7;
+/// snapshot's `WindowStats` already folds the child usage attributions and
+/// the older path's billed rows, and unread keys are ignored on load (no
+/// `deny_unknown_fields`).
+pub(super) const SNAPSHOT_VERSION: u32 = 9;
 // `retained_whole_file` is `#[serde(default)]` false: older sidecars
 // deserialize it as false and skip the full-history fast paths until the
 // next walk rewrites the sidecar (a version bump would force a re-walk).
@@ -139,10 +140,10 @@ pub(super) fn evict_live_snapshot(path: &Path) {
 pub(super) fn save(path: &Path, snapshot: &Snapshot) -> io::Result<()> {
     let temp = path.with_extension(format!("window-cache-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        crate::platform::perms::set_private_mode(&mut options);
+        let mut file = options.open(&temp)?;
         serde_json::to_writer(&mut file, snapshot)?;
         file.flush()?;
         std::fs::rename(&temp, cache_path(path))
@@ -180,6 +181,16 @@ pub enum AppendOwnership {
     /// No runtime lease: append without publishing an incremental snapshot.
     Unleased,
 }
+/// Whether the file's last byte is a newline: the append boundary probe.
+fn file_tail_is_newline(path: &Path) -> io::Result<bool> {
+    use std::io::{Read, Seek};
+    let mut probe = std::fs::File::open(path)?;
+    let mut tail = [0u8; 1];
+    probe.seek(std::io::SeekFrom::End(-1))?;
+    probe.read_exact(&mut tail)?;
+    Ok(tail[0] == b'\n')
+}
+
 /// Append authoritative JSONL bytes. Only a caller holding the existing session
 /// lease may incrementally certify the cache. Rows must have fresh writer IDs.
 /// Cache failures never fail a successful durable append.
@@ -189,6 +200,15 @@ pub enum AppendOwnership {
 /// The durable append's I/O error; a failed incremental certification is dropped.
 pub fn append_cached(path: &Path, bytes: &[u8], ownership: AppendOwnership) -> io::Result<()> {
     let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+    // The torn-tail boundary (the append-only reopen's belt): an
+    // unterminated final row - a crashed append the repair failed to
+    // re-terminate, its errors swallowed - must not merge with the first
+    // appended row: both would be lost to the index. One newline before
+    // the payload keeps the torn row alone (the loaders skip it) and the
+    // appended rows parseable. A no-op on a healthy file.
+    if file.metadata()?.len() > 0 && !file_tail_is_newline(path)? {
+        file.write_all(b"\n")?;
+    }
     file.write_all(bytes)?;
     file.flush()?;
     crate::platform::fsync(&file)?;

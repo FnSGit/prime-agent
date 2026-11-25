@@ -13,11 +13,11 @@ use serde_json::{json, Map, Value};
 use crate::backpressure::RouteAdmission;
 use crate::protocol::{response_failure, response_success, DaemonResponse};
 use crate::registry::ResidentWorker;
-use crate::supervisor::Supervisor;
+use crate::supervisor::{RosterFamilySeedOwner, Supervisor};
 
 /// Worker round-trip budget for the sender-summary read and the delivery
 /// route (TS `WORKER_REQUEST_TIMEOUT_MS`).
-const WORKER_REQUEST_TIMEOUT_MS: u64 = 30_000;
+pub(crate) const WORKER_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
 impl Supervisor {
     /// `send_message`: route to the target worker as `worker_deliver_message`;
@@ -216,24 +216,31 @@ impl Supervisor {
                 Err(error) => return WakeOutcome::Failed(error.to_string()),
             },
         };
-        let archive_dir = crate::session_archive::archive_dir(&self.options.agent_dir);
-        let info = match crate::session_catalog::resolve_saved_session(
-            &sessions_dir,
-            &archive_dir,
-            selector,
-            &cwd,
-        ) {
-            Ok(Some(info)) => info,
+        // The catalog scans and an archive restore's copy are blocking file I/O.
+        let archive_dir = self.options.agent_dir.join("sessions-archive");
+        let catalog_selector = selector.to_string();
+        let resolved = tokio::task::spawn_blocking(move || {
+            crate::session_catalog::resolve_saved_session(
+                &sessions_dir,
+                &archive_dir,
+                &catalog_selector,
+                &cwd,
+            )
+        })
+        .await;
+        let info = match resolved {
+            Ok(Ok(Some(info))) => info,
             // The saved-session catalog misses RLM children (they persist in
             // the parent's session-artifacts tree); the spawn ledger still
             // tracks them, so a child selector falls back to its live edges.
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 return match self.wake_ledger_child(selector).await {
                     Some(outcome) => outcome,
                     None => WakeOutcome::Unknown,
                 }
             }
-            Err(error) => return WakeOutcome::Failed(error.to_string()),
+            Ok(Err(error)) => return WakeOutcome::Failed(error.to_string()),
+            Err(error) => return WakeOutcome::Failed(format!("the saved-session lookup: {error}")),
         };
         let session_path = info.path.to_string_lossy().to_string();
         // Reuse before spawning (TS `createOrReuseWorker`): a resident
@@ -267,7 +274,11 @@ impl Supervisor {
         let launch = tokio::spawn({
             let supervisor = Arc::clone(self);
             let create = create;
-            async move { supervisor.launch_worker(&create, None).await }
+            async move {
+                supervisor
+                    .launch_worker(&create, None, RosterFamilySeedOwner::Registration)
+                    .await
+            }
         });
         let launched = tokio::time::timeout(
             std::time::Duration::from_millis(crate::supervisor::ROUTE_TIMEOUT_MS),
@@ -330,6 +341,7 @@ impl Supervisor {
             1 => {
                 let edge = matches.pop().expect("one match");
                 let session_file = edge.child.clone();
+                let parent_file = edge.parent.clone();
                 let (cwd, depth) =
                     crate::session_store::read_session_info(std::path::Path::new(&session_file))
                         .map_or_else(
@@ -337,8 +349,15 @@ impl Supervisor {
                             |info| (info.cwd, info.rlm_depth),
                         );
                 Some(
-                    self.launch_ledger_child_wake(&session_file, cwd, &edge.child_id, depth)
-                        .await,
+                    self.launch_ledger_child_wake(
+                        &session_file,
+                        &parent_file,
+                        cwd,
+                        &edge.child_id,
+                        depth,
+                        edge.decision_child,
+                    )
+                    .await,
                 )
             }
             _ => Some(WakeOutcome::Failed(format!(
@@ -349,16 +368,44 @@ impl Supervisor {
 
     /// Spawn one worker over a ledger child's session file, with the same
     /// concurrent-wake protections as the saved-session wake.
+    ///
+    /// The fresh create replays the child's durable identity: the ledger
+    /// edge's `decisionChild` flag (a dropped flag revives a decision
+    /// child as an agent session) and its parent session id
+    /// (the parent edge a revived decision child's replies route by — the
+    /// live parent id is not durable, so the child targets the parent's
+    /// durable session id, which resolves a live parent directly and a
+    /// passivated one through its wake).
     async fn launch_ledger_child_wake(
         self: &Arc<Self>,
         session_file: &str,
+        parent_file: &str,
         cwd: String,
         child_id: &str,
         depth: u32,
+        decision_child: bool,
     ) -> WakeOutcome {
         // Reuse before spawning: a concurrent revival may already host the file.
         if let Some(resident) = self.registry.find_by_session_file(session_file).await {
             return WakeOutcome::Woken(resident);
+        }
+        let parent_session_id = std::path::Path::new(parent_file)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut config = json!({ "cwd": cwd, "rlmDepth": depth });
+        if decision_child {
+            config["decisionChild"] = json!(true);
+        }
+        if !parent_file.is_empty() {
+            // The spawn's config carries the parent path into the durable
+            // create command's rest (the replay-key list reads it there);
+            // the wake keeps that shape so a respawn replays it too.
+            config["parentSessionPath"] = json!(parent_file);
+        }
+        let mut runtime_metadata = json!({ "kind": "subagent", "rlmChildId": child_id });
+        if !parent_session_id.is_empty() {
+            runtime_metadata["parentSessionId"] = json!(parent_session_id);
         }
         let create = DaemonCommand::Create {
             id: None,
@@ -371,9 +418,9 @@ impl Supervisor {
             // into the DURABLE create command's rest, which the passivation
             // fence reads; without them the revived child's fence sees a
             // root and never re-passivates.
-            config: Some(json!({ "cwd": cwd, "rlmDepth": depth })),
+            config: Some(config),
             telemetry_disabled: None,
-            runtime_metadata: Some(json!({ "kind": "subagent", "rlmChildId": child_id })),
+            runtime_metadata: Some(runtime_metadata),
             lifecycle: None,
             env: None,
             launch_env: None,
@@ -385,7 +432,11 @@ impl Supervisor {
         let launch = tokio::spawn({
             let supervisor = Arc::clone(self);
             let create = create;
-            async move { supervisor.launch_worker(&create, None).await }
+            async move {
+                supervisor
+                    .launch_worker(&create, None, RosterFamilySeedOwner::Registration)
+                    .await
+            }
         });
         let launched = tokio::time::timeout(
             std::time::Duration::from_millis(crate::supervisor::ROUTE_TIMEOUT_MS),
@@ -657,6 +708,9 @@ mod tests {
             name: "kid".to_string(),
             deleted: None,
             deleted_usage: None,
+            deleted_usage_by_model: None,
+            factory: None,
+            decision_child: false,
         };
         for selector in ["kid", "sub-kid1", "sess-kid"] {
             assert!(ledger_edge_matches(&edge, selector), "{selector}");

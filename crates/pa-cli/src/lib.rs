@@ -48,6 +48,7 @@ pub(crate) mod public_command;
 pub(crate) mod self_update;
 pub(crate) mod session_export;
 pub(crate) mod sessions_table_format;
+pub(crate) mod skills_command;
 pub(crate) mod subscription_login;
 pub(crate) mod telemetry_notice;
 pub(crate) mod traces_login;
@@ -59,6 +60,7 @@ pub(crate) mod piped_stdin;
 pub(crate) mod print_autonomous;
 pub(crate) mod print_boundary;
 pub(crate) mod print_goal;
+pub(crate) mod print_rlm;
 pub mod print_runtime;
 pub(crate) mod print_session_command;
 pub mod update_flow;
@@ -89,6 +91,8 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
     // Telemetry reports the version `--version` prints: the beta channel
     // restamps only the packaged manifest, never the compiled-in version.
     pa_telemetry::set_version(crate::config::version());
+    pa_daemon::protocol::configure_app_version(crate::config::version())
+        .map_err(|error| error.to_string())?;
 
     let offline_mode = args.iter().any(|arg| arg == "--offline")
         || crate::config::is_truthy_env_flag(
@@ -101,6 +105,7 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
     // Install-time kernel preparation: the installer invokes `--prime-agent-bootstrap`
     // after extracting a release, so the venv is ready before the first session.
     if args.len() == 1 && args[0] == "--prime-agent-bootstrap" {
+        crate::config::require_agent_dir()?;
         return run_runtime_bootstrap();
     }
 
@@ -113,6 +118,7 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
     let args = public_command.args;
 
     if args.first().map(String::as_str) == Some("config") {
+        crate::config::require_agent_dir()?;
         return Ok(crate::config_command::run());
     }
 
@@ -132,6 +138,13 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
     }
 
     let app_mode = mode::AppMode::resolve(&parsed, std::io::stdin().is_terminal());
+    // The TUI owns the terminal: structured logs go to stderr only outside it.
+    if app_mode != mode::AppMode::Interactive {
+        pa_ai::utils::log::install_stderr_log_sink();
+    }
+
+    // Enable Windows VT processing before raw ANSI mode writes.
+    pa_types::platform::console_init();
 
     if public_command.attach_agent.is_some() && app_mode != mode::AppMode::Interactive {
         return Err("attach requires an interactive terminal".to_string());
@@ -151,6 +164,8 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
         return Ok(0);
     }
 
+    crate::config::require_agent_dir()?;
+
     if parsed.export.is_some() {
         // The TS product only reaches the export subsystem through the `session
         // export <file> [output]` rewrite (a standalone `--export` exits above).
@@ -166,13 +181,13 @@ fn main_impl(args: &[String], runtime: &dyn mode::Runtime) -> Result<i32, String
     }
 
     // Daemon worker processes start with the worker role env var set: route
-    // straight into the worker runtime.
+    // straight into the worker runtime. The binary entry keeps the worker
+    // handshake env only for the supervisor-spawned `worker` subcommand (it
+    // strips an inherited one from every other invocation), so the routing
+    // reads that subcommand alone.
     let is_worker_process =
         std::env::var(pa_daemon::worker::WORKER_ROLE_ENV).unwrap_or_default() == "1";
-    if is_worker_process
-        && (args.first().map(String::as_str) == Some("worker")
-            || args.windows(2).any(|pair| pair == ["--mode", "daemon"]))
-    {
+    if is_worker_process && args.first().map(String::as_str) == Some("worker") {
         return run_worker_mode();
     }
 
@@ -321,8 +336,19 @@ fn run_runtime_bootstrap() -> Result<i32, String> {
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
+    // The bundled Python skills go in too: the venv is shared, so a later
+    // kernel that reuses it must not depend on which session synced first.
+    let bundled = pa_core::skills::load_skills_from_dir(
+        &pa_core::packages::get_bundled_skills_dir(),
+        "builtin",
+    );
     match runtime.block_on(pa_core::kernel::ensure_kernel_python(
-        pa_core::kernel::EnsureKernelPythonOptions::default(),
+        pa_core::kernel::EnsureKernelPythonOptions {
+            python_skills: pa_core::session_engine::runtime_wiring::kernel_python_skills(
+                &bundled.skills,
+            ),
+            on_progress: None,
+        },
     )) {
         Ok(python) => {
             println!("kernel python: {}", python.display());

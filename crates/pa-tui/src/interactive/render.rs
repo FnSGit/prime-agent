@@ -94,6 +94,10 @@ pub(super) enum Renderer {
         width: u16,
         height: u16,
         frames: Vec<String>,
+        /// Every headless render invocation so far. The frame capture dedupes on plain text,
+        /// so restyle-only renders add no frame; this count is the style-blind render witness
+        /// timing markers report.
+        renders: usize,
     },
 }
 
@@ -123,6 +127,7 @@ impl crate::suspend::SuspendTerminal for TerminalHandoff<'_> {
 pub(super) fn spawn_session_reader(ui_tx: mpsc::UnboundedSender<UiInput>, exit_guard: ExitGuard) {
     crate::input::spawn_paste_aware_reader(move |input| match input {
         crate::input::ReaderInput::BurstPaste(text) => ui_tx.send(UiInput::Paste(text)).is_ok(),
+        crate::input::ReaderInput::ChunkEnd => ui_tx.send(UiInput::InputChunkEnd).is_ok(),
         // A report the guard reassembled from a sequence crossterm's reader split at a
         // committed-`ESC` read boundary: consumed unless tracking is active, like the terminal's
         // mouse events.
@@ -168,6 +173,8 @@ impl Renderer {
     ) -> Result<Renderer> {
         match ui {
             UiMode::Terminal => {
+                // Enable Windows VT processing before raw ANSI mode writes.
+                pa_types::platform::console_init();
                 // The raw-mode bracket's own `cfmakeraw` write clears IXON, which is the
                 // kernel's one trigger for lifting a pending Ctrl+S stop: a tty stopped at the
                 // shell prompt self-heals here (verified by the flow e2e's launch route).
@@ -187,9 +194,8 @@ impl Renderer {
                 if mouse {
                     crate::mouse_tracking::enable(&mut std::io::stdout())?;
                 }
-                // Bracketed paste and the kitty keyboard protocol come up with the raw-mode
-                // bracket: pastes arrive as one chunk, and the kitty probe (once per process —
-                // see `enhanced_keys`) runs before the reader thread starts polling.
+                // Enable bracketed paste before the reader starts. On a fresh alternate
+                // screen, Kitty setup waits until the first draw finishes painting.
                 crate::enhanced_keys::enable(&mut std::io::stdout())?;
                 spawn_session_reader(ui_tx.clone(), exit_guard.clone());
                 let terminal = Terminal::new(crate::hyperlinks::stdout_backend())?;
@@ -286,6 +292,11 @@ impl Renderer {
                                     }
                                 }
                             }
+                            HeadlessStep::Timestamp(sender) => {
+                                if ui_tx.send(UiInput::Timestamp(sender)).is_err() {
+                                    return;
+                                }
+                            }
                             HeadlessStep::Key(key) => {
                                 if ui_tx.send(UiInput::Key(key)).is_err() {
                                     return;
@@ -299,6 +310,7 @@ impl Renderer {
                     width: plan.width,
                     height: plan.height,
                     frames: Vec::new(),
+                    renders: 0,
                 })
             }
         }
@@ -399,13 +411,24 @@ impl Renderer {
             width,
             height,
             frames,
+            renders,
         } = self
         else {
             return;
         };
         let text = crate::app::render_frame_text(view, *width, *height).join("\n");
+        *renders += 1;
         if frames.last().map(String::as_str) != Some(text.as_str()) {
             frames.push(text);
+        }
+    }
+
+    /// The headless render invocation count (0 on a terminal): timing markers carry it as the
+    /// witness for renders the deduped frame capture cannot express.
+    pub(super) fn headless_renders(&self) -> usize {
+        match self {
+            Renderer::Headless { renders, .. } => *renders,
+            Renderer::Terminal { .. } => 0,
         }
     }
 
@@ -423,11 +446,13 @@ impl Renderer {
             width,
             height,
             frames,
+            renders,
         } = self
         else {
             return;
         };
         let text = crate::app::render_frame_text(view, *width, *height).join("\n");
+        *renders += 1;
         if std::env::var("PA_TUI_DEBUG_EVENTS").is_ok() {
             eprintln!(
                 "[tui-frame] len={} has_second={} has_again={}",

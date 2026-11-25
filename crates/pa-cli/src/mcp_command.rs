@@ -38,7 +38,7 @@ fn is_valid_env_name(value: &str) -> bool {
 /// A user-configured MCP server entry, matching the TS `McpServerConfig`
 /// wire shape (camelCase keys).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all_fields = "camelCase")]
 pub enum McpServerConfig {
     #[serde(rename = "http")]
     Http {
@@ -100,14 +100,16 @@ fn mutate_global_settings(
     let mut failure: Option<anyhow::Error> = None;
     storage
         .with_lock(pa_core::settings::SettingsScope::Global, &mut |current| {
-            let mut settings = current
-                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-                .unwrap_or_else(|| serde_json::json!({}));
-            match mutate(&mut settings).and_then(|changed| {
+            let result = (|| -> Result<Option<String>> {
+                let mut settings =
+                    serde_json::from_str::<serde_json::Value>(current.as_deref().unwrap_or("{}"))
+                        .context("parsing settings.json; settings not saved")?;
+                let changed = mutate(&mut settings)?;
                 changed
                     .then(|| serde_json::to_string_pretty(&settings).map_err(Into::into))
                     .transpose()
-            }) {
+            })();
+            match result {
                 Ok(next) => next,
                 Err(error) => {
                     failure = Some(error);
@@ -138,6 +140,10 @@ fn set_global_mcp_server(name: &str, config: &McpServerConfig) -> Result<()> {
             .ok_or_else(|| anyhow!("settings.json must contain a JSON object"))?
             .entry("mcpServers".to_string())
             .or_insert_with(|| serde_json::json!({}));
+        // Older settings saves emitted null for an absent optional map.
+        if servers.is_null() {
+            *servers = serde_json::json!({});
+        }
         if !servers.is_object() {
             bail!("the mcpServers setting must be a JSON object");
         }
@@ -465,6 +471,34 @@ mod tests {
             serialized,
             serde_json::json!({"y": {"type": "http", "url": "https://example.com/mcp"}})
         );
+    }
+
+    #[test]
+    fn mcp_add_writes_the_bearer_token_key_the_engine_reads() {
+        let args: Vec<String> = [
+            "x",
+            "--url",
+            "https://e.com/mcp",
+            "--bearer-token-env-var",
+            "MY_TOKEN",
+        ]
+        .map(String::from)
+        .to_vec();
+        let (_, config, _) = parse_mcp_add_args(&args).unwrap();
+        let written = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            written,
+            serde_json::json!({
+                "type": "http",
+                "url": "https://e.com/mcp",
+                "bearerTokenEnvVar": "MY_TOKEN"
+            })
+        );
+        let engine: pa_core::mcp::McpServerConfig = serde_json::from_value(written).unwrap();
+        assert!(matches!(
+            engine,
+            pa_core::mcp::McpServerConfig::Http { bearer_token_env_var: Some(ref var), .. } if var == "MY_TOKEN"
+        ));
     }
 
     #[test]

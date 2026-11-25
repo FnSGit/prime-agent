@@ -16,6 +16,10 @@ pub(crate) const CONTINUATION_NO_PROGRESS_CAP: u32 = 3;
 /// each retry of a no-progress continuation waits twice as long.
 pub(crate) const CONTINUATION_NO_PROGRESS_BACKOFF_BASE_MS: u64 = 10_000;
 
+/// The goal's terminal reason when the no-progress streak reaches the cap.
+pub const CONTINUATION_NO_PROGRESS_CAP_REASON: &str =
+    "Goal continuation cap reached: consecutive turns made no progress";
+
 /// The durable one-shot wake's cron label: the daemon's boundary sites arm a
 /// one-shot cron at [`GoalDriver::backoff_wake_at`], so the backoff retry actually runs.
 pub const GOAL_BACKOFF_WAKE_CRON_LABEL: &str = "goal-backoff-wake";
@@ -23,6 +27,24 @@ pub const GOAL_BACKOFF_WAKE_CRON_LABEL: &str = "goal-backoff-wake";
 /// The wake marker prompt: the scheduler fires it into the follow-up lane;
 /// its turn re-probes the provider and re-consults the mint.
 pub const GOAL_BACKOFF_WAKE_MARKER_TEXT: &str = "<goal_backoff_wake>\nThe goal continuation backoff window (the consecutive-no-progress cap) has elapsed; this wake is automatic. Continue the goal work from where it stopped.\n</goal_backoff_wake>";
+
+/// The fallback wake's cron label: when the quiescence gate defers a goal
+/// continuation behind live background work (a `bash()` handle or a
+/// detached cell), the daemon arms a one-shot cron one
+/// [`GOAL_BACKGROUND_SKIP_WINDOW_MS`] out, so work that never completes
+/// cannot stall the goal without the model hearing of it.
+pub const GOAL_BACKGROUND_SKIP_WAKE_CRON_LABEL: &str = "goal-background-skip-wake";
+
+/// The fallback wake's window: the wake fires one marker turn this long
+/// after a deferral starts, once per deferral (the marker turn's own
+/// boundary does not re-arm it). Five minutes is generous to legitimate
+/// long builds; the work's own completion notice (`[bash-done]` or the
+/// cell's) is still the normal, immediate wake.
+pub const GOAL_BACKGROUND_SKIP_WINDOW_MS: u64 = 5 * 60 * 1000;
+
+/// The fallback wake's marker prompt: honest about why it fired, and that
+/// the work's completion notice still arrives separately.
+pub const GOAL_BACKGROUND_SKIP_WAKE_MARKER_TEXT: &str = "<goal_background_skip_wake>\nThe background-work skip window has elapsed; this wake is automatic. Live background work (a bash() shell or a backgrounded cell) still holds the goal continuation. Continue the goal work from where it stopped; its completion notification still arrives when it ends.\n</goal_background_skip_wake>";
 
 /// Whether the turn produced any output: an EMPTY content block list OR one
 /// whose every block is empty (the abort corpse's single empty text part).
@@ -126,9 +148,7 @@ impl GoalDriver {
                     },
                 )?;
                 if self.no_progress_streak >= CONTINUATION_NO_PROGRESS_CAP {
-                    let reason =
-                        "Goal continuation cap reached: consecutive turns made no progress"
-                            .to_string();
+                    let reason = CONTINUATION_NO_PROGRESS_CAP_REASON.to_string();
                     self.set_state(
                         session,
                         GoalState {

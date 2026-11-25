@@ -2,10 +2,25 @@
 //! rows, compaction aborts, and the telemetry seams.
 use super::{
     assistant_message_parts, event_to_update, pop_superseded_attempt_row, AgentView, ChatEntry,
-    CompactionReason, CompactionState, DaemonClientEvent, DaemonCommand, Duration, Map,
-    MessageBlock, Result, RetryState, SessionUi, StatusKind, ToolResultView, TurnUpdate, Value,
-    UI_REQUEST_TIMEOUT_MS,
+    CompactionReason, CompactionState, DaemonClientEvent, DaemonCommand, Map, MessageBlock,
+    Overlay, Result, RetryState, SessionUi, StatusKind, ToolResultView, TurnUpdate, Value,
 };
+use crate::interactive::reconnect::{ConnectionEffect, ConnectionEvent};
+
+/// Which press fired the shared interrupt ladder: the idle
+/// backgrounded-cell cancel rides only a BARE press (one that arms no
+/// other action); an ARMING press (the Escape clear/tree repeat, the
+/// Ctrl+C exit pair) never stops backgrounded work as a side effect of
+/// arming something else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterruptOrigin {
+    /// The press also arms another action (an Escape repeat, the Ctrl+C
+    /// exit pair): the scoped cancel never rides it.
+    Arming,
+    /// The press arms nothing else: the only gesture that may stop the
+    /// session's parked backgrounded cell.
+    Bare,
+}
 
 /// One backgrounded compaction-abort outcome: a failed abort surfaces as
 /// the transcript note and clears the stuck compaction loader locally.
@@ -18,6 +33,41 @@ pub(crate) struct CompactionAbortNote {
 }
 
 impl SessionUi {
+    /// Apply one connection event and show its row; the effect tells the run loop what to do next.
+    pub(crate) fn connection_event(
+        &mut self,
+        event: ConnectionEvent,
+        view: &mut AgentView,
+    ) -> ConnectionEffect {
+        let before = std::mem::discriminant(&self.connection);
+        let effect = self.connection.on(event);
+        match &effect {
+            ConnectionEffect::Note(text) | ConnectionEffect::Exit { note: text, .. } => {
+                self.note(text, view);
+            }
+            ConnectionEffect::Info(text) => self.note_as(text, StatusKind::Info, view),
+            ConnectionEffect::Warning(text) => self.note_as(text, StatusKind::Warning, view),
+            ConnectionEffect::ErrorRow(text) => self.error_row(text, view),
+            ConnectionEffect::None
+            | ConnectionEffect::Connect { .. }
+            | ConnectionEffect::Attach(_) => {}
+        }
+        if let ConnectionEffect::Exit { reason, .. } = &effect {
+            self.exit_reason = reason;
+        }
+        if before != std::mem::discriminant(&self.connection)
+            || !matches!(
+                effect,
+                ConnectionEffect::None
+                    | ConnectionEffect::Connect { .. }
+                    | ConnectionEffect::Attach(_)
+            )
+        {
+            self.dirty = true;
+        }
+        effect
+    }
+
     /// Abort the active turn off the UI loop: with the schema-29 capability the daemon aborts the
     /// run and the queue keeps flowing behind the settled turn; otherwise the plain abort.
     fn abort_turn(&self) {
@@ -38,6 +88,7 @@ impl SessionUi {
                     .request_ok(DaemonCommand::Abort {
                         id: None,
                         active_session_id: active_session_id.clone(),
+                        scope: None,
                         rest: Map::default(),
                     })
                     .await
@@ -49,6 +100,7 @@ impl SessionUi {
                     .request_ok(DaemonCommand::Abort {
                         id: None,
                         active_session_id,
+                        scope: None,
                         rest: Map::default(),
                     })
                     .await;
@@ -105,37 +157,6 @@ impl SessionUi {
 
     pub(crate) fn apply_background_note(&mut self, text: &str, view: &mut AgentView) {
         self.note(text, view);
-    }
-
-    /// A compaction succeeded and the durable transcript was rebuilt: re-fetch it. Best effort — a
-    /// failed fetch keeps the pushed outcome row instead of an empty transcript.
-    pub(crate) async fn rebuild_transcript(&mut self, view: &mut AgentView) {
-        self.transcript_stale = false;
-        self.last_status_index = None;
-        self.pressed_click = None;
-        let Ok(data) = self
-            .bounded_request(
-                Duration::from_millis(UI_REQUEST_TIMEOUT_MS),
-                DaemonCommand::GetMessages {
-                    id: None,
-                    active_session_id: self.active_session_id.clone(),
-                    rest: Map::default(),
-                },
-            )
-            .await
-        else {
-            return;
-        };
-        let Some(messages) = data.get("messages").and_then(Value::as_array) else {
-            return;
-        };
-        let entries = crate::snapshot::transcript_to_entries(messages);
-        view.clear_chat();
-        for entry in entries {
-            view.push_entry(entry);
-        }
-        view.follow();
-        self.dirty = true;
     }
 
     /// Report the first scroll action of the run (`tui_scroll_count`),
@@ -267,7 +288,22 @@ impl SessionUi {
             } => {
                 if active_session_id == self.active_session_id {
                     self.turn_active = false;
+                    self.run_open = false;
+                    self.outcome_after_compaction = None;
                     view.working = None;
+                    view.retry = None;
+                    view.compaction = None;
+                    // The closed session cannot run again: its remembered
+                    // settle owes the dead surface nothing.
+                    self.settled = None;
+                    self.bash_list_epoch += 1;
+                    self.factory_list_epoch += 1;
+                    self.bash_activities = serde_json::json!({"activities": []});
+                    self.factory_graph = serde_json::json!({"runs": []});
+                    if let Some(Overlay::Factory(factory_view)) = view.overlay.as_mut() {
+                        factory_view.apply_runs(Vec::new());
+                    }
+                    self.update_subagent_summary(view);
                     match reason.as_str() {
                         "shutdown" => self.error_row(
                             "The Prime Agent daemon shut down while this window was attached. The session transcript remains saved; restart Prime Agent and reopen it from Agents View.",
@@ -286,47 +322,54 @@ impl SessionUi {
                 }
             }
             DaemonClientEvent::DirectLinkLost { active_session_id } => {
-                // A direct-transport loss is never itself a session loss — the loop re-attaches
+                // A direct-transport loss is never itself a session loss — the session re-attaches
                 // through the supervisor; only the active session arms it.
                 if active_session_id == self.active_session_id {
-                    self.transport_lost = Some(active_session_id);
+                    self.connection_event(
+                        ConnectionEvent::DirectLinkLost { active_session_id },
+                        view,
+                    );
                 }
             }
             DaemonClientEvent::DaemonClosing { reason, update } => {
-                // The announcement is the discriminator the loop's shutdown recovery arms on: a
-                // bare session stop without it stays stopped.
-                self.daemon_closing_notice = Some(reason.clone());
-                match update {
-                    Some(update) => {
-                        // Spec §10: reattach is the default end state. The banner carries the
-                        // resume contract; the interactive run's reconnect loop drives the rest.
-                        let names = update
-                            .sessions
-                            .iter()
-                            .map(|row| {
-                                row.get("name")
-                                    .and_then(|value| value.as_str())
-                                    .filter(|name| !name.is_empty())
-                                    .unwrap_or_else(|| {
-                                        row.get("sessionId")
-                                            .and_then(|value| value.as_str())
-                                            .unwrap_or_default()
-                                    })
-                            })
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        view.push_entry(crate::chat::ChatEntry::Status {
-                            text: format!(
-                                "Prime Agent is updating — restarting the daemon (about {}s). {} will resume automatically.",
-                                update.est_seconds.max(1),
-                                if names.is_empty() { "Your session".to_string() } else { names }
-                            ),
-                            kind: crate::chat::StatusKind::Info,
-                        });
-                        self.reconnect = Some(update);
-                    }
-                    None => {
-                        self.note(&format!("the daemon is shutting down ({reason})"), view);
+                if let Some(update) = update {
+                    // Spec §10: reattach is the default end state. The banner carries the
+                    // resume contract; the interactive run's reconnect loop drives the rest.
+                    let names = update
+                        .sessions
+                        .iter()
+                        .map(|row| {
+                            row.get("name")
+                                .and_then(|value| value.as_str())
+                                .filter(|name| !name.is_empty())
+                                .unwrap_or_else(|| {
+                                    row.get("sessionId")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or_default()
+                                })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    view.push_entry(crate::chat::ChatEntry::Status {
+                        text: format!(
+                            "Prime Agent is updating — restarting the daemon (about {}s). {} will resume automatically.",
+                            update.est_seconds.max(1),
+                            if names.is_empty() { "Your session".to_string() } else { names }
+                        ),
+                        kind: crate::chat::StatusKind::Info,
+                    });
+                    self.connection_event(
+                        ConnectionEvent::UpdateNotice {
+                            est_seconds: update.est_seconds,
+                        },
+                        view,
+                    );
+                } else {
+                    self.note(&format!("the daemon is shutting down ({reason})"), view);
+                    // The announcement is what arms the shutdown recovery: a bare session stop
+                    // without it stays stopped.
+                    if reason == "shutdown" {
+                        self.connection_event(ConnectionEvent::ShutdownNotice, view);
                     }
                 }
             }
@@ -372,9 +415,19 @@ impl SessionUi {
         match update {
             TurnUpdate::TurnStarted => {
                 self.turn_active = true;
+                if !self.run_open {
+                    self.run_open = true;
+                    self.run_outcome = crate::program_status::Status::Done;
+                }
+                self.settled = None;
                 self.turn_error_shown = false;
-                // No card from a previous run settles on this one's failure.
-                self.pending_tools.clear();
+                // A new turn also settles leftovers from a lost turn-end frame.
+                crate::snapshot::settle_pending_tool_cards(
+                    view,
+                    &mut self.pending_tools,
+                    &mut self.aborted_tools,
+                    "the turn ended before this call returned",
+                );
                 self.aborted_tools.clear();
                 self.start_loader(view);
             }
@@ -416,8 +469,11 @@ impl SessionUi {
                 args,
             } => {
                 // The failed frame's sweep owns the call: the run's late tool frames land
-                // on nothing.
-                if !self.aborted_tools.contains(&tool_call_id) {
+                // on nothing. A start outside a live turn is one of those late
+                // frames — it would allocate a fresh card whose timer then
+                // reticks the settled id on this run's paints, so it lands
+                // on nothing too.
+                if !self.aborted_tools.contains(&tool_call_id) && self.turn_active {
                     crate::snapshot::apply_tool_execution_start(
                         view,
                         &tool_call_id,
@@ -428,6 +484,7 @@ impl SessionUi {
                     // pending-state reset or arrive without its own streamed frame).
                     self.pending_tools.insert(tool_call_id.clone());
                     Self::set_working_activity("Executing", false, view);
+                    self.track_live_tool_timer();
                 }
             }
             TurnUpdate::ToolExecutionUpdate {
@@ -459,19 +516,31 @@ impl SessionUi {
                     }
                 }
             }
-            TurnUpdate::TurnEnded { error } => {
-                // Only the engine's own turn_end clears the busy state: trailing frames
-                // from the previous turn must not cancel a turn admitted in between.
+            TurnUpdate::TurnEnded {
+                error,
+                run_failed,
+                aborted,
+            } => {
+                // One LLM turn ended; the run, and with it the busy state, lasts until
+                // `agent_end` (#3998). The OSC outcome tracks the run separately below.
                 self.streaming_index = None;
                 self.turn_ends_seen += 1;
-                self.turn_active = false;
-                view.working = None;
-                view.working_since = None;
+                // An aborted settle ends the run (the abort fallback frame
+                // has no agent_end); a failed step leaves the run open for
+                // its agent_end, which a pending retry follows first.
+                if aborted {
+                    self.run_open = false;
+                    self.settled = None;
+                } else if run_failed {
+                    self.run_outcome = crate::program_status::Status::Error;
+                }
                 view.retry = None;
-                // The turn settled: the held bash cards stream into the transcript.
-                Self::flush_pending_bash(view);
-                // Stragglers never leak into the next run.
-                self.pending_tools.clear();
+                crate::snapshot::settle_pending_tool_cards(
+                    view,
+                    &mut self.pending_tools,
+                    &mut self.aborted_tools,
+                    "the turn ended before this call returned",
+                );
                 self.aborted_tools.clear();
                 // A provider failure already surfaced through the failed assistant message
                 // or the retry-exhausted banner; the turn result error is only a backstop.
@@ -504,12 +573,19 @@ impl SessionUi {
                 });
             }
             TurnUpdate::AutoRetryEnd {
+                aborted,
                 success: _,
                 attempt: _,
                 final_error,
                 restored_model,
             } => {
                 view.retry = None;
+                // A cancelled retry rests idle, whether it cancels the
+                // countdown or the failed attempt before its agent_end.
+                if aborted {
+                    self.run_outcome = crate::program_status::Status::Idle;
+                    self.settled = None;
+                }
                 if final_error.is_some() {
                     self.turn_error_shown = true;
                     // The give-up's final attempt is superseded by the ONE terminal line.
@@ -554,11 +630,20 @@ impl SessionUi {
                 aborted,
                 error_message,
                 error_severity,
+                will_retry,
             } => {
                 view.compaction = None;
+                // The overflow recovery's end decides the run it held open:
+                // a re-issued turn reports for itself, a cancelled recovery
+                // rests idle, a failed or skipped one settles the outcome.
+                if let Some(outcome) = self.outcome_after_compaction.take() {
+                    if !will_retry {
+                        self.settled = (!aborted).then_some(outcome);
+                    }
+                }
                 if let Some(result) = result {
-                    // A succeeded compaction rebuilt the durable transcript: show the outcome
-                    // row immediately, then re-fetch so the compacted-away rows drop.
+                    // The display transcript keeps every row: the summary appends at the
+                    // compaction's own position.
                     view.push_entry(ChatEntry::CompactionSummary {
                         summary: result
                             .get("summary")
@@ -571,7 +656,7 @@ impl SessionUi {
                             .unwrap_or_default(),
                         custom_instructions,
                     });
-                    self.transcript_stale = true;
+                    self.compaction_settled = true;
                 } else if reason == "manual" {
                     // Aborts and error messages surface only for user-issued compactions.
                     if aborted {
@@ -594,9 +679,30 @@ impl SessionUi {
                     }
                 }
             }
-            TurnUpdate::Idle => {
-                if !self.turn_active {
-                    view.working = None;
+            TurnUpdate::Idle { aborted } => {
+                // A pending retry defers the outcome settle past the run's end
+                // and outlives it: the daemon holds the failed attempt's
+                // `agent_end` until after `auto_retry_start`, so a countdown
+                // held here is the next attempt's, never a stale one (the
+                // loop's own frames close it).
+                let retry_pending = view.retry.is_some();
+                self.end_run(view);
+                // The run's end settles its outcome. An abort between steps
+                // and tools keeps the original toolUse turn_end, so only the
+                // marker tells it apart. A failed attempt whose retry is
+                // pending rests working on the countdown instead, and one
+                // whose overflow recovery compaction runs leaves the outcome
+                // to that compaction's end.
+                if self.run_open {
+                    self.run_open = false;
+                    self.settled = None;
+                    if !aborted {
+                        if view.compaction.is_some() {
+                            self.outcome_after_compaction = Some(self.run_outcome);
+                        } else if !retry_pending {
+                            self.settled = Some(self.run_outcome);
+                        }
+                    }
                 }
             }
             TurnUpdate::GoalUpdate(goal) => {
@@ -644,6 +750,7 @@ impl SessionUi {
                 follow_ups,
                 starting,
                 rlm_child_status,
+                inbox_notice,
                 injected_prompts,
             } => {
                 view.queued = crate::queued::QueuedMessages {
@@ -651,6 +758,7 @@ impl SessionUi {
                     follow_ups,
                     starting,
                     rlm_child_status,
+                    inbox_notice,
                     injected_prompts,
                 };
                 // A queue change under an active browse reconciles the selection: the cursor
@@ -674,10 +782,33 @@ impl SessionUi {
         self.dirty = true;
     }
 
+    /// The agent run ended: the busy state clears and the held bash cards stream into the
+    /// transcript. A pending retry countdown is not run state — the daemon holds the
+    /// failed attempt's `agent_end` until after `auto_retry_start`, so it survives here
+    /// and the retry loop's own frames close it.
+    fn end_run(&mut self, view: &mut AgentView) {
+        self.turn_active = false;
+        view.working = None;
+        view.working_since = None;
+        // A run that ends without its `turn_end` (a pre-run abort, a detach) still
+        // leaves no live streaming slot behind.
+        self.streaming_index = None;
+        Self::flush_pending_bash(view);
+        // A detached run's `turn_end` never arrives: its open cards settle here.
+        crate::snapshot::settle_pending_tool_cards(
+            view,
+            &mut self.pending_tools,
+            &mut self.aborted_tools,
+            "the turn ended before this call returned",
+        );
+    }
+
     /// The abort ladder shared by the Ctrl+C and Escape interrupts: a compacting session aborts the
-    /// compaction run, a streaming turn aborts through `abort_and_send_queued`, and a running user
-    /// bash aborts alongside. The side-question abort stays at the call sites.
-    pub(super) fn interrupt_running_work(&self, view: &AgentView) {
+    /// compaction run, a streaming turn aborts through `abort_and_send_queued`, an idle session's
+    /// BARE press (one that arms no other action) stops a parked backgrounded cell through the
+    /// scoped abort, and a running user bash aborts alongside. The side-question abort stays at the
+    /// call sites.
+    pub(super) fn interrupt_running_work(&self, view: &AgentView, origin: InterruptOrigin) {
         // Abort the trace upload sweep first.
         if let Some(run) = &self.trace_upload {
             run.cancel.cancel();
@@ -690,12 +821,68 @@ impl SessionUi {
             // No transient abort hint: the aborted turn's own assistant row carries
             // the interrupt, so nothing is noted here.
             self.abort_turn();
+        } else if origin == InterruptOrigin::Bare
+            && self
+                .client
+                .supports_session_server_capability("background_cell_abort")
+        {
+            // The idle arm rides only a press that arms nothing else (an
+            // Escape with the tree shortcut already spent): the first
+            // Escape arms the clear/tree repeat and the first Ctrl+C arms
+            // the exit pair, so stopping backgrounded work must not be
+            // their side effect. The scoped abort touches nothing else —
+            // a session without a parked cell is a reported no-op, and a
+            // peer without the capability keeps the old no-op behavior.
+            self.abort_background_cell();
         }
         // A running user-bash command aborts the same way; the settled run
         // reports cancelled through its bash_end.
         if self.user_bash_running {
             self.abort_user_bash();
         }
+    }
+
+    /// The idle scoped abort (`abort` with scope `background_cell`): stop
+    /// only the session's parked backgrounded cell, never the queues, and
+    /// report whether one was stopped.
+    fn abort_background_cell(&self) {
+        let client = self.client.clone();
+        let active_session_id = self.active_session_id.clone();
+        let notes = self.notes.clone();
+        tokio::spawn(async move {
+            let command = DaemonCommand::Abort {
+                id: None,
+                active_session_id,
+                scope: Some("background_cell".to_string()),
+                rest: Map::default(),
+            };
+            match client.request(command).await {
+                Ok(response) if response.success => {
+                    let stopped = response
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("stoppedBackgroundCell"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let _ = notes.send(if stopped {
+                        "the backgrounded cell was stopped".to_string()
+                    } else {
+                        "no backgrounded cell is running".to_string()
+                    });
+                }
+                Ok(response) => {
+                    let _ = notes.send(format!(
+                        "the background-cell cancel failed: {}",
+                        response
+                            .error
+                            .unwrap_or_else(|| "unknown error".to_string())
+                    ));
+                }
+                Err(error) => {
+                    let _ = notes.send(format!("the background-cell cancel failed: {error:#}"));
+                }
+            }
+        });
     }
 
     /// Apply an assistant message frame: an open streaming message is updated in place; otherwise
@@ -825,6 +1012,13 @@ impl SessionUi {
             None
         };
         if abort_text.is_some() || stop_reason == Some("error") {
+            // Lifecycle failures can emit agent_end before any turn_end:
+            // the terminal message itself decides the run's outcome.
+            self.run_outcome = if abort_text.is_some() {
+                crate::program_status::Status::Idle
+            } else {
+                crate::program_status::Status::Error
+            };
             let settle_text = abort_text.clone().unwrap_or_else(|| {
                 message
                     .get("errorMessage")
@@ -917,10 +1111,20 @@ impl SessionUi {
         false
     }
 
+    /// Count live timer starts with the session's other interaction counters.
+    fn track_live_tool_timer(&self) {
+        let Some(telemetry) = self.telemetry.clone() else {
+            return;
+        };
+        tokio::spawn(async move {
+            telemetry.live_tool_timer_started().await;
+        });
+    }
+
     /// `tui ipython bash rendered`: the settled ipython card that renders
     /// as bash reports its bash share, primitives only.
     fn track_ipython_bash_rendered(&self, card: &crate::tool_card::ToolCallCard) {
-        if card.name != "ipython" {
+        if !pa_types::ai::is_python_tool_name(&card.name) {
             return;
         }
         let Some(stats) = crate::tool_card::ipython::bash_dominated_stats(card) else {

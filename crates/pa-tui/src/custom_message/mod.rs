@@ -29,8 +29,15 @@
 //! dispatch classes them as injected-prompt rows (turn prompts). The
 //! notices still drive their turn (the daemon's `followUp` notice action is
 //! unchanged); only the transcript row's class moves.
+//!
+//! The inbox notice rows (`inbox_notice`: the daemon agent-inbox arrival
+//! and reminder notices) render in their own class — daemon-attributed
+//! mail, never user input. Collapsed, a run of consecutive notices paints
+//! one dim counter line (`inbox_counter`); expanded, each notice paints the
+//! envelope summary line over its notice text.
 
 pub(crate) mod geometry;
+pub(crate) mod inbox_counter;
 pub(crate) use geometry::agent_message_body_count;
 pub(crate) mod injected_prompt;
 pub(crate) mod refinement;
@@ -44,6 +51,7 @@ pub use injected_prompt::{InjectedPromptKind, InjectedPromptRow};
 
 use crate::chat::{ChatEntry, StatusKind};
 use crate::theme::ThemeColor;
+use pa_types::inbox_notice::INBOX_NOTICE_CUSTOM_TYPE;
 use serde_json::Value;
 
 /// Custom types with a dedicated component (pa-core owns the engine-side
@@ -62,6 +70,12 @@ pub const REFINEMENT_OUTCOME_CUSTOM_TYPE: &str = "refinement_outcome";
 /// operator ruling 2026-09-23: one terminal row per episode instead of TS's per-attempt error
 /// rows). Wire twin of `pa_core::session_engine::messages::PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE`.
 pub const PROVIDER_RETRY_OUTCOME_CUSTOM_TYPE: &str = "provider_retry_outcome";
+/// Wire twin of `pa_core::prompts::model_prompts::MODEL_PROMPT_ERROR_CUSTOM_TYPE`.
+pub const MODEL_PROMPT_ERROR_CUSTOM_TYPE: &str = "model_prompt_error";
+/// Wire twin of `pa_core::session_engine::skill_problems_notice::SKILL_PROBLEMS_CUSTOM_TYPE`.
+pub const SKILL_PROBLEMS_CUSTOM_TYPE: &str = "skill_problems";
+/// Wire twin of `pa_core::session_engine::model_resolution_notice::MODEL_RESOLUTION_WARNING_CUSTOM_TYPE`.
+pub const MODEL_RESOLUTION_WARNING_CUSTOM_TYPE: &str = "model_resolution_warning";
 
 /// Which agent-message side a row renders: the received transcript rows, or the
 /// sent/queued ipython cell receipts. The direction word folds into the
@@ -95,6 +109,21 @@ pub struct AgentMessageRow {
     /// `details.message` (the body shown expanded; never a collapsed
     /// preview).
     pub message: String,
+}
+
+/// One inbox-notice row: the daemon's inbox system announcing waiting
+/// machine messages. Collapsed, a run of consecutive notices paints one dim
+/// counter line; expanded, each notice paints the summary line (the inbox
+/// system and how many messages are new or unread) over the notice text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InboxNoticeRow {
+    /// `details.class`: `arrival` or `reminder`.
+    pub class: String,
+    /// `details.count`: the number the notice announces; absent on rows
+    /// journaled before the field existed.
+    pub count: Option<u64>,
+    /// The notice text (the row's content; the model-visible prompt).
+    pub text: String,
 }
 
 /// One background-shell completion row, standalone form (the TS live path attaches
@@ -156,8 +185,9 @@ pub struct CustomPanelRow {
 /// The transcript entries for one `custom`-role message, mirroring the TS
 /// dispatch order: slash rows, compaction and refinement outcomes, agent
 /// messages (the received agent-message rows and the RLM child status
-/// notices, the same class), shell completions, injected prompts, then the
-/// generic panel. Non-display rows render nothing.
+/// notices, the same class), the inbox notices (Rust-only, their own row
+/// class), shell completions, injected prompts, then the generic panel.
+/// Non-display rows render nothing.
 pub fn custom_message_entries(message: &Value) -> Vec<ChatEntry> {
     use pa_types::slash_commands::{
         SESSION_SLASH_COMMAND_CUSTOM_TYPE, SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
@@ -192,8 +222,18 @@ pub fn custom_message_entries(message: &Value) -> Vec<ChatEntry> {
                 },
             }]
         }
+        MODEL_PROMPT_ERROR_CUSTOM_TYPE
+        | SKILL_PROBLEMS_CUSTOM_TYPE
+        | MODEL_RESOLUTION_WARNING_CUSTOM_TYPE => vec![ChatEntry::Status {
+            text: content,
+            kind: crate::chat::StatusKind::Warning,
+        }],
         REFINEMENT_OUTCOME_CUSTOM_TYPE => refinement::refinement_outcome_entries(message, details),
         AGENT_MESSAGE_CUSTOM_TYPE => agent_message_entry(details).map_or_else(
+            || vec![generic_panel_entry(custom_type, message)],
+            |entry| vec![entry],
+        ),
+        INBOX_NOTICE_CUSTOM_TYPE => inbox_notice_entry(message, details).map_or_else(
             || vec![generic_panel_entry(custom_type, message)],
             |entry| vec![entry],
         ),
@@ -341,6 +381,18 @@ fn agent_message_entry(details: &Value) -> Option<ChatEntry> {
         direction: AgentMessageDirection::Received,
         counterpart,
         message: message.to_string(),
+    })))
+}
+
+/// The inbox notice decodes with its class and count: a row missing the
+/// class string falls through to the generic box (the file's dispatch
+/// rule for malformed details).
+fn inbox_notice_entry(message: &Value, details: &Value) -> Option<ChatEntry> {
+    let class = details.get("class").and_then(Value::as_str)?;
+    Some(ChatEntry::InboxNotice(Box::new(InboxNoticeRow {
+        class: class.to_string(),
+        count: details.get("count").and_then(Value::as_u64),
+        text: custom_content_text(message),
     })))
 }
 
@@ -757,6 +809,82 @@ mod tests {
         assert!(matches!(entries.as_slice(), [ChatEntry::AgentMessage(_)]));
     }
 
+    /// The inbox notices decode to their own class: the class and count
+    /// ride the row, the notice text is the body (the class assertion is
+    /// the mutation pin — routing the type back through the user or
+    /// injected-prompt arms fails it). A row journaled before `count`
+    /// existed decodes without it.
+    #[test]
+    fn inbox_notice_rows_decode_with_class_count_and_body() {
+        let arrival = "[inbox 19:14 UTC] 1 new message (bash-done); total waiting: 1. Read them with rlm.inbox.read().";
+        let reminder = "[inbox reminder] 2 messages still waiting (oldest waited 5m) \u{2014} rlm.inbox.read()";
+        for (class, text, count) in [
+            ("arrival", arrival, Some(1)),
+            ("reminder", reminder, Some(2)),
+            ("reminder", reminder, None),
+        ] {
+            let mut details = json!({ "sender": "Agent inbox", "class": class });
+            if let Some(count) = count {
+                details["count"] = json!(count);
+            }
+            let entries = decoded(&json!({
+                "role": "custom",
+                "customType": INBOX_NOTICE_CUSTOM_TYPE,
+                "content": text,
+                "display": true,
+                "details": details,
+                "timestamp": 1_730_000_000_000u64,
+            }));
+            assert_eq!(
+                entries,
+                vec![ChatEntry::InboxNotice(Box::new(InboxNoticeRow {
+                    class: class.to_string(),
+                    count,
+                    text: text.to_string(),
+                }))],
+                "{class} notice row"
+            );
+        }
+    }
+
+    /// A display:false inbox notice renders nothing (the shared early
+    /// return).
+    #[test]
+    fn inbox_notice_display_false_renders_nothing() {
+        let entries = decoded(&json!({
+            "role": "custom",
+            "customType": INBOX_NOTICE_CUSTOM_TYPE,
+            "content": "[inbox 19:14 UTC] 1 new message (bash-done)",
+            "display": false,
+            "details": { "sender": "Agent inbox", "class": "arrival" },
+        }));
+        assert!(entries.is_empty(), "{entries:?}");
+    }
+
+    /// Malformed details (a missing or non-string class) fall through to
+    /// the generic box, the file's dispatch rule.
+    #[test]
+    fn inbox_notice_malformed_details_fall_to_the_generic_panel() {
+        for details in [
+            json!({ "sender": "Agent inbox" }),
+            json!({ "sender": "Agent inbox", "class": null }),
+        ] {
+            let entries = decoded(&json!({
+                "role": "custom",
+                "customType": INBOX_NOTICE_CUSTOM_TYPE,
+                "content": "[inbox 19:14 UTC] 1 new message",
+                "display": true,
+                "details": details,
+            }));
+            assert!(
+                matches!(entries.as_slice(), [ChatEntry::CustomPanel(row)]
+                    if row.custom_type == INBOX_NOTICE_CUSTOM_TYPE
+                        && row.content == "[inbox 19:14 UTC] 1 new message"),
+                "{details} must fall to the generic box: {entries:?}"
+            );
+        }
+    }
+
     #[test]
     fn compaction_outcome_maps_to_status_rows() {
         let skipped = decoded(&json!({
@@ -870,6 +998,11 @@ mod tests {
             custom_type: "notice".to_string(),
             content: body.clone(),
         };
+        let inbox = InboxNoticeRow {
+            class: "arrival".to_string(),
+            count: Some(1),
+            text: body.clone(),
+        };
         let compacted = format!(" {body}");
         // (collapsed rows + their expected text, expanded rows, expanded
         // header text)
@@ -908,6 +1041,11 @@ mod tests {
                 None,
                 render::render_custom_panel(&panel, &theme, 60),
                 vec!["", " [notice]"],
+            ),
+            (
+                None,
+                render::render_inbox_notice(&inbox, &theme, 60, true),
+                vec!["", " \u{2709} Agent inbox \u{b7} 1 new message"],
             ),
             (
                 Some((

@@ -10,8 +10,9 @@
 
 //! Verifier integration tests for kernel process teardown on drop: a session or harness that boots
 //! a kernel and then drops its handles must not leave the `python -m rlm.repl` process alive. The
-//! kernel Python is ambient product state; skipped when absent.
-#![cfg(unix)]
+//! kernel Python is ambient product state; skipped when absent. The process-table scans read
+//! `/proc`, so the binary is Linux-only.
+#![cfg(target_os = "linux")]
 
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -158,8 +159,12 @@ fn test_options() -> Option<pa_core::kernel::shared::KernelManagerOptions> {
         host_handlers: pa_core::kernel::shared::HostRequestHandlers::default(),
         python_skills: Vec::new(),
         on_background_work_settled: None,
+        pending_detached_completions: None,
         snapshot: None,
-        bootstrap_code: Some(pa_core::kernel::bootstrap::build_rlm_bootstrap_code(&[])),
+        bootstrap_code: Some(pa_core::kernel::bootstrap::build_rlm_bootstrap_code(
+            &[],
+            false,
+        )),
         stderr_log_path: None,
     })
 }
@@ -237,6 +242,8 @@ async fn session_engine_drop_kills_the_prewarmed_kernel_process() {
 
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
+            cell_wake: None,
+            on_background_cell: None,
             cron_store: None,
             steering_mode: None,
             follow_up_mode: None,
@@ -313,6 +320,8 @@ async fn engine_dispose_kernel_kills_the_prewarmed_kernel_process() {
 
     let engine = pa_core::session_engine::engine::create_session(
         pa_core::session_engine::engine::SessionEngineConfig {
+            cell_wake: None,
+            on_background_cell: None,
             cron_store: None,
             steering_mode: None,
             follow_up_mode: None,

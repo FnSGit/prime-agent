@@ -1,8 +1,9 @@
 //! The queued-message strip above the prompt dock (see [`render_queue`]). Sanctioned divergence
-//! (operator request Kevin 2026-09-24; directives 2026-09-25, 2026-09-28): internal prompts
-//! condense into one counted row by origin instead of preview rows; child status notices and
+//! (operator request Kevin 2026-09-24; directive 2026-09-25): internal prompts condense into one
+//! counted row by origin instead of preview rows; child status notices, inbox notices, and
 //! engine-minted continuations classify by wire-typed provenance only (user-typed look-alikes stay
-//! human rows); browse walks every item; edits are human-origin only.
+//! human rows). The browse walks the user-typed items only (operator decision 2026-10-16):
+//! internal prompts are a separate channel, shown only as the condensed row.
 
 use crate::theme::{Theme, ThemeColor};
 use crate::width::{pad_line, truncate_line};
@@ -22,6 +23,9 @@ enum InternalPromptOrigin {
     Heartbeat,
     /// A parked RLM child status notice, classified by wire-typed provenance only.
     ChildStatus,
+    /// A parked daemon inbox notice (the arrival/reminder rows), classified
+    /// by wire-typed provenance only.
+    InboxNotice,
     Other,
 }
 
@@ -52,13 +56,14 @@ struct CondensedCounts {
     agent_messages: usize,
     heartbeats: usize,
     child_status: usize,
+    inbox_notices: usize,
     other: usize,
 }
 
 impl CondensedCounts {
     /// Every counted origin's total (zero means no condensed row).
     fn total(&self) -> usize {
-        self.agent_messages + self.heartbeats + self.child_status + self.other
+        self.agent_messages + self.heartbeats + self.child_status + self.inbox_notices + self.other
     }
 
     /// The counted row's text: each origin with queued prompts and its count, plural-correct, in
@@ -68,6 +73,7 @@ impl CondensedCounts {
             (self.agent_messages, InternalPromptOrigin::AgentMessage),
             (self.heartbeats, InternalPromptOrigin::Heartbeat),
             (self.child_status, InternalPromptOrigin::ChildStatus),
+            (self.inbox_notices, InternalPromptOrigin::InboxNotice),
             (self.other, InternalPromptOrigin::Other),
         ]
         .into_iter()
@@ -77,6 +83,7 @@ impl CondensedCounts {
                 InternalPromptOrigin::AgentMessage => "agent message",
                 InternalPromptOrigin::Heartbeat => "heartbeat",
                 InternalPromptOrigin::ChildStatus => "child status notice",
+                InternalPromptOrigin::InboxNotice => "inbox notice",
                 InternalPromptOrigin::Other => "other internal prompt",
             };
             let plural = if count == 1 { "" } else { "s" };
@@ -104,6 +111,7 @@ fn condensed_counts(queue: &QueuedMessages) -> Option<CondensedCounts> {
                 InternalPromptOrigin::AgentMessage => counts.agent_messages += 1,
                 InternalPromptOrigin::Heartbeat => counts.heartbeats += 1,
                 InternalPromptOrigin::ChildStatus => counts.child_status += 1,
+                InternalPromptOrigin::InboxNotice => counts.inbox_notices += 1,
                 InternalPromptOrigin::Other => counts.other += 1,
             }
         }
@@ -138,6 +146,9 @@ fn queued_item_origin(
     if queue.rlm_child_status.is_marked(lane, index) {
         return Some(InternalPromptOrigin::ChildStatus);
     }
+    if queue.inbox_notice.is_marked(lane, index) {
+        return Some(InternalPromptOrigin::InboxNotice);
+    }
     if let Some(origin) = internal_prompt_origin(message) {
         return Some(origin);
     }
@@ -170,10 +181,14 @@ pub struct QueuedMessages {
     /// "Starting" row until the turn's rows land; not browsable.
     pub starting: Option<String>,
     /// Which parked items are RLM child status notices, by lane index (wire-typed
-    /// provenance): folded into the condensed count, still browseable.
+    /// provenance): folded into the condensed count.
     pub rlm_child_status: QueueLaneIndices,
+    /// Which parked items are daemon inbox notices (the arrival/reminder rows),
+    /// by lane index (the third wire-typed provenance rider); folded into the
+    /// condensed count, never a browsable user row.
+    pub inbox_notice: QueueLaneIndices,
     /// Which parked items are engine-minted internal prompts, by lane index (the second wire-typed
-    /// provenance rider); folded into the condensed count, read-only.
+    /// provenance rider); folded into the condensed count.
     pub injected_prompts: QueueLaneIndices,
 }
 
@@ -184,7 +199,8 @@ impl QueuedMessages {
     }
 }
 
-/// The lane-indices rider shape the typed-provenance marks share (`sessionActions.rlmChildStatus` /
+/// The lane-indices rider shape the typed-provenance marks share
+/// (`sessionActions.rlmChildStatus` / `sessionActions.inboxNotice` /
 /// `sessionActions.injectedPrompts`); the strip never classifies by preview text.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueueLaneIndices {
@@ -230,19 +246,20 @@ impl QueueLane {
     }
 }
 
-/// One addressable queue item (TS `QueueSelectionItem`). `internal` marks an internal prompt, which
-/// the browse walks READ-ONLY; `false` is the human row the edit affordances apply to.
+/// One addressable user-typed queue item (TS `QueueSelectionItem`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueSelectionItem {
     pub lane: QueueLane,
+    /// The real lane index the mutations address.
     pub index: usize,
+    /// The 0-based position among the lane's user-typed items (the strip's visible rows).
+    pub position: usize,
     pub text: String,
-    pub internal: bool,
 }
 
 /// The strip rows: the "Starting" row of a preparing turn above a truncated dim preview per
 /// human-typed queued message, the condensed internal-prompt row, and the queue hint. Empty input
-/// renders no rows; a preparing turn alone renders its row but never the hint.
+/// renders no rows; the hint renders only when a human-typed message is parked.
 #[must_use]
 pub fn render_queue(
     theme: &Theme,
@@ -258,21 +275,20 @@ pub fn render_queue(
         rows.push(preview_row(theme, STARTING_LABEL, starting, width));
     }
     // The human-typed previews render individually, so what the user parked stays explicit above
-    // the condensed row; child status notices classify by typed provenance here.
-    for (lane, index, message) in queued_items(queue) {
-        if queued_item_origin(message, queue, lane, index).is_none() {
-            let label = match lane {
-                QueueLane::Steering => STEERING_LABEL,
-                QueueLane::FollowUp => FOLLOW_UP_LABEL,
-            };
-            rows.push(preview_row(theme, label, message, width));
-        }
+    // the condensed row.
+    let user_items = flatten(queue);
+    for item in &user_items {
+        let label = match item.lane {
+            QueueLane::Steering => STEERING_LABEL,
+            QueueLane::FollowUp => FOLLOW_UP_LABEL,
+        };
+        rows.push(preview_row(theme, label, &item.text, width));
     }
     if let Some(counts) = condensed_counts(queue) {
         rows.push(condensed_row(theme, &counts, width));
     }
-    if queue.is_empty() {
-        // A starting row alone carries no parked messages to browse.
+    if user_items.is_empty() {
+        // A starting row or internal prompts alone carry no user-typed messages to browse.
         return rows;
     }
     let hint = format!("\u{2570}\u{2500} {browse_key} to browse and edit queued messages");
@@ -287,23 +303,14 @@ pub fn render_queue(
     rows
 }
 
-/// The browse header text: the lane, its 1-based index, and the effective keys for the affordances;
-/// an internal prompt renders the read-only phrasing instead.
+/// The browse header text: the lane, the item's 1-based position among the lane's user-typed rows,
+/// and the effective keys for the affordances.
 #[must_use]
 pub fn browse_header_text(selected: &QueueSelectionItem, key_display: &QueueBrowseKeys) -> String {
-    if selected.internal {
-        return format!(
-            "{} {} \u{00b7} {}/{} browse \u{00b7} read-only internal prompt",
-            selected.lane.display_name(),
-            selected.index + 1,
-            key_display.navigate_older,
-            key_display.navigate_newer,
-        );
-    }
     format!(
         "{} {} \u{00b7} {}/{} browse \u{00b7} {}/{} reorder \u{00b7} enter steers \u{00b7} {} queues \u{00b7} empty deletes",
         selected.lane.display_name(),
-        selected.index + 1,
+        selected.position + 1,
         key_display.navigate_older,
         key_display.navigate_newer,
         key_display.move_earlier,
@@ -429,8 +436,25 @@ impl QueueSelection {
         }
     }
 
+    /// The real lane index of the user item next to the selection in its lane, one step earlier
+    /// (`direction < 0`) or later; `None` when the selection has no user neighbor there.
+    #[must_use]
+    pub fn reorder_target(&self, direction: i64) -> Option<usize> {
+        let cursor = self.cursor?;
+        let lane = self.items[cursor].lane;
+        let neighbor = if direction < 0 {
+            cursor.checked_sub(1)?
+        } else {
+            cursor + 1
+        };
+        self.items
+            .get(neighbor)
+            .filter(|item| item.lane == lane)
+            .map(|item| item.index)
+    }
+
     /// Re-point the selection after a mutation or queue update: the selection
-    /// survives only when the addressed item is unchanged (TS `refreshAt`).
+    /// survives only when the addressed user-typed item is unchanged (TS `refreshAt`).
     pub fn refresh_at(
         &mut self,
         queue: &QueuedMessages,
@@ -439,14 +463,11 @@ impl QueueSelection {
         expected_text: &str,
     ) -> Option<String> {
         self.items = flatten(queue);
-        let cursor = match lane {
-            QueueLane::Steering => Some(index),
-            QueueLane::FollowUp => queue.steering.len().checked_add(index),
-        };
-        let selected = cursor.and_then(|cursor| self.items.get(cursor));
-        if selected.is_some_and(|item| {
-            item.lane == lane && item.index == index && item.text == expected_text
-        }) {
+        let cursor = self
+            .items
+            .iter()
+            .position(|item| item.lane == lane && item.index == index);
+        if cursor.is_some_and(|cursor| self.items[cursor].text == expected_text) {
             self.cursor = cursor;
             None
         } else {
@@ -464,11 +485,7 @@ impl QueueSelection {
 
 /// Mirror one applied lane move locally: swap the item with its neighbor so the strip and the
 /// selection update without waiting for the `session_action_update` event.
-pub fn mirror_lane_move(queue: &mut QueuedMessages, lane: QueueLane, index: usize, target: i64) {
-    if target < 0 {
-        return;
-    }
-    let target = target as usize;
+pub fn mirror_lane_move(queue: &mut QueuedMessages, lane: QueueLane, index: usize, target: usize) {
     let lane_items = match lane {
         QueueLane::Steering => &mut queue.steering,
         QueueLane::FollowUp => &mut queue.follow_ups,
@@ -477,17 +494,19 @@ pub fn mirror_lane_move(queue: &mut QueuedMessages, lane: QueueLane, index: usiz
         lane_items.swap(index, target);
         // The typed provenance mirrors the same swap (a marked index rides its item through the
         // move), so the classification stays correct until the daemon's action update lands.
-        let (lane_child, lane_injected) = match lane {
+        let (lane_child, lane_inbox, lane_injected) = match lane {
             QueueLane::Steering => (
                 &mut queue.rlm_child_status.steering,
+                &mut queue.inbox_notice.steering,
                 &mut queue.injected_prompts.steering,
             ),
             QueueLane::FollowUp => (
                 &mut queue.rlm_child_status.follow_up,
+                &mut queue.inbox_notice.follow_up,
                 &mut queue.injected_prompts.follow_up,
             ),
         };
-        for indices in [lane_child, lane_injected] {
+        for indices in [lane_child, lane_inbox, lane_injected] {
             for marked in indices.iter_mut() {
                 if *marked == index {
                     *marked = target;
@@ -499,22 +518,19 @@ pub fn mirror_lane_move(queue: &mut QueuedMessages, lane: QueueLane, index: usiz
     }
 }
 
+/// The browsable items: the user-typed queue items, lane-by-lane, oldest-first.
 fn flatten(queue: &QueuedMessages) -> Vec<QueueSelectionItem> {
-    let item = |lane: QueueLane, index: usize, text: &str| QueueSelectionItem {
-        lane,
-        index,
-        text: text.to_string(),
-        internal: queued_item_origin(text, queue, lane, index).is_some(),
-    };
-    let steering = queue
-        .steering
-        .iter()
-        .enumerate()
-        .map(|(index, text)| item(QueueLane::Steering, index, text));
-    let follow_up = queue
-        .follow_ups
-        .iter()
-        .enumerate()
-        .map(|(index, text)| item(QueueLane::FollowUp, index, text));
-    steering.chain(follow_up).collect()
+    let mut items: Vec<QueueSelectionItem> = Vec::new();
+    for (lane, index, text) in queued_items(queue) {
+        if queued_item_origin(text, queue, lane, index).is_none() {
+            let position = items.iter().filter(|item| item.lane == lane).count();
+            items.push(QueueSelectionItem {
+                lane,
+                index,
+                position,
+                text: text.to_string(),
+            });
+        }
+    }
+    items
 }

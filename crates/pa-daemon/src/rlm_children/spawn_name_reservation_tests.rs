@@ -1,5 +1,6 @@
 use super::*;
 use crate::protocol::{response_failure, response_success};
+use pa_core::session_engine::rlm_host::RlmSpawnKind;
 use pa_types::platform::transport::bind_transport;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -144,6 +145,7 @@ async fn sessions_with_gated_supervisor(
             std::env::temp_dir(),
             /*telemetry_disabled*/ true,
         )),
+        String::new(),
     );
     sessions.set_identity(ParentIdentity {
         model: Some("mock/mock-1".to_string()),
@@ -159,8 +161,10 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
         name: Some(name.to_string()),
         model: None,
         thinking: None,
-        cell_source_code: None,
+        cwd: None,
+        kind: RlmSpawnKind::Subagent,
         spawned_by_request_id: None,
+        factory: None,
     }
 }
 

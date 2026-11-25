@@ -103,7 +103,7 @@ fn create_config_flags_reach_the_engine_model_resolution() {
     // The registry resolves the models.json apiKey (the provider name has
     // no env-key mapping), so the engine can authenticate without env.
     assert_eq!(
-        engine.resolve_request_api_key(&model).as_deref(),
+        engine.resolve_request_auth(&model).api_key.as_deref(),
         Some("sk-battery")
     );
 }
@@ -380,12 +380,22 @@ fn the_startup_chain_refuses_models_outside_the_allowlist() {
 /// The create-config key override pins the KEY, never the headers: a
 /// request target with an explicit key still ships the registry's
 /// merged headers (Macroscope PR #2755: `switch_model` dropped the
-/// stored provider headers whenever an override was configured).
+/// stored provider headers whenever an override was configured). The
+/// stored login's team is not one of them: it rides only with the
+/// stored key.
 #[tokio::test]
-async fn an_api_key_override_keeps_the_merged_team_headers() {
+async fn an_api_key_override_keeps_the_merged_headers_but_not_the_stored_team() {
     let dir = tempfile::TempDir::new().unwrap();
     let agent_dir = dir.path().join("agent");
     write_prime_auth(&agent_dir);
+    std::fs::write(
+        agent_dir.join("models.json"),
+        serde_json::json!({
+            "providers": { "prime-inference": { "headers": { "X-Probe": "merged" } } }
+        })
+        .to_string(),
+    )
+    .unwrap();
     let engine = restore_test_engine(dir.path(), Some("prime-inference"), None);
     engine.configure_model(EngineModelSelection {
         provider: None,
@@ -395,13 +405,16 @@ async fn an_api_key_override_keeps_the_merged_team_headers() {
     });
     let model = engine.resolve_registry_model().expect("resolved model");
     assert_eq!(model.provider, "prime-inference");
-    let (api_key, headers) = engine.resolve_request_key_and_headers(&model);
-    assert_eq!(api_key.as_deref(), Some("explicit-override"));
-    let headers = headers.expect("the override keeps the merged headers");
+    let resolved = engine.resolve_request_auth(&model);
+    assert_eq!(resolved.api_key.as_deref(), Some("explicit-override"));
+    let headers = resolved
+        .headers
+        .expect("the override keeps the merged headers");
+    assert_eq!(headers.get("X-Probe").map(String::as_str), Some("merged"));
     assert_eq!(
-        headers.get("X-Prime-Team-ID").map(String::as_str),
-        Some("team-1"),
-        "an explicit key override never orphans the stored team"
+        headers.get("X-Prime-Team-ID"),
+        None,
+        "the stored team rides only with the stored key"
     );
 }
 
@@ -417,9 +430,9 @@ async fn request_auth_carries_the_stored_team_header() {
     let engine = restore_test_engine(dir.path(), Some("prime-inference"), None);
     let model = engine.resolve_registry_model().expect("resolved model");
     assert_eq!(model.provider, "prime-inference");
-    let (api_key, headers) = engine.resolve_request_key_and_headers(&model);
-    assert_eq!(api_key.as_deref(), Some("test-key"));
-    let headers = headers.expect("merged request headers");
+    let resolved = engine.resolve_request_auth(&model);
+    assert_eq!(resolved.api_key.as_deref(), Some("test-key"));
+    let headers = resolved.headers.expect("merged request headers");
     assert_eq!(
         headers.get("X-Prime-Team-ID").map(String::as_str),
         Some("team-1"),
@@ -949,7 +962,7 @@ fn configure_model_merges_only_present_fields() {
     let model = engine.resolve_registry_model().expect("resolved model");
     assert_eq!(model.provider, "battery");
     assert_eq!(
-        engine.resolve_request_api_key(&model).as_deref(),
+        engine.resolve_request_auth(&model).api_key.as_deref(),
         Some("flag-key")
     );
 }
@@ -1216,4 +1229,252 @@ fn a_model_switch_keeps_the_agent_slot_in_sync_with_the_reported_level() {
         "high",
         "the agent slot re-syncs to the restored level"
     );
+}
+
+async fn private_default_create_worker(
+    dir: &std::path::Path,
+    responses: Vec<Vec<u8>>,
+) -> std::sync::Arc<crate::worker::Worker> {
+    let agent_dir = dir.join("agent");
+    write_prime_auth(&agent_dir);
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({
+            "defaultProvider": "prime-inference",
+            "defaultModel": "internal/glm-5.3-fast",
+            "enabledModels": [
+                "prime-inference/z-ai/glm-5.3",
+                "prime-inference/internal/glm-5.3-fast",
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let server = MockCatalogServer::start(responses).await;
+    install_loopback_catalog(&agent_dir, &server);
+    std::sync::Arc::new(crate::worker::Worker::new(
+        crate::worker::WorkerConfig {
+            socket_path: dir.join("worker.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "model-race".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "race-create".to_string(),
+            agent_dir,
+            recovery_journal_path: dir.join("recovery.jsonl"),
+            script: None,
+            telemetry_disabled: Some(true),
+        },
+        None,
+    ))
+}
+
+async fn create_state(worker: &crate::worker::Worker, dir: &std::path::Path) -> Value {
+    let created = worker
+        .dispatch(
+            "create",
+            &json!({ "sessionPath": dir.join("race-session.jsonl"), "cwd": dir }),
+        )
+        .await;
+    assert!(created.success, "create failed: {created:?}");
+    let state = worker
+        .dispatch(
+            "get_connection_state",
+            &json!({ "activeSessionId": "race-create" }),
+        )
+        .await;
+    state.data.expect("state data")
+}
+
+#[tokio::test]
+async fn a_fresh_scoped_create_waits_for_the_private_default() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let pi = pi_payload();
+    let layer_a = json!({ "schemaVersion": 1, "models": [] }).to_string();
+    let worker = private_default_create_worker(
+        dir.path(),
+        vec![
+            catalog_ok_json(&layer_a),
+            catalog_ok_json(&pi),
+            catalog_ok_json(&pi),
+        ],
+    )
+    .await;
+    let data = create_state(&worker, dir.path()).await;
+    assert_eq!(
+        data["model"]["provider"], "prime-inference",
+        "the session runs on the provider default: {data}"
+    );
+    assert_eq!(
+        data["model"]["id"], "internal/glm-5.3-fast",
+        "the private default the patterns scope in wins the startup pick: {data}"
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_scoped_create_falls_back_with_a_recorded_message() {
+    for no_session in [false, true] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let worker = private_default_create_worker(dir.path(), Vec::new()).await;
+        let mut payload = json!({ "cwd": dir.path() });
+        if no_session {
+            payload["noSession"] = json!(true);
+        } else {
+            payload["sessionPath"] = json!(dir.path().join("race-session.jsonl"));
+        }
+        let created = worker.dispatch("create", &payload).await;
+        assert!(created.success, "create failed: {created:?}");
+        let summary = created.data.expect("create summary");
+        let state = worker
+            .dispatch(
+                "get_connection_state",
+                &json!({ "activeSessionId": "race-create" }),
+            )
+            .await;
+        let data = state.data.expect("state data");
+        assert_eq!(
+            data["model"]["id"], "z-ai/glm-5.3",
+            "the fallback is the first scoped model: {data}"
+        );
+        assert_eq!(
+            summary["modelFallbackMessage"],
+            "Default model prime-inference/internal/glm-5.3-fast is not available. Using prime-inference/z-ai/glm-5.3",
+            "the fallback is on the record (noSession={no_session}): {summary}"
+        );
+        let attached = worker
+            .dispatch("attach", &json!({ "activeSessionId": "race-create" }))
+            .await;
+        assert!(attached.success, "attach failed: {attached:?}");
+        let snapshot = attached.data.expect("attach data");
+        assert_eq!(
+            snapshot["snapshot"]["summary"]["modelFallbackMessage"],
+            summary["modelFallbackMessage"],
+            "the attach summary delivers the warning to the TUI"
+        );
+        if no_session {
+            let path = dir.path().join("authorized-session.jsonl");
+            let mut target =
+                crate::session_store::SessionFile::create(dir.path().to_str().unwrap(), None, 0);
+            target.set_path(path.clone());
+            target.append_model_change("prime-inference", "z-ai/glm-5.3");
+            target.rewrite().unwrap();
+            let switched = worker
+                .dispatch(
+                    "switch_session",
+                    &json!({ "activeSessionId": "race-create", "sessionPath": path }),
+                )
+                .await;
+            assert!(switched.success, "switch failed: {switched:?}");
+            let attached = worker
+                .dispatch("attach", &json!({ "activeSessionId": "race-create" }))
+                .await;
+            assert!(attached.success, "attach failed: {attached:?}");
+            let snapshot = attached.data.expect("replacement attach data");
+            assert!(
+                snapshot["snapshot"]["summary"]["modelFallbackMessage"].is_null(),
+                "navigation must not replay the old in-memory warning: {snapshot}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_explicit_scope_with_no_matches_does_not_warn_about_an_excluded_default() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let agent_dir = dir.path().join("agent");
+    write_custom_provider_models_json(&agent_dir, "http://127.0.0.1:9");
+    std::fs::write(
+        agent_dir.join("settings.json"),
+        json!({"defaultProvider": "anthropic", "defaultModel": "excluded-default"}).to_string(),
+    )
+    .unwrap();
+    let engine = restore_test_engine(dir.path(), None, None);
+    *engine.startup_scope.lock().unwrap() = Some(StartupScope {
+        scoped_models: Vec::new(),
+        patterns: vec!["battery/no-such-model".to_string()],
+        is_continuing: false,
+    });
+    let resolved = engine.resolve_registry_model().expect("available fallback");
+    assert_eq!(
+        (resolved.provider.as_str(), resolved.id.as_str()),
+        ("battery", "mock-1")
+    );
+    assert!(
+        engine.model_fallback_message().is_none(),
+        "explicitly excluded defaults do not imply an unavailable-model fallback"
+    );
+}
+
+/// A flagged selection the catalog misses runs on a custom id: its warning
+/// shows as one display-only row across turns; an exact selection shows none.
+#[test]
+fn an_inexact_model_selection_shows_one_warning_row_across_turns() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registration =
+        pa_ai::faux::register_faux_provider(pa_ai::faux::RegisterFauxProviderOptions {
+            api: Some("faux".to_string()),
+            ..Default::default()
+        });
+    registration.set_repeat_last_response(true);
+    registration.set_responses(vec![pa_ai::faux::FauxResponseStep::Message(
+        pa_ai::faux::faux_assistant_text_message(
+            "ok",
+            pa_ai::faux::FauxAssistantMessageOptions::default(),
+        ),
+    )]);
+    for (model_id, expected_rows) in [("claude-opus-4-7", 0), ("no-such-model", 1)] {
+        let dir = tempfile::TempDir::new().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        // The provider's default model is the template an unknown id rebuilds on.
+        std::fs::write(
+            agent_dir.join("models.json"),
+            json!({
+                "providers": {
+                    "anthropic": {
+                        "api": "faux", "baseUrl": "http://localhost:0", "apiKey": "sk-faux",
+                        "models": [{
+                            "id": "claude-opus-4-7", "name": "Opus",
+                            "contextWindow": 128_000, "maxTokens": 16384,
+                        }],
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let engine = Arc::new(
+            AgentSessionEngine::new(AgentEngineConfig {
+                cwd: dir.path().to_path_buf(),
+                agent_dir,
+                provider: Some("anthropic".to_string()),
+                model: Some(model_id.to_string()),
+                api_key: Some("sk-faux".to_string()),
+                thinking: None,
+                session_dir: None,
+                session_file: None,
+                faux_script: None,
+                supervisor_link: None,
+                telemetry_disabled: Some(true),
+                cron_store: None,
+                queued_steering_probe: None,
+            })
+            .unwrap(),
+        );
+        engine.register_arc();
+        let mut events = Vec::new();
+        admit(&engine, "one".to_string(), &mut events);
+        admit(&engine, "two".to_string(), &mut events);
+        assert_eq!(assistant_texts(&events), vec!["ok", "ok"], "{model_id}");
+        let rows = events
+            .iter()
+            .filter(|event| {
+                matches!(event, EngineEvent::CustomMessage(row) if row["customType"]
+                    == pa_core::session_engine::model_resolution_notice::MODEL_RESOLUTION_WARNING_CUSTOM_TYPE)
+            })
+            .count();
+        assert_eq!(rows, expected_rows, "{model_id}");
+    }
+    registration.unregister();
 }

@@ -1,7 +1,7 @@
 //! Domain types for the agent loop.
 //!
 //! Serde field names use camelCase so serialized messages match the TS wire
-//! format exactly (important for the proxy protocol and session JSONL parity).
+//! format exactly (important for session JSONL parity).
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -33,6 +33,17 @@ pub enum ServiceTier {
     Flex,
     Scale,
     Priority,
+}
+
+/// The requested provider transport (wire names match the shared AI
+/// package's). `None` leaves the choice to the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Transport {
+    Sse,
+    Websocket,
+    WebsocketCached,
+    Auto,
 }
 
 /// How tool calls from one assistant message are executed.
@@ -92,6 +103,16 @@ pub struct ImageContent {
     /// Base64 encoded image data.
     pub data: String,
     /// e.g. "image/jpeg", "image/png".
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+}
+
+/// Base64-encoded video content block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VideoContent {
+    /// Base64 encoded video data.
+    pub data: String,
+    /// e.g. "video/mp4", "video/webm".
     #[serde(rename = "mimeType")]
     pub mime_type: String,
 }
@@ -301,6 +322,7 @@ pub struct ToolResultMessage {
 pub enum ToolResultContent {
     Text(TextContent),
     Image(ImageContent),
+    Video(VideoContent),
 }
 
 impl ToolResultContent {
@@ -483,6 +505,24 @@ impl AgentToolResult {
 /// Callback used by tools to publish partial execution updates.
 pub type AgentToolUpdateCallback = Arc<dyn Fn(AgentToolResult) + Send + Sync>;
 
+/// Heartbeat cadence for in-flight tool calls: quiet until `after_ms`
+/// elapses, then one [`AgentEvent::ToolExecutionProgress`] every
+/// `every_ms` while the call still runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolProgressCadence {
+    pub after_ms: u64,
+    pub every_ms: u64,
+}
+
+impl Default for ToolProgressCadence {
+    fn default() -> Self {
+        ToolProgressCadence {
+            after_ms: 60_000,
+            every_ms: 60_000,
+        }
+    }
+}
+
 /// Tool definition used by the agent runtime.
 ///
 /// The schema is a plain JSON Schema `Value` (TS validates against a `TypeBox`
@@ -499,6 +539,12 @@ pub trait AgentTool: Send + Sync {
     /// validation. Return `None` to keep the arguments unchanged.
     fn prepare_arguments(&self, _args: &serde_json::Value) -> Option<serde_json::Value> {
         None
+    }
+    /// Whether a call naming another tool should dispatch to this one
+    /// (e.g. pre-rename names replayed from history); exact name matches
+    /// win.
+    fn accepts_alias(&self, _name: &str) -> bool {
+        false
     }
     /// Execute the tool call. Return `Err` on failure instead of encoding
     /// errors in `content`, like a `throw` in the TS reference.
@@ -529,6 +575,9 @@ pub enum AgentEvent {
     /// Last event of a run; carries all messages produced by the run.
     AgentEnd {
         messages: Vec<AgentMessage>,
+        /// Whether this run ended through a cancellation path. Captured
+        /// before dispatch, so later abort requests cannot relabel it.
+        aborted: bool,
     },
     TurnStart,
     TurnEnd {
@@ -552,6 +601,14 @@ pub enum AgentEvent {
         tool_call_id: String,
         tool_name: String,
         args: serde_json::Value,
+    },
+    /// In-flight tool-call heartbeat: emitted on the
+    /// [`AgentLoopConfig::tool_progress`] cadence once a call outlives the
+    /// initial threshold, so a stalled call is visible while it runs.
+    ToolExecutionProgress {
+        tool_call_id: String,
+        tool_name: String,
+        elapsed_ms: u64,
     },
     ToolExecutionUpdate {
         tool_call_id: String,
@@ -583,7 +640,7 @@ pub struct AfterToolCallResult {
     pub details: Option<serde_json::Value>,
     pub is_error: Option<bool>,
     /// Hint that the agent should stop after the current tool batch. Early
-    /// termination only happens when every finalized tool result in the batch
+    /// termination happens when any finalized tool result in the batch
     /// sets this to true.
     pub terminate: Option<bool>,
 }

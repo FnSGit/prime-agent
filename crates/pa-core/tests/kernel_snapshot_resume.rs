@@ -12,7 +12,7 @@
 //! `kernel-state.dill` snapshot, and a resumed session prewarms from the snapshot alone so its
 //! first `ipython` call sees the old variables. The kernel Python is ambient; skipped if absent.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pa_ai::faux::{
@@ -91,7 +91,7 @@ fn ipython_tool_call_step(call_id: &str, code: &str) -> FauxResponseStep {
         vec![pa_types::ai::AssistantContentBlock::ToolCall(
             pa_types::ai::ToolCall {
                 id: call_id.to_string(),
-                name: "ipython".to_string(),
+                name: "python_repl".to_string(),
                 arguments: serde_json::json!({ "code": code })
                     .as_object()
                     .cloned()
@@ -153,7 +153,8 @@ async fn tool_result_texts(engine: &pa_core::session_engine::engine::SessionEngi
                     .iter()
                     .filter_map(|block| match block {
                         pa_agent::types::ToolResultContent::Text(text) => Some(text.text.clone()),
-                        pa_agent::types::ToolResultContent::Image(_) => None,
+                        pa_agent::types::ToolResultContent::Image(_)
+                        | pa_agent::types::ToolResultContent::Video(_) => None,
                     })
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -208,6 +209,8 @@ impl Fixture {
         faux: &FauxSession,
     ) -> SessionEngineConfig {
         SessionEngineConfig {
+            cell_wake: None,
+            on_background_cell: None,
             steering_mode: None,
             follow_up_mode: None,
             cwd: self.cwd.clone(),
@@ -243,7 +246,7 @@ async fn session_end_then_resume_prewarms_and_revives_the_namespace() {
     let faux_one = faux_session(vec![
         ipython_tool_call_step(
             "call-setup",
-            "data = {'n': 42}\nmarker = 'lane-snapshot'\nprint('setup done')",
+            "data = {'n': 42}\nmarker = 'lane-snapshot'\nimport os\nos.makedirs('moved', exist_ok=True)\nos.chdir('moved')\nos.environ['PA_RESTORE_PROBE'] = 'set'\nprint('setup done')",
         ),
         text_step("state defined"),
     ]);
@@ -280,7 +283,10 @@ async fn session_end_then_resume_prewarms_and_revives_the_namespace() {
 
     // Session two: RESUME with the prewarm config flag off; only `hasSnapshot` may fire the boot.
     let faux_two = faux_session(vec![
-        ipython_tool_call_step("call-read", "print(marker)"),
+        ipython_tool_call_step(
+            "call-read",
+            "print(marker)\nimport os\nprint(os.getcwd())\nprint(os.environ.get('PA_RESTORE_PROBE'))",
+        ),
         text_step("read back"),
     ]);
     let resumed_manager = SessionManager::open(&fixture.cwd, &fixture.sessions_dir, &session_file);
@@ -317,6 +323,27 @@ async fn session_end_then_resume_prewarms_and_revives_the_namespace() {
         "the resumed namespace must revive: {results:?}"
     );
 
+    // The reset the notice discloses: the resumed kernel runs at the
+    // session cwd (not the moved dir) and the probe env var is gone.
+    let read_back = results
+        .iter()
+        .find(|text| text.contains("lane-snapshot"))
+        .expect("the resumed read cell ran");
+    let session_cwd = fixture
+        .cwd
+        .canonicalize()
+        .expect("canonicalize the fixture cwd");
+    assert!(
+        read_back
+            .lines()
+            .any(|line| Path::new(line.trim()) == session_cwd.as_path()),
+        "the resumed kernel must run at the session cwd: {read_back}"
+    );
+    assert!(
+        read_back.lines().any(|line| line.trim() == "None"),
+        "the probe env var must be reset: {read_back}"
+    );
+
     // The restore notice rode the turn and landed durably, naming what came back (TS
     // `_onIpythonStateRestored`, display row with the `restored` details flag).
     let entries = resumed.session.entries().await;
@@ -342,6 +369,10 @@ async fn session_end_then_resume_prewarms_and_revives_the_namespace() {
     assert!(
         content.contains("marker"),
         "the notice names what returned: {content}"
+    );
+    assert!(
+        content.contains("The working directory and environment variables were reset to the session defaults; re-apply any os.chdir(...) or os.environ[...] changes you still need."),
+        "the notice must disclose the cwd/env reset: {content}"
     );
     assert_eq!(
         notice.details,

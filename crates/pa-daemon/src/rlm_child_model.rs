@@ -1,7 +1,8 @@
 //! RLM child model resolution and roster text helpers: reference resolution against the
-//! credential-backed catalog, the spawn-time thinking-support check, plus the roster text caps.
+//! credential-backed catalog, the spawn-time thinking-support check, the requested child cwd,
+//! plus the roster text caps.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Result};
 use pa_ai::models::{get_supported_thinking_levels, thinking_level_from_str};
@@ -13,6 +14,13 @@ const MODEL_ERROR_SUGGESTION_LIMIT: usize = 3;
 pub const ANSWER_PREVIEW_MAX_CHARS: usize = 160;
 /// Cap on the one-line task label shown in kernel rosters.
 pub const LABEL_MAX_CHARS: usize = 200;
+/// Cap on the FULL final-answer text the collect envelope carries (the
+/// settle-binding data plane): the roster preview stays
+/// [`ANSWER_PREVIEW_MAX_CHARS`], while a consumer that binds outputs from
+/// the answer (the factory's output ports) needs the whole fenced JSON,
+/// so the lane is bounded instead of unbounded, never ballooning the
+/// collect reply for a runaway answer.
+pub const ANSWER_TEXT_MAX_CHARS: usize = 65_536;
 const ELLIPSIS: &str = "...";
 
 /// The model catalog the RLM surface resolves against: the same
@@ -55,7 +63,12 @@ pub fn resolve_child_model(
 
 /// The resolution before the allowlist gate: `None` inherits the parent model; a reference resolves
 /// parent equality first, then an exact catalog selector, then a unique short-form match.
-fn resolve_child_model_unchecked(
+/// Public for the daemonless print host: print sessions do not enforce
+/// `allowedModels`, so its children do not either.
+///
+/// # Errors
+/// Returns an error when the reference cannot be resolved against the catalog.
+pub fn resolve_child_model_unchecked(
     agent_dir: &Path,
     reference: Option<&str>,
     parent_model: Option<&str>,
@@ -146,6 +159,27 @@ pub fn assert_thinking_supported(
     );
 }
 
+/// The directory a child starts in: a requested `cwd` resolves against the
+/// session cwd and is canonicalized (project-context discovery walks its
+/// ancestors), otherwise the child shares the session cwd.
+///
+/// # Errors
+/// Returns an error naming `operation` when the requested directory does not exist.
+pub fn resolve_child_cwd(
+    session_cwd: &Path,
+    requested: Option<&str>,
+    operation: &str,
+) -> Result<PathBuf> {
+    let Some(requested) = requested else {
+        return Ok(session_cwd.to_path_buf());
+    };
+    let joined = session_cwd.join(requested);
+    match joined.canonicalize() {
+        Ok(cwd) if cwd.is_dir() => Ok(cwd),
+        _ => bail!("{operation} cwd {} is not a directory", joined.display()),
+    }
+}
+
 /// Rejection message for an unresolved model reference: the
 /// unavailability, the selector form, and close matches for retry.
 fn model_unavailable_error(
@@ -191,7 +225,8 @@ pub fn rlm_child_label(prompt: &str) -> String {
 }
 
 /// Whitespace-collapsed text capped at `max` chars with an ellipsis.
-fn cap_text(text: &str, max: usize) -> String {
+#[must_use]
+pub fn cap_text(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
@@ -417,35 +452,49 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        // The authorized private model: the compiled fallback lacks it, the
-        // fingerprint-scoped disk cache carries it.
+        // The entitled private model: the compiled fallback lacks it, the
+        // account's scoped Prime Inference snapshot carries it.
         let mut auth = pa_core::auth::AuthStorage::create(dir.path());
         let api_key = auth.get_api_key("prime-inference").expect("api key");
-        // The stored team selection survives ambient env credentials (a
-        // dogfood box's ambient `PRIME_API_KEY` changes the pair); the
-        // cache below is written for whatever pair resolves.
+        // The snapshot below is written for whatever pair resolves (an
+        // ambient `PRIME_API_KEY` on a dogfood box changes the pair).
         let team_id = auth
             .get_provider_headers("prime-inference")
             .and_then(|headers| headers.get("X-Prime-Team-ID").cloned())
-            .expect("stored team selection");
-        let fingerprint =
-            pa_core::models::private_prime_authorization_fingerprint(&api_key, &team_id);
-        pa_core::models::write_private_prime_authorization_cache(
-            &dir.path().join("models.json"),
-            &pa_core::models::PrivatePrimeAuthorizationCache {
-                fingerprint,
-                models: vec![serde_json::from_value(json!({
-                    "id": "internal/glm-5.3-fast", "name": "GLM 5.3 Fast",
-                    "api": "openai-completions", "provider": "prime-inference",
-                    "baseUrl": "https://api.pinference.ai/api/v1",
-                    "reasoning": true, "input": ["text"],
-                    "cost": { "input": 0.42, "output": 2.1, "cacheRead": 0, "cacheWrite": 0 },
-                    "contextWindow": 400_000, "maxTokens": 131_072
-                }))
-                .unwrap()],
-                refreshed_at: 1,
+            .unwrap_or_default();
+        // Every compiled route, so the snapshot passes the coverage gate.
+        let mut data: Vec<serde_json::Value> =
+            pa_models::transports::prime_inference_offline_entries()
+                .iter()
+                .map(|model| {
+                    json!({
+                        "id": model.id,
+                        "pricing": { "input_usd_per_mtok": 1.0, "output_usd_per_mtok": 1.0 },
+                    })
+                })
+                .collect();
+        data.push(json!({
+            "id": "internal/glm-5.3-fast",
+            "display_name": "GLM 5.3 Fast",
+            "pricing": { "input_usd_per_mtok": 0.42, "output_usd_per_mtok": 2.1 },
+            "specs": {
+                "context_window": 400_000, "max_output_tokens": 131_072,
+                "supports_reasoning": true,
+                "modalities": { "input": ["text"], "output": ["text"] },
             },
-        );
+        }));
+        std::fs::create_dir_all(dir.path().join("models")).unwrap();
+        std::fs::write(
+            dir.path().join("models/prime-inference-models-cache.json"),
+            json!({
+                "url": format!("{}/models", pa_core::models::PRIME_INFERENCE_BASE_URL),
+                "scope": pa_models::prime_inference::scope_key(&api_key, &team_id),
+                "fetchedAt": 1,
+                "payload": { "data": data },
+            })
+            .to_string(),
+        )
+        .unwrap();
 
         assert!(catalog_models(dir.path())
             .iter()
@@ -588,5 +637,24 @@ mod tests {
         let preview = compact_rlm_text(&long_answer);
         assert_eq!(preview.chars().count(), ANSWER_PREVIEW_MAX_CHARS);
         assert!(preview.ends_with("..."));
+    }
+
+    #[test]
+    fn the_binding_lane_keeps_far_more_than_the_preview_cap() {
+        // The collect envelope's full-answer lane: a fenced JSON output
+        // longer than the 160-character roster preview binds whole from
+        // it, so the bound stays far above the preview cap and only a
+        // genuinely oversized payload (over ANSWER_TEXT_MAX_CHARS) sees
+        // the ellipsis.
+        let long = "y".repeat(ANSWER_TEXT_MAX_CHARS + 50);
+        let capped = cap_text(&long, ANSWER_TEXT_MAX_CHARS);
+        assert_eq!(capped.chars().count(), ANSWER_TEXT_MAX_CHARS);
+        assert!(capped.ends_with("..."));
+        let wide_json = format!(
+            "{{\"blob\": \"{}\"}}",
+            "z".repeat(ANSWER_PREVIEW_MAX_CHARS * 4)
+        );
+        let lane = cap_text(&wide_json, ANSWER_TEXT_MAX_CHARS);
+        assert_eq!(lane, wide_json, "a wide-but-bounded JSON keeps its tail");
     }
 }

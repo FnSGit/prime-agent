@@ -12,6 +12,105 @@ fn view() -> AgentView {
     AgentView::new(Theme::builtin("prime", ColorMode::TrueColor))
 }
 
+#[test]
+fn markdown_link_targets_use_the_owning_view_cwd() {
+    let first_path = std::env::temp_dir().join("markdown-first");
+    let second_path = std::env::temp_dir().join("markdown-second");
+    let first_url = url::Url::from_directory_path(&first_path)
+        .unwrap()
+        .join("url")
+        .unwrap()
+        .to_string();
+    let second_url = url::Url::from_directory_path(&second_path)
+        .unwrap()
+        .join("url")
+        .unwrap()
+        .to_string();
+    let mut first = view();
+    first.chrome.cwd = first_path.to_string_lossy().into_owned();
+    first.push_entry(ChatEntry::User {
+        text: "[link](url)".to_string(),
+    });
+    let mut second = view();
+    second.chrome.cwd = second_path.to_string_lossy().into_owned();
+    second.push_entry(ChatEntry::User {
+        text: "[link](url)".to_string(),
+    });
+    let targets =
+        |v: &mut AgentView| crate::hyperlinks::frame_link_ranges(&v.render_transcript(80));
+    let first_targets = targets(&mut first);
+    let second_targets = targets(&mut second);
+    assert!(first_targets.iter().any(|link| link.url == first_url));
+    assert!(second_targets.iter().any(|link| link.url == second_url));
+    assert_eq!(targets(&mut first), first_targets);
+    first.chrome.cwd = second_path.to_string_lossy().into_owned();
+    assert_eq!(targets(&mut first), second_targets);
+    assert!(targets(&mut first).iter().all(|link| link.url != first_url));
+}
+
+/// A raw OSC 8 sequence in model, tool, or file text renders as plain text: only the links the
+/// renderer adds (here the markdown link) are clickable.
+#[test]
+fn injected_terminal_links_are_not_clickable() {
+    let injected = "\x1b]8;;https://evil.example/\x1b\\safe\x1b]8;;\x1b\\";
+    // Removing the inner opener must not join the outer prefix into a new one.
+    let nested = "\x1b]8;;\x1b]8;;x\x1b\\file:///evil\x1b\\safe";
+    // Markdown decodes `\;` after the source is stripped.
+    let escaped = "\x1b]8\\;;file:///evil\x1b\\safe";
+    let entries = vec![
+        ChatEntry::Assistant(Box::new(AssistantMessage {
+            blocks: vec![MessageBlock::Text(format!(
+                "{injected} {nested} {escaped} and [docs](https://docs.example/)"
+            ))],
+            has_tool_calls: true,
+            streaming: false,
+            error: None,
+            aborted: false,
+        })),
+        ChatEntry::Tool(Box::new(ToolCallCard {
+            id: "t1".to_string(),
+            name: "python".to_string(),
+            args: serde_json::json!({ "code": format!("x = 1  # {injected}") }),
+            started: true,
+            ..Default::default()
+        })),
+        ChatEntry::AgentMessage(Box::new(crate::custom_message::AgentMessageRow {
+            direction: crate::custom_message::AgentMessageDirection::Received,
+            counterpart: "lane".to_string(),
+            message: format!("{injected}\n{nested}"),
+        })),
+        ChatEntry::ShellCompletion(Box::new(crate::custom_message::ShellCompletionRow {
+            pid: Some(1),
+            exit_code: Some(0),
+            content: format!("[bash-done] {injected}"),
+        })),
+        ChatEntry::CompactionSummary {
+            summary: injected.to_string(),
+            tokens_before: 1,
+            custom_instructions: None,
+        },
+    ];
+    for detail in [Detail::Overview, Detail::All] {
+        let mut v = view_with(entries.clone());
+        v.detail = detail;
+        let links = crate::hyperlinks::frame_link_ranges(&v.render_transcript(80));
+        assert!(!links.is_empty(), "the markdown link stays clickable");
+        assert!(
+            links.iter().all(|link| link.url == "https://docs.example/"),
+            "{detail:?}: {links:?}"
+        );
+    }
+    let streaming = crate::compaction_row::CompactionState {
+        reason: crate::compaction_row::CompactionReason::Manual,
+        custom_instructions: None,
+        summary: injected.to_string(),
+    };
+    let theme = Theme::builtin("prime", ColorMode::TrueColor);
+    let rows = crate::compaction_row::render_compaction_stream(&streaming, true, &theme, 80);
+    let links = crate::hyperlinks::frame_link_ranges(&rows);
+    assert!(!rows.is_empty() && links.is_empty(), "{links:?}");
+}
+
 /// The hardware caret never sits over the factory page: the page is an
 /// input-less replacement view, so `frame_cursor` suppresses the stale
 /// editor dock position while it is open (the settings menu's guard
@@ -21,9 +120,8 @@ fn view() -> AgentView {
 fn the_factory_page_suppresses_the_stale_editor_cursor() {
     let mut v = view();
     v.dock_cursor = Some((10, 3));
-    v.factory_view = Some(crate::factory_view::FactoryView::from_reply(
-        &serde_json::json!({ "runs": [] }),
-        12,
+    v.overlay = Some(Overlay::Factory(
+        crate::factory_view::FactoryView::from_reply(&serde_json::json!({ "runs": [] }), 12),
     ));
     assert!(
         v.frame_cursor().is_none(),
@@ -31,7 +129,7 @@ fn the_factory_page_suppresses_the_stale_editor_cursor() {
     );
     // ...and the editor's position reports again once the page closes
     // (`frame_cursor` maps the dock row through the window offset).
-    v.factory_view = None;
+    v.overlay = None;
     assert_eq!(v.frame_cursor(), Some((11, 3)));
 }
 
@@ -44,29 +142,32 @@ fn a_paste_never_reaches_the_editor_behind_an_overlay() {
     let editor_text = |view: &AgentView| view.editor.get_lines().join("\n");
     // The /effort picker takes it into its search.
     let mut v = view();
-    v.effort_picker = Some(crate::effort_picker::EffortPicker::new(
-        &["high".to_string()],
-        None,
+    v.overlay = Some(Overlay::ChoicePicker(
+        crate::choice_picker::ChoicePicker::effort(&["high".to_string()], None),
     ));
     assert!(v.route_paste("effort"));
     assert_eq!(editor_text(&v), "");
     // The /login provider selector takes it into its search.
     let mut v = view();
-    v.provider_auth = Some(crate::provider_auth::ProviderAuthSelector::new(
-        crate::provider_auth::AuthSelectorKind::Login,
-        Vec::new(),
+    v.overlay = Some(Overlay::ProviderAuth(
+        crate::provider_auth::ProviderAuthSelector::new(
+            crate::provider_auth::AuthSelectorKind::Login,
+            Vec::new(),
+        ),
     ));
     assert!(v.route_paste("login"));
     assert_eq!(editor_text(&v), "");
     // The settings menu takes it into its search.
     let mut v = view();
-    v.settings_menu = Some(crate::settings_menu::SettingsMenu::new(Vec::new()));
+    v.overlay = Some(Overlay::Settings(crate::settings_menu::SettingsMenu::new(
+        Vec::new(),
+    )));
     assert!(v.route_paste("setting"));
     assert_eq!(editor_text(&v), "");
     // The input-less overlays consume it (the reload box stands in for
     // the whole consume set).
     let mut v = view();
-    v.reload_box = Some("reloading".to_string());
+    v.overlay = Some(Overlay::Reload("reloading".to_string()));
     assert!(v.route_paste("never"));
     assert_eq!(editor_text(&v), "");
     // The bare dock: the editor takes it.
@@ -217,8 +318,8 @@ fn hint_rows_carry_the_platform_alt_label() {
     v.queue_selected = Some(crate::queued::QueueSelectionItem {
         lane: crate::queued::QueueLane::Steering,
         index: 0,
+        position: 0,
         text: "turn right".to_string(),
-        internal: false,
     });
     let frame = v.render_frame(80, 24);
     let joined = frame.iter().map(text_of).collect::<Vec<_>>().join("\n");
@@ -251,29 +352,12 @@ fn frame_is_exactly_height_rows() {
     assert!(joined.contains('>'));
 }
 
-#[test]
-fn osc_emissions_reemit_only_changed_rows() {
-    let mut v = view();
-    v.chrome.version = "0.0.0".to_string();
-    v.chrome.cwd = "/w".to_string();
-    v.chrome.chat_name = "w".to_string();
-    v.push(TranscriptItem::UserMessage {
-        text: "hello".to_string(),
-    });
-    let frame = v.render_frame(80, 24);
-    let first = v.take_osc_emissions(&frame);
-    let marked: Vec<usize> = first.iter().map(|(row, _)| *row).collect();
-    assert!(!marked.is_empty());
-    let again = v.take_osc_emissions(&frame);
-    assert!(again.is_empty());
-}
-
 /// Fill the transcript past one window so there is scrollable history.
 fn filled(mut v: AgentView, turns: usize) -> AgentView {
     v.chrome.version = "0.0.0".to_string();
     v.chrome.cwd = "/w".to_string();
     v.chrome.chat_name = "w".to_string();
-    v.onboarding = None;
+    v.overlay = None;
     for index in 0..turns {
         v.push(TranscriptItem::UserMessage {
             text: format!("user line {index}"),
@@ -1409,8 +1493,8 @@ fn browse_header_pair_sits_below_the_editor_top_row() {
     v.queue_selected = Some(crate::queued::QueueSelectionItem {
         lane: crate::queued::QueueLane::Steering,
         index: 0,
+        position: 0,
         text: "turn right".to_string(),
-        internal: false,
     });
     let frame = v.render_frame(80, 24);
     let joined: Vec<String> = frame.iter().map(text_of).collect();
@@ -1606,6 +1690,9 @@ fn a_landing_result_with_receipts_settles_the_card() {
             }),
             is_error: false,
         });
+        // The final result settles the call (the pipeline stamps
+        // `ended_at` with every settle path): the live timer stops.
+        card.ended_at = Some(std::time::Instant::now());
     }
     view.mark_entry_stale(index);
     let text = transcript_text(&mut view, 80);

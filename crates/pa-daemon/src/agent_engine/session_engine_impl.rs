@@ -3,11 +3,12 @@
 //! turn state machine, and the export/telemetry reads.
 
 use super::{
-    artifact_reference, json, map_thinking_level, now_millis, persisted_rlm_max_depth,
-    AgentSessionEngine, Arc, BranchSummaryOutcome, BranchSummaryRequest, BranchSummaryRun,
-    CompactionOutcome, CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection,
-    ParentIdentity, PromptRequest, ProviderTarget, SessionEngine, SideQuestionOutcome,
-    SideQuestionRequest, StartupScope, TurnPrompt, Value, DEFAULT_RLM_MAX_DEPTH,
+    artifact_reference, json, map_thinking_level, now_millis, AgentSessionEngine, Arc,
+    BranchSummaryOutcome, BranchSummaryRequest, BranchSummaryRun, CompactionOutcome,
+    CompactionRequest, CompactionRun, EngineEvent, EngineModelSelection, GoalWakeKind,
+    ParentIdentity, PromptContextBoundary, PromptRequest, ProviderTarget, SessionEngine,
+    SideQuestionOutcome, SideQuestionRequest, StartupScope, TurnPrompt, Value,
+    DEFAULT_RLM_MAX_DEPTH,
 };
 
 impl SessionEngine for AgentSessionEngine {
@@ -51,10 +52,8 @@ impl SessionEngine for AgentSessionEngine {
             // The release itself: best-effort; a retired runtime releases
             // nothing. The probe lock drops before the await (`Send`).
             let release = self
-                .kernel_release_probe
-                .lock()
-                .expect("kernel release probe lock")
-                .clone();
+                .live_handles()
+                .map(|live| Arc::clone(&live.kernel_release));
             if let Some(release) = release {
                 release().await;
             }
@@ -67,8 +66,14 @@ impl SessionEngine for AgentSessionEngine {
         }
         // The driver is mid-mutation or the session is unbuilt: fall back to the published state,
         // then empty.
-        let published = self.published_goal.lock().expect("published goal lock");
-        published
+        self.built_handles()
+            .and_then(|handles| {
+                handles
+                    .published_goal
+                    .lock()
+                    .expect("published goal lock")
+                    .clone()
+            })
             .as_ref()
             .and_then(|goal| serde_json::to_value(goal).ok())
             .or_else(|| serde_json::to_value(pa_core::goals::empty_goal_state()).ok())
@@ -77,20 +82,26 @@ impl SessionEngine for AgentSessionEngine {
 
     fn mint_post_compaction_goal_continuation(&self) -> Option<crate::engine::GoalContinuation> {
         // The mirrored locks are async, so the mint runs on the engine runtime.
-        let handles = self
-            .goal_runtime
-            .lock()
-            .expect("goal runtime lock")
-            .clone()?;
+        let live = self.live_handles()?;
+        let handles = &live.goal;
         // The progress check's input, read before the driver lock. The
         // failed pair's DROP happens INSIDE the quiescence gate (an early
         // drop would remint).
         let last_turn = self.last_loop_assistant_message();
         let continuation = self.runtime.block_on(async {
             let mut driver = handles.driver.lock().await;
-            // The quiescence arm: unsettled work defers the mint (owed, not consumed).
-            if self.has_unsettled_rlm_work().await || self.has_live_background_bash_handles() {
+            // The quiescence arm: unsettled work defers the mint (owed, not
+            // consumed). Live background work also arms the fallback wake
+            // (once per deferral): its completion notice is the normal retry,
+            // and work that never completes gets one marker turn after one
+            // window.
+            let background_work = self.background_work_count() > 0;
+            if self.has_unsettled_rlm_work().await || background_work {
                 driver.mark_continuation_owed();
+                if background_work {
+                    drop(driver);
+                    self.arm_background_skip_wake().await;
+                }
                 return None;
             }
             // Now the failed pair can leave the loop (`last_turn` still
@@ -123,9 +134,10 @@ impl SessionEngine for AgentSessionEngine {
                 let state = driver.state_with_creation_elapsed();
                 let wake_at = driver.backoff_wake_at();
                 drop(driver);
-                self.publish_goal_state(&state);
+                live.publish_goal(&state);
                 if let Some(wake_at) = wake_at {
-                    self.schedule_goal_backoff_wake(wake_at).await;
+                    self.schedule_goal_wake(GoalWakeKind::Backoff, wake_at)
+                        .await;
                 }
                 return None;
             }
@@ -133,9 +145,9 @@ impl SessionEngine for AgentSessionEngine {
             // This mint's own guard handle: the admission sink releases
             // exactly it, never the mirror.
             let pending_handle = Some(driver.pending_continuation_handle());
-            let goal_update = self.publish_goal_state(&driver.state_with_creation_elapsed());
+            let goal_update = live.publish_goal(&driver.state_with_creation_elapsed());
             drop(driver);
-            self.cancel_goal_backoff_wake();
+            self.cancel_goal_wake();
             Some((
                 crate::engine::PromptRequest {
                     batch: Vec::new(),
@@ -256,6 +268,28 @@ impl SessionEngine for AgentSessionEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
     }
 
+    fn set_prompt_context_boundary(&self, leaf_id: Option<String>) {
+        let boundary = match leaf_id {
+            Some(leaf) => PromptContextBoundary::Leaf(leaf),
+            None => PromptContextBoundary::Empty,
+        };
+        if std::env::var_os("PA_COMPACTION_TRACE").is_some() {
+            pa_core::session_engine::compaction_trace::trace(
+                "daemon.prompt_boundary",
+                &json!({
+                    "kind": match &boundary {
+                        PromptContextBoundary::Empty => "empty",
+                        PromptContextBoundary::Leaf(_) => "leaf",
+                    },
+                }),
+            );
+        }
+        *self
+            .prompt_context_boundary
+            .lock()
+            .expect("prompt context boundary lock") = Some(boundary);
+    }
+
     /// Restore through the bounded readiness wait. An explicit create flag
     /// wins; a failed restore is never silent
     /// ([`Self::model_fallback_message`]).
@@ -281,7 +315,8 @@ impl SessionEngine for AgentSessionEngine {
             .session_file
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()?;
+            .clone()
+            .unwrap_or_default();
         if decision.session_file != current {
             return None;
         }
@@ -312,6 +347,31 @@ impl SessionEngine for AgentSessionEngine {
                     .map(str::to_string),
             );
         }
+    }
+
+    /// The session's newest accepted progress note; `None` before the
+    /// first build and after a run boundary cleared it.
+    fn progress_note(&self) -> Option<String> {
+        self.built_handles()
+            .and_then(|handles| handles.progress_notes.latest_note())
+            .map(|(note, _)| note)
+    }
+
+    /// Clears the stored note at the run boundary; the throttle clock stays.
+    fn clear_progress_note(&self) {
+        if let Some(handles) = self.built_handles() {
+            handles.progress_notes.clear();
+        }
+    }
+
+    /// The live-slot identity check: the store a replacement retired is
+    /// not the session's published inbox (the consumed withdrawal's
+    /// re-check consults this under the core lock).
+    fn inbox_is_live(
+        &self,
+        inbox: &std::sync::Arc<pa_core::session_engine::inbox::SessionInbox>,
+    ) -> bool {
+        self.is_live_inbox(inbox)
     }
 
     fn configure_service_tier(&self, tier: Option<pa_types::ai::ServiceTier>) {
@@ -390,14 +450,23 @@ impl SessionEngine for AgentSessionEngine {
         let Ok(model) = self.resolve_model() else {
             return false;
         };
+        self.rebuild_request_auth_registry();
         {
-            let (api_key, headers) = self.resolve_request_key_and_headers(&model);
+            // The switch's slot install serializes with the other slot
+            // writers' fence (the failover callbacks take the same lock),
+            // so a mid-switch turn never sees a half-swapped target.
+            let _reload_serialized = self
+                .reload_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut target = self.provider_target.write().expect("provider target lock");
+            // The daemon's stream re-resolves request auth per provider
+            // call; the slot's auth half is write-only here.
             *target = Some(ProviderTarget {
                 service_tier: *self.service_tier.read().expect("service tier lock"),
-                api_key,
+                api_key: None,
                 model: model.clone(),
-                headers,
+                headers: None,
             });
         }
         let session = self.session.blocking_lock();
@@ -412,6 +481,10 @@ impl SessionEngine for AgentSessionEngine {
                 core.session
                     .set_model_and_thinking_level(&model, &provider, &model_id, level),
             );
+            // The turn-boundary model facts follow the switch: `model.info`
+            // and the usage estimate's context window report the model now
+            // running. A core that is not built yet rebinds at its build.
+            core.update_model_facts(&model);
         }
         if let Some(children) = &self.children {
             children.set_model(format!("{}/{}", model.provider, model.id));
@@ -492,10 +565,12 @@ impl SessionEngine for AgentSessionEngine {
     fn configure_startup_scope(
         &self,
         scoped_models: Vec<pa_core::models::ScopedModel>,
+        patterns: Vec<String>,
         is_continuing: bool,
     ) {
         *self.startup_scope.lock().unwrap() = Some(StartupScope {
             scoped_models,
+            patterns,
             is_continuing,
         });
         // The scope changed the startup decisions: drop the stale level; the
@@ -549,6 +624,12 @@ impl SessionEngine for AgentSessionEngine {
         }
     }
 
+    fn set_auto_compaction_enabled(&self, enabled: bool) {
+        if let Some(core) = self.session.blocking_lock().as_deref() {
+            core.session.set_auto_compaction_enabled(enabled);
+        }
+    }
+
     fn run_compaction(
         &self,
         request: CompactionRequest,
@@ -570,7 +651,7 @@ impl SessionEngine for AgentSessionEngine {
         let custom_instructions = request.custom_instructions;
         // The live target's key: the config key is the startup snapshot and
         // goes stale with provider switches.
-        let api_key = self.resolve_request_api_key(&model);
+        let (model, api_key) = self.resolve_request_target(model);
         let run = async {
             // The lock covers the clone only; the summarizer call below must not ride it.
             let session = self.session.lock().await.clone();
@@ -583,20 +664,16 @@ impl SessionEngine for AgentSessionEngine {
                     custom_instructions.as_deref(),
                     &model,
                     api_key,
-                    // The run's own signal: a raced summarizer still lands
-                    // the pre-commit check (TS `_performCompaction`).
+                    // The run's own signal cancels it up to the commit
+                    // (TS `_performCompaction`); a committed run finishes.
                     Some(signal),
                 )
                 .await
         };
-        let result = self
-            .runtime
-            .block_on(pa_agent::abort::race_with_abort(run, signal));
-        let compaction = match result {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => {
-                // Abort-marked errors and a lost race both surface as the
-                // TS "Compaction cancelled" outcome.
+        let compaction = match self.runtime.block_on(run) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Abort-marked errors surface as the TS "Compaction cancelled" outcome.
                 if pa_agent::abort::is_abort_error(&error) {
                     return CompactionOutcome::Aborted;
                 }
@@ -604,7 +681,6 @@ impl SessionEngine for AgentSessionEngine {
                     error: format!("{error:#}"),
                 };
             }
-            Err(_) => return CompactionOutcome::Aborted,
         };
         match compaction {
             pa_core::session_engine::compact_session::CompactOutcome::Skipped(message) => {
@@ -657,7 +733,7 @@ impl SessionEngine for AgentSessionEngine {
                 }
             }
         };
-        let api_key = self.resolve_request_api_key(&model);
+        let (model, api_key) = self.resolve_request_target(model);
         let settings =
             pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
         let reserve_tokens = settings
@@ -671,6 +747,7 @@ impl SessionEngine for AgentSessionEngine {
         let entries = request.entries;
         let custom_instructions = request.custom_instructions;
         let replace_instructions = request.replace_instructions;
+        let session_id = request.session_id;
         // TS #2411: the branch summary resolves its model through the
         // `auxiliaryModel` setting, keeping its one-off prompt off the
         // prompt-cache prefix.
@@ -688,6 +765,7 @@ impl SessionEngine for AgentSessionEngine {
                     replace_instructions,
                     reserve_tokens,
                     auxiliary: Some(&auxiliary),
+                    session_id: Some(&session_id),
                 },
             )
             .await
@@ -756,7 +834,9 @@ impl SessionEngine for AgentSessionEngine {
             let session = engine.session.shared_persistence();
             let manager = session.lock().await;
             driver.reload_from_branch(&manager, goal_reload);
-            let announcement = self.publish_goal_state(&driver.state_with_creation_elapsed());
+            let announcement = self
+                .built_handles()
+                .and_then(|handles| handles.publish_goal(&driver.state_with_creation_elapsed()));
             *self
                 .reloaded_goal_update
                 .lock()
@@ -804,33 +884,20 @@ impl SessionEngine for AgentSessionEngine {
         // This session's own depth gates the kernel `refine.*` host requests (depth-0 only).
         self.rlm_depth
             .store(identity.rlm_depth, std::sync::atomic::Ordering::Relaxed);
+        self.factory_child
+            .store(identity.factory_child, std::sync::atomic::Ordering::Relaxed);
         if let Some(thinking) = &identity.thinking {
             pa_ai::models::thinking_level_from_str(thinking)
                 .ok_or_else(|| anyhow::anyhow!("unknown thinking level \"{thinking}\""))?;
         }
         // The depth bound's precedence: chat override > inherited > global
-        // setting > env > default.
-        let (max_depth, source) = persisted_rlm_max_depth(identity.session_file.as_deref())
-            .map(|depth| (depth, "chat"))
-            .or_else(|| {
-                identity
-                    .rlm_max_depth
-                    .map(|depth| (u64::from(depth), "inherited"))
-            })
-            .or_else(|| {
-                let settings =
-                    pa_core::settings::SettingsManager::create(self.cwd(), &self.config.agent_dir);
-                settings.get_rlm_max_depth().map(|depth| (depth, "global"))
-            })
-            .or_else(|| {
-                std::env::var("RLM_MAX_DEPTH")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .filter(|value| *value >= 1)
-                    .map(|depth| (depth, "env"))
-            })
-            .unwrap_or((u64::from(DEFAULT_RLM_MAX_DEPTH), "default"));
+        // setting > env > default (the shared resolver).
+        let (max_depth, source) = pa_core::session_engine::rlm_host::resolve_rlm_max_depth(
+            identity.session_file.as_deref(),
+            identity.rlm_max_depth,
+            &self.cwd(),
+            &self.config.agent_dir,
+        );
         *self.rlm_max_depth_source.lock().expect("depth source lock") = source;
         // The semantic-edge identity (TS `semanticEdgeLedgerPath` +
         // provenance): a spawned child's ledger lives in its rlm session
@@ -900,8 +967,29 @@ impl SessionEngine for AgentSessionEngine {
         }
     }
 
+    fn on_turn_start(&self) {
+        if let Some(children) = &self.children {
+            children.notify_turn_started();
+        }
+    }
+
     /// The worker's turn completed: release child prompt tasks waiting on the boundary.
     fn on_turn_done(&self) {
+        *self
+            .prompt_context_boundary
+            .lock()
+            .expect("prompt context boundary lock") = None;
+        self.runtime.block_on(async {
+            let core = self.session.lock().await.clone();
+            if let Some(core) = core {
+                core.session
+                    .shared_persistence()
+                    .lock()
+                    .await
+                    .replay_admitted_user_rows(Vec::new())
+                    .expect("clearing admitted rows cannot fail");
+            }
+        });
         if let Some(children) = &self.children {
             children.notify_turn_done();
         }
@@ -939,13 +1027,13 @@ impl SessionEngine for AgentSessionEngine {
         // and the ledger records nothing. The engine build always wires
         // it; no fallback to the agent's own fn, which would leak the
         // id-carrying wrapper into the side call.
-        let side_stream_fn = {
-            let guard = self.session.blocking_lock();
-            guard
-                .as_deref()
-                .and_then(|engine| engine.session.side_question_stream_fn())
-        };
-        let Some(side_stream_fn) = side_stream_fn else {
+        // The run bills the engine it started on: a replace during the run must
+        // not move the bill to the replacement.
+        let built = self.session.blocking_lock().clone();
+        let side_stream_fn = built
+            .as_deref()
+            .and_then(|engine| engine.session.side_question_stream_fn());
+        let (Some(built), Some(side_stream_fn)) = (built, side_stream_fn) else {
             return SideQuestionOutcome::Failed {
                 answer: String::new(),
                 error: "Select a model before asking a side question".to_string(),
@@ -962,6 +1050,9 @@ impl SessionEngine for AgentSessionEngine {
                     signal,
                     sink,
                 ));
+        // The answer never enters the history, but the run's model calls bill the session.
+        self.runtime
+            .block_on(built.session.record_model_usage(result.usage.clone()));
         match result.status {
             pa_core::session_engine::side_question::SideQuestionStatus::Complete => {
                 SideQuestionOutcome::Complete {
@@ -1167,26 +1258,26 @@ impl SessionEngine for AgentSessionEngine {
     ) -> anyhow::Result<Value> {
         let model = self.resolve_model()?;
         self.ensure_core_session(&model)?;
-        let api_key = self.resolve_request_api_key(&model);
-        let global_harness_dir = self.config.agent_dir.clone();
+        let (model, api_key) = self.resolve_request_target(model);
         // The lock covers the clone only; the model call below must not ride it.
         let core = self
             .session
             .blocking_lock()
             .clone()
             .expect("session built by ensure_core_session");
-        let result = self.runtime.block_on(async {
-            core.session
-                .refine(
-                    &options,
-                    pa_core::session_engine::refine::RefinementSource::User,
-                    &model,
-                    api_key,
-                    global_harness_dir,
-                )
+        let committed = self.runtime.block_on(async {
+            let pending = core.session.start_refinement(
+                options,
+                pa_core::session_engine::refine::RefinementSource::User,
+                model,
+                api_key,
+            );
+            drop(core);
+            pending
                 .await
+                .map_err(|error| anyhow::anyhow!("refinement task failed: {error}"))?
         })?;
-        serde_json::to_value(&result)
+        serde_json::to_value(&committed.result)
             .map_err(|error| anyhow::anyhow!("refinement result conversion failed: {error}"))
     }
 
@@ -1278,9 +1369,12 @@ impl SessionEngine for AgentSessionEngine {
         if let Some(command) =
             crate::session_commands::parse_prompt_session_command(&request.message)
         {
-            let Some(execution) =
-                crate::session_commands::run_session_command(self, &command, &mut emit)
-            else {
+            let Some(execution) = crate::session_commands::run_session_command(
+                self,
+                &command,
+                &request.images,
+                &mut emit,
+            ) else {
                 return;
             };
             if let Some(error) = &execution.error {
@@ -1307,6 +1401,10 @@ impl SessionEngine for AgentSessionEngine {
         // unparseable row fails the turn, not double-represents it.
         let injected = match &request.custom_message {
             Some(custom) => {
+                // A missing `timestamp` fills from the type's own serde
+                // default at this parse, so the accepted row below can BE
+                // the parsed row: the frames and the model context carry
+                // one normalized representation.
                 match serde_json::from_value::<pa_types::session::AgentMessage>(custom.clone()) {
                     Ok(pa_types::session::AgentMessage::Custom(parsed)) => Some(parsed),
                     Ok(_) => {
@@ -1316,6 +1414,29 @@ impl SessionEngine for AgentSessionEngine {
                         return;
                     }
                     Err(error) => {
+                        // The row failed to parse: log the requesting turn's
+                        // identity (source, agent message id, session file)
+                        // plus a summary of the row — never the raw payload,
+                        // which can carry base64 image blocks and private
+                        // prompt text. The row never reached the transcript,
+                        // so this line is the only evidence the sender
+                        // leaves; the summary identifies it.
+                        let session_file = self
+                            .session_file
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .as_deref()
+                            .map_or_else(|| "unset".to_string(), |path| path.display().to_string());
+                        eprintln!(
+                            "{}",
+                            injected_custom_parse_failed_log_line(
+                                &request.source,
+                                request.agent_message_id.as_deref(),
+                                &session_file,
+                                custom,
+                                &error,
+                            )
+                        );
                         emit(EngineEvent::Done(Err(format!(
                             "injected custom message parse failed: {error}"
                         ))));
@@ -1327,8 +1448,11 @@ impl SessionEngine for AgentSessionEngine {
         };
         // The accepted turn row: an injected custom row replaces the user
         // message; the plain turn records the accepted row, images after.
-        let accepted = if let Some(custom) = &request.custom_message {
-            EngineEvent::CustomMessage(custom.clone())
+        // The injected row the client sees IS the parsed row (one
+        // normalized representation): the frames carry exactly what the
+        // model context holds, a default-filled clock included.
+        let accepted = if let Some(parsed) = &injected {
+            EngineEvent::CustomMessage(crate::session_commands::custom_message_value(parsed))
         } else {
             let mut content = vec![json!({ "type": "text", "text": request.message })];
             for image in &request.images {
@@ -1400,10 +1524,27 @@ impl SessionEngine for AgentSessionEngine {
 
     fn abort_in_flight_turn(&self) {
         // The active run aborts and the in-flight fetch cancels; none in flight: nothing.
-        let agent = self.turn_agent.lock().expect("turn agent lock").clone();
+        let agent = self
+            .built_handles()
+            .map(|handles| Arc::clone(&handles.turn_agent));
         if let Some(agent) = agent {
             agent.abort();
         }
+        // The session's kernel stops its current user cell too (attached or
+        // detached): the run's own signal cannot reach a cell the run left
+        // behind (an auto-backgrounded one), so the abort path targets the
+        // execution directly. The interrupt is nonblocking; the kernel's
+        // watcher owns the grace and any retirement.
+        self.abort_kernel_user_execution();
+    }
+
+    /// The scoped idle cancel: stop ONLY a detached (backgrounded) kernel
+    /// cell. The queues, the running turn, and attached work stay exactly as
+    /// they are; a session without a detached cell answers `false` and
+    /// changes nothing.
+    fn abort_background_cell(&self) -> bool {
+        self.kernel_manager()
+            .is_some_and(|manager| manager.abort_detached_execution())
     }
 
     /// `set_steering_mode` / `set_follow_up_mode`: the queue delivery modes
@@ -1419,7 +1560,9 @@ impl SessionEngine for AgentSessionEngine {
                 modes.1 = Some(mode.to_string());
             }
         }
-        let agent = self.turn_agent.lock().expect("turn agent lock").clone();
+        let agent = self
+            .built_handles()
+            .map(|handles| Arc::clone(&handles.turn_agent));
         if let Some(agent) = agent {
             if let Some(mode) = steering.and_then(Self::queue_mode) {
                 agent.set_steering_mode(mode);
@@ -1429,4 +1572,34 @@ impl SessionEngine for AgentSessionEngine {
             }
         }
     }
+}
+
+/// The daemon-log line for an injected custom row that failed to parse:
+/// the requesting turn's identity (source, agent message id, session file)
+/// plus a summary of the row — its `customType`, its top-level keys, and
+/// its byte length. Never the raw payload: it can carry base64 image
+/// blocks and private prompt text, and the summary is enough to identify
+/// the sender. Unit-tested in isolation; the parse site prints it with
+/// `eprintln!` (the daemon log captures stderr).
+pub(crate) fn injected_custom_parse_failed_log_line(
+    source: &str,
+    agent_message_id: Option<&str>,
+    session_file: &str,
+    raw_payload: &Value,
+    error: &serde_json::Error,
+) -> String {
+    let custom_type = raw_payload
+        .get("customType")
+        .and_then(Value::as_str)
+        .unwrap_or("<none>");
+    let mut keys: Vec<&str> = Vec::new();
+    if let Some(object) = raw_payload.as_object() {
+        keys.extend(object.keys().map(String::as_str));
+    }
+    let bytes = serde_json::to_vec(raw_payload).map_or(0, |payload| payload.len());
+    format!(
+        "pa-daemon: injected custom message parse failed: {error}; source={source:?} \
+         agent_message_id={agent_message_id:?} session_file={session_file:?} \
+         customType={custom_type:?} keys={keys:?} bytes={bytes}"
+    )
 }

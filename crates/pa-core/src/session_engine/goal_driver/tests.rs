@@ -269,6 +269,24 @@ fn usage_accounting_and_budget_limit() {
     assert_eq!(driver.state().status, GoalStatus::BudgetLimited);
 }
 
+/// A call billed while the goal ran still charges it across a pause and
+/// resume; a call billed during the pause does not.
+#[test]
+fn a_pause_keeps_the_calls_billed_while_the_goal_ran() {
+    let mut session = persisted_session();
+    let mut driver = GoalDriver::new();
+    let bill = driver.billed_row_recorder();
+    driver.start(&mut session, "work", Some(1_000)).unwrap();
+    bill(&usage(30, 10));
+    driver.pause(&mut session, "Paused by user").unwrap();
+    bill(&usage(500, 0));
+    driver.resume(&mut session).unwrap();
+    driver
+        .record_assistant_usage(&mut session, "a1", &usage(5, 5))
+        .unwrap();
+    assert_eq!(driver.state().tokens_used, 40 + 10);
+}
+
 #[test]
 fn terminal_messages_fail_or_keep_the_goal() {
     use pa_types::ai::StopReason;
@@ -721,6 +739,34 @@ fn a_parked_refusal_clears_an_earlier_strikes_window() {
         "no wake during the park"
     );
     assert_eq!(driver.no_progress_streak(), 1, "the strike stays durable");
+}
+
+/// The print surface's wake take owns an armed window even after its
+/// deadline passed during the settled run: the take still yields the
+/// overdue deadline once — the sleep saturates to zero — and consuming
+/// it admits exactly one wake per strike.
+#[test]
+fn the_print_wake_take_yields_an_overdue_window_once() {
+    let mut session = persisted_session();
+    let mut driver = GoalDriver::new();
+    driver.start(&mut session, "work", None).unwrap();
+    let created_at = driver.state().created_at.unwrap();
+
+    // Strike one: the backoff window arms.
+    let empty = test_empty_turn(created_at as i64 + 1);
+    assert!(driver
+        .next_continuation_message(&mut session, Some(&empty))
+        .unwrap()
+        .is_none());
+
+    // The settled boundary outlasted the window: the armed deadline sits
+    // in the past, still non-zero.
+    let overdue = now_millis().saturating_sub(1);
+    driver.no_progress_backoff_until_ms = overdue;
+
+    // The take yields the overdue deadline once, and consumes it.
+    assert_eq!(driver.take_backoff_wake_at(), Some(overdue));
+    assert_eq!(driver.take_backoff_wake_at(), None);
 }
 
 #[test]

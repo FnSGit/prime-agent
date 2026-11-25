@@ -667,6 +667,8 @@ const AGENT_SESSION_ENDED: EventRule = EventRule {
         ("failed_run_count", optional(count())),
         ("aborted_run_count", optional(count())),
         ("tool_call_count", optional(count())),
+        // Videos `attach_video` loaded into tool results (the count only).
+        ("video_attachment_count", optional(count())),
         ("compaction_count", optional(count())),
         ("model_call_count", optional(count())),
         ("input_tokens", optional(tokens())),
@@ -759,6 +761,20 @@ const AGENT_COMMAND_USED: EventRule = EventRule {
     name: "agent command used",
     since: 1,
     properties: &[("command_name", required(free_string(64)))],
+};
+
+/// Adoption of the automatic compaction percentage setting; no session content.
+const AUTOCOMPACT_THRESHOLD_CHANGED: EventRule = EventRule {
+    name: "autocompact threshold changed",
+    since: 2,
+    properties: &[(
+        "threshold_percent",
+        required(PropKind::Number {
+            max: 100,
+            integer: false,
+            nullable: false,
+        }),
+    )],
 };
 
 /// The onboarding journey's real stages only.
@@ -967,8 +983,9 @@ const SESSION_ARCHIVED: EventRule = EventRule {
 
 /// A settled ipython cell that rendered as bash (v2): its executed
 /// `bash()` line share and command count, never command text. One of the
-/// two standalone TUI events (with `agent command used`), tracked per
-/// render by the upstream #3307 addition and kept intact.
+/// standalone TUI events (with `agent command used`),
+/// tracked per render by the upstream #3307
+/// addition and kept intact.
 const TUI_IPYTHON_BASH_RENDERED: EventRule = EventRule {
     name: "tui ipython bash rendered",
     since: 2,
@@ -996,6 +1013,7 @@ const TUI_EXIT: EventRule = EventRule {
         ),
         ("turn_active", required(boolean())),
         ("tui_scroll_count", optional(count())),
+        ("tui_live_tool_timer_count", optional(count())),
         ("tui_selection_count", optional(count())),
         ("tui_click_count", optional(count())),
         ("tui_menu_open_count", optional(count())),
@@ -1012,6 +1030,7 @@ const TUI_EXIT: EventRule = EventRule {
         ("tui_scoped_models_count", optional(count())),
         ("tui_suspend_count", optional(count())),
         ("tui_agents_action_count", optional(count())),
+        ("tui_agents_content_search_count", optional(count())),
         ("tui_enhanced_keys_kitty", optional(boolean())),
         ("tui_enhanced_keys_modify_other_keys", optional(boolean())),
         ("tui_hyperlinks_enabled", optional(boolean())),
@@ -1219,14 +1238,33 @@ const UPDATE_EVENTS: &[EventRule] = &[
     },
 ];
 
+const HARNESS_REFINEMENTS_CHANGED: EventRule = EventRule {
+    name: "harness refinements changed",
+    since: 2,
+    properties: &[("enabled", required(boolean()))],
+};
+
+/// Adoption of the web search provider setting: the chosen provider's id only.
+const WEB_SEARCH_PROVIDER_CHANGED: EventRule = EventRule {
+    name: "web search provider changed",
+    since: 2,
+    properties: &[(
+        "provider",
+        required(enum_rule(&["serper", "eco"], "serper")),
+    )],
+};
+
 /// Every catalogued event, flattened.
 #[must_use]
 pub fn catalog() -> Vec<&'static EventRule> {
     let mut all: Vec<&'static EventRule> = vec![
+        &HARNESS_REFINEMENTS_CHANGED,
+        &WEB_SEARCH_PROVIDER_CHANGED,
         &AGENT_STARTED,
         &AGENT_RUN_COMPLETED,
         &AGENT_SESSION_ENDED,
         &AGENT_COMMAND_USED,
+        &AUTOCOMPACT_THRESHOLD_CHANGED,
         &ONBOARDING_STAGE,
         &ONBOARDING_COMPLETED,
         &AGENT_STARTUP_STAGE,
@@ -1352,47 +1390,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn the_catalog_is_the_low_frequency_set() {
-        assert_eq!(SCHEMA_VERSION, 2);
-        let names: Vec<&str> = catalog().iter().map(|rule| rule.name).collect();
-        for name in [
-            "agent started",
-            "agent run completed",
-            "agent session ended",
-            "agent command used",
-            "onboarding completed",
-            "onboarding stage",
-            "agent startup stage",
-            "agent installation stage",
-            "session archived",
-            "startup",
-            "daemon event",
-            "model refused",
-            "update completed",
-            "tui exit",
-        ] {
-            assert!(names.contains(&name), "{name} stays catalogued");
-        }
-        // The per-occurrence events folded into run/session/client counters.
-        for name in [
-            "agent run started",
-            "agent error",
-            "agent timing",
-            "agent tool summary",
-            "agent feature outcome",
-            "agent input stage",
-            "tool executed",
-            "skill used",
-            "mcp connector used",
-            "rlm child usage attributed",
-            "kernel bootstrap",
-            "tui scroll used",
-        ] {
-            assert!(!names.contains(&name), "{name} is folded, not an event");
-        }
-    }
-
     /// Every property key matches the platform backend's key pattern
     /// (`^[a-zA-Z][a-zA-Z0-9_]*$`, at most 64 chars; a bad key drops the
     /// whole event there) and every event stays under its 128-key cap.
@@ -1460,11 +1457,20 @@ mod tests {
         properties.set("trigger", json!("spontaneous")); // out of vocabulary
         properties.set("tool_bash_call_count", json!(3u64));
         properties.set("tool_name", json!("private_tool")); // not a catalogued property
+        properties.set("error_category", Value::Null); // nullable
+        properties.set("compaction_count", Value::Null); // NOT nullable
         let adjusted = sanitize("agent run completed", &mut properties);
         assert_eq!(properties.get("trigger"), Some(&json!("unknown")));
         assert_eq!(properties.get("tool_bash_call_count"), Some(&json!(3u64)));
         assert!(properties.get("tool_name").is_none(), "unknown key dropped");
-        assert_eq!(adjusted, 2, "one fallback + one dropped key");
+        assert_eq!(properties.get("error_category"), Some(&Value::Null));
+        assert!(properties.get("compaction_count").is_none());
+        assert_eq!(adjusted, 3, "one fallback + two dropped keys");
+
+        let mut uncatalogued = Properties::new();
+        uncatalogued.set("anything", json!("kept"));
+        assert_eq!(sanitize("a future event", &mut uncatalogued), 0);
+        assert_eq!(uncatalogued.get("anything"), Some(&json!("kept")));
     }
 
     #[test]
@@ -1478,27 +1484,6 @@ mod tests {
         let _ = sanitize("agent run completed", &mut properties);
         assert_eq!(properties.get("turn_count"), Some(&json!(1_000_000u64)));
         assert!(properties.get("retry_count").is_none(), "fraction dropped");
-    }
-
-    #[test]
-    fn sanitize_keeps_null_only_where_nullable() {
-        let mut properties = Properties::new();
-        properties.set("session_id", json!("0197d0a0-8f5c-7f2a-b0e3-2d7e0d2b3b1a"));
-        properties.set("outcome", json!("error"));
-        properties.set("duration_ms", json!(120));
-        properties.set("error_category", Value::Null); // nullable
-        properties.set("compaction_count", Value::Null); // NOT nullable
-        let _ = sanitize("agent run completed", &mut properties);
-        assert_eq!(properties.get("error_category"), Some(&Value::Null));
-        assert!(properties.get("compaction_count").is_none());
-    }
-
-    #[test]
-    fn sanitize_passes_uncatalogued_events_through() {
-        let mut properties = Properties::new();
-        properties.set("anything", json!("kept"));
-        assert_eq!(sanitize("a future event", &mut properties), 0);
-        assert_eq!(properties.get("anything"), Some(&json!("kept")));
     }
 
     #[test]

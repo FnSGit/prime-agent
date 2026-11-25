@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -61,7 +62,7 @@ class RlmSubagentRegistryTest(unittest.TestCase):
 
         self.assertEqual(subagents[0].status, "error")
 
-    def test_forwards_orchestrator_chosen_name_and_model_to_host(self) -> None:
+    def test_forwards_orchestrator_chosen_name_model_and_cwd_to_host(self) -> None:
         host_request = AsyncMock(
             return_value={
                 "rlm_child_id": "sub-a1b2c3d4",
@@ -77,6 +78,7 @@ class RlmSubagentRegistryTest(unittest.TestCase):
                     "check the API",
                     name="api-reviewer",
                     model="deepseek/deepseek-v4-flash",
+                    cwd="../api",
                 )
             )
 
@@ -87,12 +89,34 @@ class RlmSubagentRegistryTest(unittest.TestCase):
                 "kwargs": {
                     "name": "api-reviewer",
                     "model": "deepseek/deepseek-v4-flash",
+                    "cwd": "../api",
                 },
             },
         )
         self.assertEqual(result.rlm_child_id, "sub-a1b2c3d4")
         self.assertEqual(result.name, "api-reviewer")
         self.assertEqual(result.model, "deepseek/deepseek-v4-flash")
+
+    def test_forwards_the_decision_kind_to_host(self) -> None:
+        host_request = AsyncMock(
+            return_value={
+                "rlm_child_id": "sub-a1b2c3d4",
+                "name": "system-1",
+                "session_dir": "/tmp/parent/sub-a1b2c3d4",
+                "model": "prime-inference/clef",
+            }
+        )
+
+        with patch.object(rlm_module, "host_request", host_request):
+            asyncio.run(rlm_module.rlm.spawn("decide", name="system-1", kind="decision"))
+
+        host_request.assert_awaited_once_with(
+            "rlm.run",
+            {
+                "prompt": "decide",
+                "kwargs": {"name": "system-1", "kind": "decision"},
+            },
+        )
 
     def test_requires_an_explicit_child_name(self) -> None:
         host_request = AsyncMock()
@@ -109,6 +133,14 @@ class RlmSubagentRegistryTest(unittest.TestCase):
             with self.assertRaisesRegex(AttributeError, r"rlm\.run was renamed; spawn a child with: handle = await rlm\.spawn\("):
                 target.run
             self.assertFalse(hasattr(target, "run"))
+
+    def test_package_module_resolves_namespace_attributes(self) -> None:
+        self.assertIs(rlm_module.factory, rlm_module.rlm.factory)
+        self.assertTrue(inspect.iscoroutinefunction(rlm_module.factory.run))
+        self.assertEqual(rlm_module.factory.help(), importlib.import_module("rlm.factory").FACTORY_HELP)
+        session = object()
+        with patch.object(type(rlm_module.rlm), "session", session, create=True):
+            self.assertIs(rlm_module.session, session)
 
     def test_finds_authenticated_models_through_host(self) -> None:
         host_request = AsyncMock(

@@ -18,7 +18,7 @@ async def list_agents() -> dict[str, Any]:
 
 
 async def get_agent(target: str) -> dict[str, Any]:
-    """Read one live session summary by active id, session id/name, or suffix."""
+    """Read one family member's summary by active id, session id/name, or id suffix."""
     if not isinstance(target, str):
         raise TypeError(f"target must be str, got {type(target).__name__}")
     return await host_request("agent_observe.get", {"target": target})
@@ -29,10 +29,10 @@ async def recent_messages(
     limit: int = 8,
     max_chars: int = 800,
 ) -> dict[str, Any]:
-    """Read bounded recent message previews from an active session.
+    """Read bounded recent message previews from a family member's session.
 
     Args:
-        target: Active session id, session id/name, or unambiguous suffix.
+        target: Active session id, session id/name, or unambiguous id suffix.
         limit: Number of recent messages to return. Host validates 1-50.
         max_chars: Per-message preview size. Host validates 80-2000.
     """

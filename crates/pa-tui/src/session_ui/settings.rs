@@ -3,8 +3,8 @@
 //! fullscreen toggle is retired (the operator's 2026-09-28 ruling removed
 //! the setting and the command).
 use super::{
-    key_event_to_id, AgentView, DaemonCommand, Duration, KeyEvent, Map, PathBuf, Result, SessionUi,
-    StatusKind, Value, UI_REQUEST_TIMEOUT_MS,
+    key_event_to_id, AgentView, DaemonCommand, Duration, KeyEvent, Map, Overlay, PathBuf, Result,
+    SessionUi, StatusKind, Value, UI_REQUEST_TIMEOUT_MS,
 };
 
 /// The `/reload` task's report: the daemon reloaded the session's live
@@ -14,7 +14,7 @@ pub(crate) type ReloadNote = Result<(), String>;
 /// The question a pending confirm answers (callers await inline in TS;
 /// the TUI loop parks the continuation instead).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum PendingConfirm {
+pub(crate) enum PendingConfirm {
     /// `/import <path>`: replace the current session with the JSONL file.
     Import { path: String },
     /// The import's stored session cwd is gone: `Yes` retries with the
@@ -49,11 +49,13 @@ impl SessionUi {
             return;
         };
         view.editor.set_text("");
-        view.confirm = Some(crate::confirm::ConfirmPanel::yes_no(
-            "Import session",
-            &format!("Replace current session with {input_path}?"),
-        ));
-        self.pending_confirm = Some(PendingConfirm::Import { path: input_path });
+        view.overlay = Some(Overlay::Confirm {
+            panel: crate::confirm::ConfirmPanel::yes_no(
+                "Import session",
+                &format!("Replace current session with {input_path}?"),
+            ),
+            pending: PendingConfirm::Import { path: input_path },
+        });
         self.dirty = true;
     }
 
@@ -67,33 +69,26 @@ impl SessionUi {
             return Ok(());
         };
         let action = {
-            let Some(confirm) = view.confirm.as_mut() else {
+            let Some(Overlay::Confirm { panel, .. }) = view.overlay.as_mut() else {
                 return Ok(());
             };
-            let kb = view.editor.keybindings();
-            confirm.handle_key(kb, &id)
+            panel.handle_key(view.editor.keybindings(), &id)
         };
         match action {
             crate::confirm::ConfirmAction::None => {}
-            crate::confirm::ConfirmAction::Cancel => {
-                view.confirm = None;
-                self.pending_confirm = None;
-            }
+            crate::confirm::ConfirmAction::Cancel => view.overlay = None,
             crate::confirm::ConfirmAction::Select(option) => {
-                let pending = self.pending_confirm.take();
-                view.confirm = None;
-                if option == "Yes" {
-                    match pending {
-                        Some(PendingConfirm::Import { path }) => {
-                            self.run_import(&path, None, view).await?;
+                if let Some(Overlay::Confirm { pending, .. }) = view.overlay.take() {
+                    if option == "Yes" {
+                        match pending {
+                            PendingConfirm::Import { path } => {
+                                self.run_import(&path, None, view).await?;
+                            }
+                            PendingConfirm::ImportCwdFallback { path, fallback_cwd } => {
+                                self.run_import(&path, Some(&fallback_cwd), view).await?;
+                            }
+                            PendingConfirm::Update => self.spawn_update(view),
                         }
-                        Some(PendingConfirm::ImportCwdFallback { path, fallback_cwd }) => {
-                            self.run_import(&path, Some(&fallback_cwd), view).await?;
-                        }
-                        Some(PendingConfirm::Update) => {
-                            self.spawn_update(view);
-                        }
-                        None => {}
                     }
                 }
             }
@@ -143,15 +138,17 @@ impl SessionUi {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                    view.confirm = Some(crate::confirm::ConfirmPanel::yes_no(
-                        "Session cwd not found",
-                        &format!(
-                            "cwd from session file does not exist\n{session_cwd}\n\ncontinue in current cwd\n{fallback_cwd}"
+                    view.overlay = Some(Overlay::Confirm {
+                        panel: crate::confirm::ConfirmPanel::yes_no(
+                            "Session cwd not found",
+                            &format!(
+                                "cwd from session file does not exist\n{session_cwd}\n\ncontinue in current cwd\n{fallback_cwd}"
+                            ),
                         ),
-                    ));
-                    self.pending_confirm = Some(PendingConfirm::ImportCwdFallback {
-                        path: input_path.to_string(),
-                        fallback_cwd,
+                        pending: PendingConfirm::ImportCwdFallback {
+                            path: input_path.to_string(),
+                            fallback_cwd,
+                        },
                     });
                     self.dirty = true;
                 }
@@ -225,12 +222,16 @@ impl SessionUi {
         };
         // A missing settings seam keeps the TS defaults.
         if let Some(settings) = &settings {
+            values.compaction_threshold_percent = settings.compaction_threshold_percent();
             values.show_images = settings.show_images();
             values.auto_resize_images = settings.image_auto_resize();
             values.block_images = settings.block_images();
             values.skill_commands = settings.enable_skill_commands();
             values.builtin_skills = settings.enable_builtin_skills();
+            values.harness_refinements = settings.harness_refinements();
+            values.web_search_provider = settings.web_search_provider();
             values.hardware_cursor = settings.show_hardware_cursor();
+            values.emoji_shortcodes = settings.emoji_shortcodes();
             values.editor_padding = settings.editor_padding_x();
             values.autocomplete_max_visible = settings.autocomplete_max_visible();
             values.clear_on_shrink = settings.clear_on_shrink();
@@ -248,6 +249,9 @@ impl SessionUi {
             values.auto_resize_images = true;
             values.skill_commands = true;
             values.builtin_skills = true;
+            values.harness_refinements = true;
+            values.emoji_shortcodes = true;
+            values.web_search_provider = "serper".to_string();
             values.idle_eviction_minutes = "90".to_string();
             values.mermaid = "streaming".to_string();
             values.tree_filter_mode = "user-only".to_string();
@@ -262,7 +266,9 @@ impl SessionUi {
             .map(ToString::to_string)
             .collect();
         let rows = crate::settings_menu::settings_menu_rows(&values);
-        view.settings_menu = Some(crate::settings_menu::SettingsMenu::new(rows));
+        view.overlay = Some(Overlay::Settings(crate::settings_menu::SettingsMenu::new(
+            rows,
+        )));
         self.track_menu_opened("settings", "command");
         self.dirty = true;
     }
@@ -277,7 +283,7 @@ impl SessionUi {
             return Ok(());
         };
         let action = {
-            let Some(menu) = view.settings_menu.as_mut() else {
+            let Some(Overlay::Settings(menu)) = view.overlay.as_mut() else {
                 return Ok(());
             };
             menu.handle_key(&id, view.editor.keybindings())
@@ -287,7 +293,7 @@ impl SessionUi {
             crate::settings_menu::SettingsMenuAction::None
             | crate::settings_menu::SettingsMenuAction::SubmenuClosed => {}
             crate::settings_menu::SettingsMenuAction::Cancel => {
-                view.settings_menu = None;
+                view.overlay = None;
             }
             crate::settings_menu::SettingsMenuAction::PreviewTheme { name } => {
                 // Switch live without persisting.
@@ -309,6 +315,17 @@ impl SessionUi {
     /// the settings seam for persisted preferences.
     async fn apply_settings_change(&mut self, id: &str, value: &str, view: &mut AgentView) {
         match id {
+            "autocompact-threshold" => {
+                if let Some(settings) = &self.client_settings {
+                    let result = value
+                        .parse::<f64>()
+                        .map_err(anyhow::Error::from)
+                        .and_then(|percent| settings.set_compaction_threshold_percent(percent));
+                    if let Err(error) = result {
+                        self.error_row(&format!("{error:#}"), view);
+                    }
+                }
+            }
             "autocompact" => {
                 self.daemon_switch(
                     DaemonCommand::SetAutoCompaction {
@@ -365,14 +382,28 @@ impl SessionUi {
                 view.editor.set_autocomplete_skill_commands(skills);
                 self.dirty = true;
             }
+            "harness-refinements" => {
+                self.persist_bool_setting(
+                    |settings, enabled| settings.set_harness_refinements(enabled),
+                    value,
+                    view,
+                );
+            }
+            "web-search-provider" => {
+                if let Some(settings) = &self.client_settings {
+                    if let Err(error) = settings.set_web_search_provider(value) {
+                        self.error_row(&format!("{error:#}"), view);
+                    }
+                }
+            }
             "builtin-skills" => {
                 self.persist_bool_setting(
                     |settings, enabled| settings.set_enable_builtin_skills(enabled),
                     value,
                     view,
                 );
-                // The toggle takes effect after a reload.
-                let _ = self.handle_reload_command(view);
+                // The toggle takes effect after a reload; the menu stays open while it runs.
+                self.start_reload();
             }
             "show-hardware-cursor" => {
                 // A failed persist changes nothing: the live flag flips only when the
@@ -386,6 +417,15 @@ impl SessionUi {
                 // The very next frame shows or hides the hardware cursor at the focused
                 // caret.
                 view.show_hardware_cursor = value == "true";
+            }
+            "emoji-shortcodes" => {
+                if let Some(settings) = &self.client_settings {
+                    if let Err(error) = settings.set_emoji_shortcodes(value == "true") {
+                        self.error_row(&format!("{error:#}"), view);
+                        return;
+                    }
+                }
+                view.editor.set_emoji_shortcodes(value == "true");
             }
             "editor-padding" => {
                 if let Some(settings) = &self.client_settings {
@@ -753,10 +793,17 @@ impl SessionUi {
         }
     }
 
-    /// The reload box replaces the editor while the daemon reload runs; the
-    /// run loop folds the outcome in when it lands.
+    /// `/reload`: the reload box replaces the editor while the daemon reload runs.
     pub(super) fn handle_reload_command(&mut self, view: &mut AgentView) -> Result<()> {
-        view.reload_box = Some("Reloading keybindings, skills, prompts, themes...".to_string());
+        view.overlay = Some(Overlay::Reload(
+            "Reloading keybindings, skills, prompts, themes...".to_string(),
+        ));
+        self.start_reload();
+        Ok(())
+    }
+
+    /// Start the daemon reload; the run loop folds the outcome in when it lands.
+    fn start_reload(&mut self) {
         self.dirty = true;
         let client = self.client.clone();
         let active_session_id = self.active_session_id.clone();
@@ -774,14 +821,13 @@ impl SessionUi {
             let _ = notes.send(outcome);
         });
         self.reload = Some(task);
-        Ok(())
     }
 
     /// Drop the box, re-read the user keybindings and theme, refresh the model
     /// catalog, and surface the status row.
     pub(crate) async fn apply_reload_outcome(&mut self, outcome: ReloadNote, view: &mut AgentView) {
         self.reload = None;
-        view.reload_box = None;
+        view.close_overlay_if(|overlay| matches!(overlay, Overlay::Reload(_)));
         match outcome {
             Ok(()) => {
                 // The view rebuilds from the durable session store, so client status rows

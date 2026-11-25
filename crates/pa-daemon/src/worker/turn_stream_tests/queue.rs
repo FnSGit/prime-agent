@@ -84,7 +84,7 @@ fn queued_prompt(message: &str, policy: TurnPolicy) -> QueuedItem {
 
 /// Run the pump until both lanes drain (the runner keeps idling; the
 /// task is aborted by the test's end).
-async fn drain_pump(core: &Arc<Mutex<SessionCore>>, work_notify: &Arc<Notify>) {
+async fn drain_pump(core: &Arc<Mutex<SessionCore>>, work_notify: &Arc<crate::worker::WorkNotify>) {
     work_notify.notify_one();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -411,11 +411,7 @@ async fn follow_up_mode_all_batches_the_follow_up_lane() {
 
 /// Kevin's acceptance case: ALL visible steers send together; the follow-up runs once idle.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
 async fn abort_and_send_queued_delivers_the_steering_batch_then_the_follow_ups() {
-    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = std::env::temp_dir().join(format!("pa-worker-abort-send-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = WorkerConfig {
@@ -478,10 +474,8 @@ async fn abort_and_send_queued_delivers_the_steering_batch_then_the_follow_ups()
             .as_ref()
             .and_then(|engine| {
                 engine
-                    .turn_agent
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
+                    .built_handles()
+                    .map(|handles| handles.turn_agent.clone())
             })
             .and_then(|agent| agent.signal())
             .is_some();
@@ -603,11 +597,7 @@ async fn abort_and_send_queued_delivers_the_steering_batch_then_the_follow_ups()
 
 /// Answers immediately while both the aborted turn and the follow-up's reply are held.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // the faux registry is process-global: the guard must span the async flow
 async fn abort_and_send_queued_acks_before_the_follow_up_delivery() {
-    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = std::env::temp_dir().join(format!("pa-worker-abort-ack-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let config = WorkerConfig {
@@ -762,4 +752,609 @@ async fn abort_and_send_queued_acks_before_the_follow_up_delivery() {
         "the follow-up row survived the bare abort exactly once: {texts:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[derive(Default)]
+struct NoteWitnessEngine {
+    note: Mutex<Option<String>>,
+    note_at_notice_turn: Mutex<Option<String>>,
+    withdraw_follow_up_after_end: Mutex<Option<Arc<Mutex<SessionCore>>>>,
+    turns: std::sync::atomic::AtomicUsize,
+}
+
+impl SessionEngine for NoteWitnessEngine {
+    fn progress_note(&self) -> Option<String> {
+        self.note.lock().unwrap().clone()
+    }
+
+    fn clear_progress_note(&self) {
+        *self.note.lock().unwrap() = None;
+    }
+
+    fn run_prompt(
+        &self,
+        _prompt_index: usize,
+        _request: PromptRequest,
+        _aborted: &dyn Fn() -> bool,
+        emit: &mut dyn FnMut(EngineEvent) -> bool,
+    ) {
+        emit(EngineEvent::AgentStart);
+        if self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            // Turn one: the mid-run note acceptance (the model's
+            // `rlm.progress_note`).
+            *self.note.lock().unwrap() = Some("halfway through the review".to_string());
+        } else {
+            *self.note_at_notice_turn.lock().unwrap() = self.note.lock().unwrap().clone();
+        }
+        emit(EngineEvent::AgentEnd {
+            messages: Vec::new(),
+            aborted: false,
+        });
+        if let Some(core) = self.withdraw_follow_up_after_end.lock().unwrap().take() {
+            // A queue withdrawal can land after AgentEnd but before the runner settles.
+            core.lock().unwrap().follow_up.clear();
+        }
+    }
+
+    fn run_side_question(
+        &self,
+        _request: SideQuestionRequest,
+        _signal: &pa_agent::abort::AbortSignal,
+        _sink: &pa_core::session_engine::side_question::SideQuestionSink,
+    ) -> SideQuestionOutcome {
+        SideQuestionOutcome::Failed {
+            answer: String::new(),
+            error: "unsupported".to_string(),
+        }
+    }
+
+    fn run_compaction(
+        &self,
+        _request: CompactionRequest,
+        _signal: &pa_agent::abort::AbortSignal,
+    ) -> CompactionOutcome {
+        CompactionOutcome::Skipped {
+            message: "nothing to compact".to_string(),
+        }
+    }
+
+    fn run_branch_summary(
+        &self,
+        _request: crate::engine::BranchSummaryRequest,
+        _signal: &pa_agent::abort::AbortSignal,
+    ) -> crate::engine::BranchSummaryOutcome {
+        crate::engine::BranchSummaryOutcome::Failed {
+            error: "unsupported".to_string(),
+        }
+    }
+
+    fn rebuild_session_context(
+        &self,
+        _branch_entries: Vec<pa_types::session::FileEntry>,
+        _goal_reload: pa_core::session_engine::goal_driver::GoalBranchReload,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// The queued async bash completion's delivery keeps the note its cut run
+/// accepted mid-flight; the note clears only at the run's true end.
+#[tokio::test]
+async fn the_async_completion_notice_delivery_keeps_the_live_note() {
+    let engine = Arc::new(NoteWitnessEngine::default());
+    let runner = burst_runner(engine.clone());
+    // The busy-session row `admit_kernel_notice` queues.
+    runner
+        .core
+        .lock()
+        .unwrap()
+        .steering
+        .push_back(queued_prompt(
+            "[bash-done pid:4321 exit:137]",
+            TurnPolicy::Queued,
+        ));
+    // Turn one's end is the steering cut; the runner then hands the queued
+    // notice its own turn.
+    runner
+        .run_turn(
+            engine.clone(),
+            Lane::Steering,
+            vec![queued_prompt("review the installer", TurnPolicy::Queued)],
+        )
+        .await;
+    assert_eq!(
+        engine.note.lock().unwrap().as_deref(),
+        Some("halfway through the review"),
+        "the steering-cut run end must keep the live note"
+    );
+    let notice = runner.core.lock().unwrap().steering.pop_front();
+    runner
+        .run_turn(
+            engine.clone(),
+            Lane::Steering,
+            vec![notice.expect("the queued notice row")],
+        )
+        .await;
+    assert_eq!(
+        engine.note_at_notice_turn.lock().unwrap().as_deref(),
+        Some("halfway through the review"),
+        "the notice's turn must still see the live note"
+    );
+    assert!(
+        engine.note.lock().unwrap().is_none(),
+        "the lanes-empty run end cleared the note"
+    );
+}
+
+/// An ordinary queued follow-up retains the note until its own final end, like steering.
+#[tokio::test]
+async fn queued_follow_up_keeps_the_note_until_its_final_end() {
+    let engine = Arc::new(NoteWitnessEngine::default());
+    let runner = burst_runner(engine.clone());
+    runner
+        .core
+        .lock()
+        .unwrap()
+        .follow_up
+        .push_back(queued_prompt(
+            "also check the deployment",
+            TurnPolicy::Queued,
+        ));
+    runner
+        .run_turn(
+            engine.clone(),
+            Lane::Steering,
+            vec![queued_prompt("review", TurnPolicy::Queued)],
+        )
+        .await;
+    assert_eq!(
+        engine.progress_note().as_deref(),
+        Some("halfway through the review")
+    );
+    let follow_up = runner.core.lock().unwrap().follow_up.pop_front().unwrap();
+    runner
+        .run_turn(engine.clone(), Lane::FollowUp, vec![follow_up])
+        .await;
+    assert_eq!(
+        engine.note_at_notice_turn.lock().unwrap().as_deref(),
+        Some("halfway through the review")
+    );
+    assert_eq!(engine.progress_note(), None);
+}
+
+/// `AgentEnd`'s queued-work decision must be reconsidered if the queue is withdrawn
+/// before the final idle snapshot.
+#[tokio::test]
+async fn withdrawing_follow_up_after_agent_end_clears_the_note_at_settle() {
+    let engine = Arc::new(NoteWitnessEngine::default());
+    let runner = burst_runner(engine.clone());
+    runner
+        .core
+        .lock()
+        .unwrap()
+        .follow_up
+        .push_back(queued_prompt("withdraw this follow-up", TurnPolicy::Queued));
+    *engine.withdraw_follow_up_after_end.lock().unwrap() = Some(Arc::clone(&runner.core));
+    runner
+        .run_turn(
+            engine.clone(),
+            Lane::Steering,
+            vec![queued_prompt("review", TurnPolicy::Queued)],
+        )
+        .await;
+    assert!(!runner.core.lock().unwrap().busy);
+    assert_eq!(
+        engine.progress_note(),
+        None,
+        "idle must not retain the canceled work's note"
+    );
+}
+
+/// Clearing queued work while a run is active preserves its note, but clearing the
+/// last queued work after the run settled ends the retained note's lifetime.
+#[tokio::test]
+async fn clearing_an_idle_queue_drops_the_retained_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(NoteWitnessEngine::default());
+    let mut worker = Worker::new(
+        WorkerConfig {
+            socket_path: dir.path().join("worker.sock"),
+            supervisor_socket_path: dir.path().join("supervisor.sock"),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "note-session".to_string(),
+            agent_dir: dir.path().join("agent"),
+            recovery_journal_path: dir.path().join("recovery.jsonl"),
+            telemetry_disabled: Some(true),
+            script: Some(json!({ "responses": ["unused"] })),
+        },
+        None,
+    );
+    worker.engine = engine.clone();
+    *engine.note.lock().unwrap() = Some("checking deployment".to_string());
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.created = true;
+        core.busy = true;
+        core.follow_up
+            .push_back(queued_prompt("queued", TurnPolicy::Queued));
+    }
+    assert!(worker.dispatch("clear_queue", &json!({})).await.success);
+    assert_eq!(
+        engine.progress_note().as_deref(),
+        Some("checking deployment")
+    );
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.busy = false;
+        core.queued_input_suspended = true;
+        core.follow_up
+            .push_back(queued_prompt("queued", TurnPolicy::Queued));
+    }
+    assert!(worker.dispatch("clear_queue", &json!({})).await.success);
+    assert_eq!(
+        engine.progress_note(),
+        None,
+        "no remaining work can replace the stale note"
+    );
+}
+
+/// An engine whose run parks mid-flight until the worker aborts, then
+/// ends with the abort gate armed and no `agent_end` of its own: the
+/// user stop that cuts the run at the source.
+#[derive(Default)]
+struct AbortSwallowedEngine {
+    note: Mutex<Option<String>>,
+    clear_gate: Option<Arc<NoteClearGate>>,
+}
+
+struct NoteClearGate {
+    entered: Notify,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl SessionEngine for AbortSwallowedEngine {
+    fn progress_note(&self) -> Option<String> {
+        self.note.lock().unwrap().clone()
+    }
+
+    fn clear_progress_note(&self) {
+        if let Some(gate) = &self.clear_gate {
+            gate.entered.notify_one();
+            gate.release
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the test releases the note clear");
+        }
+        *self.note.lock().unwrap() = None;
+    }
+
+    fn run_prompt(
+        &self,
+        _prompt_index: usize,
+        _request: PromptRequest,
+        aborted: &dyn Fn() -> bool,
+        emit: &mut dyn FnMut(EngineEvent) -> bool,
+    ) {
+        emit(EngineEvent::AgentStart);
+        // The mid-run note acceptance (the model's `rlm.progress_note`).
+        *self.note.lock().unwrap() = Some("halfway through the review".to_string());
+        // Park until the user's stop lands mid-flight.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !aborted() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the test never aborted the run"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // The stop cuts the next event before it settles: the abort gate
+        // arms on the sighting and the run ends with NO `agent_end`.
+        emit(EngineEvent::AgentStart);
+    }
+
+    fn run_side_question(
+        &self,
+        _request: SideQuestionRequest,
+        _signal: &pa_agent::abort::AbortSignal,
+        _sink: &pa_core::session_engine::side_question::SideQuestionSink,
+    ) -> SideQuestionOutcome {
+        SideQuestionOutcome::Failed {
+            answer: String::new(),
+            error: "unsupported".to_string(),
+        }
+    }
+
+    fn run_compaction(
+        &self,
+        _request: CompactionRequest,
+        _signal: &pa_agent::abort::AbortSignal,
+    ) -> CompactionOutcome {
+        CompactionOutcome::Skipped {
+            message: "nothing to compact".to_string(),
+        }
+    }
+
+    fn run_branch_summary(
+        &self,
+        _request: crate::engine::BranchSummaryRequest,
+        _signal: &pa_agent::abort::AbortSignal,
+    ) -> crate::engine::BranchSummaryOutcome {
+        crate::engine::BranchSummaryOutcome::Failed {
+            error: "unsupported".to_string(),
+        }
+    }
+
+    fn rebuild_session_context(
+        &self,
+        _branch_entries: Vec<pa_types::session::FileEntry>,
+        _goal_reload: pa_core::session_engine::goal_driver::GoalBranchReload,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// The abort gate swallows the stopped run's `agent_end`, but the pane
+/// still settles idle at the same settle: the note — the roster
+/// summary's `progressNote` source — must not survive that idle settle.
+#[tokio::test]
+async fn an_aborted_run_clears_the_note_at_its_idle_settle() {
+    let engine = Arc::new(AbortSwallowedEngine::default());
+    let runner = burst_runner(engine.clone());
+    let core = std::sync::Arc::clone(&runner.core);
+    let engine_for_turn = std::sync::Arc::clone(&engine);
+    let turn = tokio::spawn(async move {
+        runner
+            .run_turn(
+                engine_for_turn,
+                Lane::Steering,
+                vec![queued_prompt("review the gate", TurnPolicy::Queued)],
+            )
+            .await;
+    });
+    // The run parks mid-flight: wait for the note, then stop the run.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while engine.progress_note().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run never set its note"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    core.lock().unwrap().abort_requested = true;
+    let _ = turn.await;
+    assert!(
+        engine.note.lock().unwrap().is_none(),
+        "the aborted run's idle settle must clear the note"
+    );
+}
+
+/// Pause the note clear so a roster reader can attempt the same
+/// core-then-note snapshot as `SummaryInputs`. Idle must never become
+/// observable with the stopped run's note still present.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_aborted_run_never_exposes_an_idle_summary_with_its_old_note() {
+    let (release, receiver) = std::sync::mpsc::channel();
+    let gate = Arc::new(NoteClearGate {
+        entered: Notify::new(),
+        release: Mutex::new(receiver),
+    });
+    let engine = Arc::new(AbortSwallowedEngine {
+        note: Mutex::new(None),
+        clear_gate: Some(Arc::clone(&gate)),
+    });
+    let runner = burst_runner(engine.clone());
+    let core = Arc::clone(&runner.core);
+    core.lock().unwrap().busy = true;
+    let engine_for_turn = Arc::clone(&engine);
+    let turn = tokio::spawn(async move {
+        runner
+            .run_turn(
+                engine_for_turn,
+                Lane::Steering,
+                vec![queued_prompt("review the gate", TurnPolicy::Queued)],
+            )
+            .await;
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while engine.progress_note().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the run publishes a progress note");
+    core.lock().unwrap().abort_requested = true;
+    tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+        .await
+        .expect("the aborted run reaches its note clear");
+    let exposed_stale_idle = match core.try_lock() {
+        Ok(core) => !core.busy && engine.progress_note().is_some(),
+        Err(std::sync::TryLockError::WouldBlock) => false,
+        Err(error) => panic!("the summary lock is poisoned: {error}"),
+    };
+    release.send(()).unwrap();
+    turn.await.unwrap();
+    assert!(
+        !exposed_stale_idle,
+        "an idle roster snapshot could retain the aborted run's progress note"
+    );
+    assert!(!core.lock().unwrap().busy);
+    assert!(engine.progress_note().is_none());
+}
+
+mod withdrawal;
+
+/// The runner-level durable pin for the inbox read's drain seam: a
+/// turn whose cell reads the inbox (`rlm.inbox.read` drained the store
+/// and fired the sweep at the drain) parks with the journal settled —
+/// the queued reminder never wakes a second turn, the durable snapshot
+/// loses it while the turn still runs (a crash in that window revives no
+/// stale wake), and the parked verdict reads idle.
+struct DrainSweepEngine {
+    core: std::sync::OnceLock<Arc<Mutex<SessionCore>>>,
+    recovery: std::sync::OnceLock<Arc<Mutex<Option<WorkerRecoveryJournal>>>>,
+    arrivals: pa_core::session_engine::inbox::InboxArrivals,
+    inbox: Arc<pa_core::session_engine::inbox::SessionInbox>,
+    prompts: Mutex<Vec<String>>,
+    mid_turn_snapshot: Mutex<Vec<crate::journal::WorkerQueueItemRecord>>,
+}
+
+impl SessionEngine for DrainSweepEngine {
+    fn run_prompt(
+        &self,
+        _prompt_index: usize,
+        request: PromptRequest,
+        _aborted: &dyn Fn() -> bool,
+        emit: &mut dyn FnMut(EngineEvent) -> bool,
+    ) {
+        self.prompts.lock().unwrap().push(request.message);
+        // The kernel's rlm.inbox.read drained the store inside the cell
+        // and fired the drain seam: the sweep runs inside the read's own
+        // host handler.
+        self.inbox.drain();
+        withdraw_drained_inbox_notice(
+            self.recovery.get().expect("the runner's recovery"),
+            self.core.get().expect("the runner's core"),
+            &self.arrivals,
+            &self.inbox,
+            self,
+        );
+        // The durable snapshot read back MID-TURN (the crash window):
+        // the swept reminder must already be gone from the journal.
+        let snapshot = {
+            let recovery = self.recovery.get().expect("the runner's recovery");
+            let recovery = recovery.lock().unwrap();
+            recovery
+                .as_ref()
+                .expect("the runner's journal")
+                .latest_queue_snapshot("burst-session")
+                .map(|(steering, _, _)| steering)
+                .unwrap_or_default()
+        };
+        *self.mid_turn_snapshot.lock().unwrap() = snapshot;
+        emit(EngineEvent::Done(Ok(())));
+    }
+
+    fn run_side_question(
+        &self,
+        _request: SideQuestionRequest,
+        _signal: &pa_agent::abort::AbortSignal,
+        _sink: &pa_core::session_engine::side_question::SideQuestionSink,
+    ) -> SideQuestionOutcome {
+        SideQuestionOutcome::Failed {
+            answer: String::new(),
+            error: "unsupported".to_string(),
+        }
+    }
+
+    fn run_compaction(
+        &self,
+        _request: CompactionRequest,
+        _signal: &pa_agent::abort::AbortSignal,
+    ) -> CompactionOutcome {
+        CompactionOutcome::Skipped {
+            message: "nothing to compact".to_string(),
+        }
+    }
+
+    fn run_branch_summary(
+        &self,
+        _request: crate::engine::BranchSummaryRequest,
+        _signal: &pa_agent::abort::AbortSignal,
+    ) -> crate::engine::BranchSummaryOutcome {
+        crate::engine::BranchSummaryOutcome::Failed {
+            error: "unsupported".to_string(),
+        }
+    }
+
+    fn rebuild_session_context(
+        &self,
+        _branch_entries: Vec<pa_types::session::FileEntry>,
+        _goal_reload: pa_core::session_engine::goal_driver::GoalBranchReload,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_draining_turn_sweeps_the_queued_reminder_and_parks_settled() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal_path = dir.path().join("recovery.jsonl");
+    let inbox = Arc::new(pa_core::session_engine::inbox::SessionInbox::in_memory());
+    // The unread message a reminder row announces.
+    inbox.push(
+        pa_core::session_engine::inbox::InboxNotice {
+            class: pa_types::inbox_notice::INBOX_CLASS_BASH_DONE,
+            sender: Some("the command".to_string()),
+            text: "the command finished".to_string(),
+            meta: json!({ "pid": 4321 }),
+        },
+        1_000,
+    );
+    let engine = Arc::new(DrainSweepEngine {
+        core: std::sync::OnceLock::new(),
+        recovery: std::sync::OnceLock::new(),
+        arrivals: pa_core::session_engine::inbox::InboxArrivals::default(),
+        inbox: Arc::clone(&inbox),
+        prompts: Mutex::new(Vec::new()),
+        mid_turn_snapshot: Mutex::new(Vec::new()),
+    });
+    let runner = burst_runner(Arc::clone(&engine) as Arc<dyn SessionEngine>);
+    // The runner's journal: the admission and the sweep checkpoint against
+    // the same durable file.
+    *runner.recovery.lock().unwrap() = Some(WorkerRecoveryJournal::open(&journal_path).unwrap());
+    let _ = engine.core.set(Arc::clone(&runner.core));
+    let _ = engine.recovery.set(Arc::clone(&runner.recovery));
+    {
+        let mut core = runner.core.lock().unwrap();
+        // The human turn runs first; the reminder row parks behind it.
+        core.steering
+            .push_back(queued_prompt("drain the inbox", TurnPolicy::Queued));
+    }
+    admit_inbox_reminder(
+        &runner.recovery,
+        &runner.core,
+        &runner.work_notify,
+        &inbox,
+        || false,
+        None,
+    );
+    let running = tokio::spawn(async move { runner.run().await });
+    // The park readiness: exactly one prompt ran (the reminder never
+    // woke) and the runner parked idle with empty lanes.
+    let parked = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            {
+                let engine_prompts = engine.prompts.lock().unwrap().len();
+                let core = engine
+                    .core
+                    .get()
+                    .expect("the runner's core")
+                    .lock()
+                    .unwrap();
+                let empty = core.steering.is_empty() && core.follow_up.is_empty();
+                if engine_prompts == 1 && !core.busy && empty {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    running.abort();
+    parked.expect("the runner never parked after the draining turn");
+    assert_eq!(
+        *engine.prompts.lock().unwrap(),
+        vec!["drain the inbox".to_string()],
+        "the human turn ran; the swept reminder never woke a second turn"
+    );
+    assert!(
+        engine.mid_turn_snapshot.lock().unwrap().is_empty(),
+        "the durable snapshot lost the swept reminder while the turn still ran"
+    );
+    assert!(
+        !WorkerRecoveryJournal::read_interrupted(&journal_path),
+        "the parked verdict reads idle: no swept row revives as interrupted work"
+    );
 }

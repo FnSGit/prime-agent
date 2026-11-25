@@ -53,6 +53,7 @@ fn kill_worker(pid: u32) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn process_alive(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
         let rest = stat
@@ -63,6 +64,7 @@ fn process_alive(pid: u32) -> bool {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn child_pids_of(ppid: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     let entries = std::fs::read_dir("/proc").expect("read /proc");
@@ -86,6 +88,30 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
         }
     }
     pids
+}
+
+/// The children of `ppid` without `/proc`: one `ps` listing of every pid's parent.
+#[cfg(not(target_os = "linux"))]
+fn child_pids_of(parent_pid: u32) -> Vec<u32> {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .expect("run ps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let parent: u32 = fields.next()?.parse().ok()?;
+            (parent == parent_pid).then_some(pid)
+        })
+        .collect()
+}
+
+/// Liveness without `/proc`: the platform probe, which also reads zombies as dead.
+#[cfg(not(target_os = "linux"))]
+fn process_alive(pid: u32) -> bool {
+    pa_types::platform::process::is_process_alive(pid).unwrap_or(false)
 }
 
 fn graceful_shutdown(socket: &Path) {
@@ -169,9 +195,12 @@ fn spawn_supervisor(dir: &Path) -> Supervisor {
 }
 
 /// A stub `gh` binary: `auth status` succeeds, `gist create` requires the
-/// upload file and prints a gist URL. No upload ever leaves the box.
-fn write_stub_gh(dir: &Path) {
-    let script = r#"#!/bin/bash
+/// upload file, holds until `release` exists, and prints a gist URL. No
+/// upload ever leaves the box.
+fn write_stub_gh(dir: &Path, release: &Path) {
+    let release = release.display();
+    let script = format!(
+        r#"#!/bin/bash
 case "$1" in
   auth) exit 0 ;;
   gist)
@@ -179,11 +208,13 @@ case "$1" in
       echo "gist: upload file missing" >&2
       exit 1
     fi
+    while [ ! -f "{release}" ]; do sleep 0.01; done
     echo "https://gist.github.com/testuser/abc123"
     ;;
   *) echo "unsupported: $1" >&2; exit 1 ;;
 esac
-"#;
+"#
+    );
     std::fs::write(dir.join("gh"), script).expect("write stub gh");
     make_executable(&dir.join("gh"));
 }
@@ -208,7 +239,16 @@ async fn tui_export_and_share_surface() {
     // The stub gh on PATH (isolated bin dir, PATH restored after the run).
     let stub_dir = dir.path().join("bin");
     std::fs::create_dir_all(&stub_dir).expect("bin dir");
-    write_stub_gh(&stub_dir);
+    // The upload holds until the loader frame was captured: a stub that
+    // answers at once can settle before the loader ever paints.
+    let release = dir.path().join("gist-release");
+    write_stub_gh(&stub_dir, &release);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let releaser = std::thread::spawn(move || {
+        if release_rx.recv().is_ok() {
+            std::fs::write(&release, "").expect("release the stub upload");
+        }
+    });
     let previous_path = std::env::var("PATH").unwrap_or_default();
     let previous_viewer_url = std::env::var("PI_SHARE_VIEWER_URL").ok();
     std::env::set_var("PATH", format!("{}:{}", stub_dir.display(), previous_path));
@@ -296,7 +336,15 @@ async fn tui_export_and_share_surface() {
             pa_tui::interactive::HeadlessStep::Submit(format!("/export {}", html_out.display())),
             pa_tui::interactive::HeadlessStep::Submit(format!("/export {}", jsonl_out.display())),
             pa_tui::interactive::HeadlessStep::Submit("/share".to_string()),
-            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 5_000 },
+            pa_tui::interactive::HeadlessStep::WaitRender {
+                needle: "Creating gist...".to_string(),
+                timeout_ms: 10_000,
+            },
+            pa_tui::interactive::HeadlessStep::Timestamp(release_tx),
+            pa_tui::interactive::HeadlessStep::WaitGone {
+                needle: "Creating gist...".to_string(),
+                timeout_ms: 10_000,
+            },
             pa_tui::interactive::HeadlessStep::Submit("/share now".to_string()),
         ],
         width: 100,
@@ -306,6 +354,7 @@ async fn tui_export_and_share_surface() {
         pa_tui::interactive::run_interactive(options, pa_tui::interactive::UiMode::Headless(plan))
             .await
             .expect("interactive run");
+    releaser.join().expect("releaser thread");
 
     std::env::set_var("PATH", previous_path);
     match previous_viewer_url {
@@ -351,10 +400,10 @@ async fn tui_export_and_share_surface() {
     // `state.tools` in the live-session export).
     let tools = data["tools"].as_array().expect("tools section");
     assert!(
-        tools.iter().any(|tool| tool["name"] == "ipython"
+        tools.iter().any(|tool| tool["name"] == "python_repl"
             && tool["description"].is_string()
             && tool["parameters"].is_object()),
-        "ipython contract in export tools: {data}"
+        "python_repl contract in export tools: {data}"
     );
     // No custom tool ran: the pre-render section is omitted, not null.
     assert!(

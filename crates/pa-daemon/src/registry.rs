@@ -69,14 +69,27 @@ impl WorkerReply {
     }
 }
 
-/// Command-route liveness for one resident worker: `connected` tracks the
-/// live socket, `session_ready` marks the create boundary a client command
-/// must never overtake, `retired` marks a worker that will not come back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerEnd {
+    /// Supervised: an exit is a crash the monitor relaunches.
+    Live,
+    /// An intentional stop is under way: the exit is not a crash.
+    Stopping,
+    /// Retired by the stop: it will not come back.
+    Stopped,
+    /// Retired by the crash path's give-up.
+    GaveUp,
+}
+
+/// Command-route liveness for one resident worker: `connected` mirrors the
+/// installed command channel, `session_ready` marks the create boundary a
+/// client command must never overtake, `end` says whether the worker is
+/// still supervised. Written only through [`ResidentWorker::transition`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WorkerRouteState {
     pub(crate) connected: bool,
     pub(crate) session_ready: bool,
-    pub(crate) retired: bool,
+    pub(crate) end: WorkerEnd,
 }
 
 impl WorkerRouteState {
@@ -84,9 +97,72 @@ impl WorkerRouteState {
         Self {
             connected: false,
             session_ready: false,
-            retired: false,
+            end: WorkerEnd::Live,
         }
     }
+
+    /// The worker will not come back: routes fail fast instead of parking.
+    pub(crate) fn retired(self) -> bool {
+        match self.end {
+            WorkerEnd::Stopped | WorkerEnd::GaveUp => true,
+            WorkerEnd::Live | WorkerEnd::Stopping => false,
+        }
+    }
+
+    /// An intentional stop owns the worker's exit.
+    pub(crate) fn stop_requested(self) -> bool {
+        match self.end {
+            WorkerEnd::Stopping | WorkerEnd::Stopped => true,
+            WorkerEnd::Live | WorkerEnd::GaveUp => false,
+        }
+    }
+
+    fn apply(&mut self, transition: WorkerTransition) {
+        match transition {
+            WorkerTransition::ConnectionInstalled => self.connected = true,
+            WorkerTransition::ConnectionLost => self.connected = false,
+            WorkerTransition::SessionReady => self.session_ready = true,
+            WorkerTransition::SessionReplaying => self.session_ready = false,
+            WorkerTransition::RequestStop => {
+                self.end = match self.end {
+                    WorkerEnd::Live | WorkerEnd::Stopping => WorkerEnd::Stopping,
+                    WorkerEnd::Stopped | WorkerEnd::GaveUp => WorkerEnd::Stopped,
+                }
+            }
+            // A retired worker stays retired.
+            WorkerTransition::ResumeStopped => {
+                self.end = match self.end {
+                    WorkerEnd::Stopping => WorkerEnd::Live,
+                    end @ (WorkerEnd::Live | WorkerEnd::Stopped | WorkerEnd::GaveUp) => end,
+                }
+            }
+            WorkerTransition::RetireStopped => self.end = WorkerEnd::Stopped,
+            // A stop that raced the give-up keeps the stop's end.
+            WorkerTransition::GiveUp => {
+                self.end = match self.end {
+                    WorkerEnd::Live | WorkerEnd::GaveUp => WorkerEnd::GaveUp,
+                    WorkerEnd::Stopping | WorkerEnd::Stopped => WorkerEnd::Stopped,
+                }
+            }
+        }
+    }
+}
+
+/// The connection pair is written only by the channel install/loss, under the
+/// channel lock and epoch fence.
+#[derive(Clone, Copy)]
+pub(crate) enum WorkerTransition {
+    ConnectionInstalled,
+    ConnectionLost,
+    /// The (re)created session answered: client commands may run.
+    SessionReady,
+    /// A replacement's create replay is pending.
+    SessionReplaying,
+    RequestStop,
+    /// An abandoned update stop hands the worker back to supervision.
+    ResumeStopped,
+    RetireStopped,
+    GiveUp,
 }
 
 /// One resident session worker: the durable identity (descriptor) plus the
@@ -95,6 +171,8 @@ pub(crate) struct ResidentWorker {
     pub(crate) worker_id: String,
     pub(crate) descriptor: Mutex<DaemonWorkerDescriptor>,
     pub(crate) descriptor_path: PathBuf,
+    /// Fresh creates seed their family before replying; adopted workers seed on registration.
+    pub(crate) roster_family_seed_owned_by_create: AtomicBool,
     /// The worker's command pump channel, bounded at
     /// [`crate::backpressure::WORKER_INFLIGHT_CAPACITY`]: admission precedes
     /// enqueue, so the queue and in-flight set share one bound.
@@ -103,13 +181,21 @@ pub(crate) struct ResidentWorker {
     /// this empty is refused with the typed overload error; supervisor-internal routes wait.
     pub(crate) inflight: Arc<tokio::sync::Semaphore>,
     pub(crate) pending: Mutex<HashMap<String, tokio::sync::oneshot::Sender<WorkerReply>>>,
-    pub(crate) intentional_stop: AtomicBool,
     pub(crate) consecutive_failures: AtomicU32,
     /// Unix-millis spawn time of the current child (0 for an adopted pid): only a lifetime past the
     /// stable window earns a counter reset (spawn-dies-fast churn accumulates).
     pub(crate) spawned_at_ms: AtomicU64,
+    /// The resident's monitor generation: the latest `spawn_monitor` claim.
+    /// A watch whose generation was superseded returns at the exit check
+    /// instead of running crash bookkeeping over the new owner's process.
+    pub(crate) monitor_epoch: AtomicU64,
     /// The worker advertised `direct_peer_transport` in its `worker_auth` response.
     pub(crate) peer_transport_capable: AtomicBool,
+    /// The worker advertised `background_cell_abort` in its `worker_auth`
+    /// response: only a worker that reads the scoped abort's scope may
+    /// receive one (an older adopted worker would treat it as the full
+    /// queue-suspending abort).
+    pub(crate) background_cell_abort_capable: AtomicBool,
     /// The last-good heartbeats catalog answer, tagged with its generation: served when the worker
     /// is too busy for a fresh list (fresh only while current).
     pub(crate) heartbeat_snapshot: Mutex<Option<WorkerHeartbeatSnapshot>>,
@@ -131,11 +217,22 @@ pub(crate) struct ResidentWorker {
     /// Monotonic connection epoch: only the current connection's pumps may flip `connected` false
     /// (a superseded socket's late EOF cannot retire a live replacement).
     connection_epoch: AtomicU64,
+    /// The epoch whose connection already ended (written under the channel lock): its
+    /// handshake must not install a channel after the loss.
+    ended_epoch: AtomicU64,
     /// The compaction-abort token: armed by `compaction_start`, cleared by
     /// `compaction_end`, so an `abort_compaction` never needs the worker's own answer.
     pub(crate) compaction: crate::compaction_supervision::CompactionSupervision,
     /// The pending owner-disconnect stop (TS `ownerCleanupTimer`).
     pub(crate) owner_cleanup: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+    /// The client-forwarded launch env (TS `ResidentWorker.launchEnv`):
+    /// in memory ONLY — never the descriptor, never the durable create
+    /// command, never the update roster. The spawn merges it under the
+    /// internal identity overrides. A resident worker loses it once its
+    /// create completes (a crash relaunch runs on the daemon's env); an
+    /// owned worker keeps it for the owner-driven recovery relaunch
+    /// until ownership clears (promotion).
+    pub(crate) launch_env: std::sync::Mutex<Option<std::collections::BTreeMap<String, String>>>,
 }
 
 /// The last-good heartbeats rows, tagged with the catalog generation they
@@ -165,15 +262,17 @@ impl ResidentWorker {
             worker_id,
             descriptor: Mutex::new(descriptor),
             descriptor_path,
+            roster_family_seed_owned_by_create: AtomicBool::new(false),
             cmd_tx: Mutex::new(None),
             inflight: Arc::new(tokio::sync::Semaphore::new(
                 crate::backpressure::WORKER_INFLIGHT_CAPACITY,
             )),
             pending: Mutex::new(HashMap::new()),
-            intentional_stop: AtomicBool::new(false),
             consecutive_failures: AtomicU32::new(0),
             spawned_at_ms: AtomicU64::new(0),
+            monitor_epoch: AtomicU64::new(0),
             peer_transport_capable: AtomicBool::new(false),
+            background_cell_abort_capable: AtomicBool::new(false),
             heartbeat_snapshot: Mutex::new(None),
             cron_snapshot: Mutex::new(None),
             heartbeat_snapshot_generation: AtomicU64::new(0),
@@ -181,9 +280,25 @@ impl ResidentWorker {
             identity_persist_pending: AtomicBool::new(false),
             identity_quarantined: AtomicBool::new(false),
             connection_epoch: AtomicU64::new(0),
+            ended_epoch: AtomicU64::new(0),
             compaction: crate::compaction_supervision::CompactionSupervision::default(),
             owner_cleanup: std::sync::Mutex::new(None),
+            launch_env: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Set the client-forwarded launch env (the in-memory lifetime is
+    /// documented on the field).
+    pub(crate) fn set_launch_env(&self, env: Option<std::collections::BTreeMap<String, String>>) {
+        *self
+            .launch_env
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = env;
+    }
+
+    /// Drop the stored launch env (the ready-time and promotion clears).
+    pub(crate) fn clear_launch_env(&self) {
+        self.set_launch_env(None);
     }
 
     pub(crate) fn route_state(&self) -> WorkerRouteState {
@@ -194,10 +309,11 @@ impl ResidentWorker {
         self.route_state_tx.subscribe()
     }
 
-    fn publish_route_state(&self, edit: impl FnOnce(&mut WorkerRouteState)) {
+    /// The one writer of the route state; waiters wake on every change.
+    pub(crate) fn transition(&self, transition: WorkerTransition) {
         self.route_state_tx.send_if_modified(|state| {
             let mut next = *state;
-            edit(&mut next);
+            next.apply(transition);
             if next == *state {
                 false
             } else {
@@ -207,15 +323,13 @@ impl ResidentWorker {
         });
     }
 
-    /// A live worker socket was wired. Returns the connection's epoch,
-    /// which its pumps carry so only they can retire it.
-    pub(crate) fn note_connection_live(&self) -> u64 {
-        let epoch = self
-            .connection_epoch
+    /// A worker socket was wired. Returns the connection's epoch, which
+    /// its pumps carry so only they can retire it; the connection counts as
+    /// connected once its channel installs.
+    pub(crate) fn begin_connection(&self) -> u64 {
+        self.connection_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            + 1;
-        self.publish_route_state(|state| state.connected = true);
-        epoch
+            + 1
     }
 
     pub(crate) fn connection_is_current(&self, epoch: u64) -> bool {
@@ -233,35 +347,32 @@ impl ResidentWorker {
         cmd_tx: tokio::sync::mpsc::Sender<WorkerRequest>,
     ) {
         // The epoch recheck runs UNDER the channel lock: a stale connect
-        // must never overwrite a newer connection's channel.
+        // must never overwrite a newer connection's channel, and a connection
+        // that already ended (its worker died right after the auth answer)
+        // must not install a dead one.
+        let mut guard = self.cmd_tx.lock().await;
+        if !self.connection_is_current(epoch)
+            || self.ended_epoch.load(std::sync::atomic::Ordering::SeqCst) == epoch
+        {
+            return;
+        }
+        *guard = Some(cmd_tx);
+        self.transition(WorkerTransition::ConnectionInstalled);
+    }
+
+    /// The connection's pumps ended: its channel leaves routing with it, so every
+    /// "connected" reader sees the loss. The epoch check runs under the channel lock
+    /// (the install's fence): a superseded connection's late end cannot clear its
+    /// replacement's channel.
+    pub(crate) async fn note_connection_lost(&self, epoch: u64) {
         let mut guard = self.cmd_tx.lock().await;
         if !self.connection_is_current(epoch) {
             return;
         }
-        *guard = Some(cmd_tx);
-    }
-
-    pub(crate) fn note_connection_lost(&self, epoch: u64) {
-        if epoch
-            != self
-                .connection_epoch
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return;
-        }
-        self.publish_route_state(|state| state.connected = false);
-    }
-
-    pub(crate) fn note_session_ready(&self) {
-        self.publish_route_state(|state| state.session_ready = true);
-    }
-
-    pub(crate) fn note_session_replaying(&self) {
-        self.publish_route_state(|state| state.session_ready = false);
-    }
-
-    pub(crate) fn note_retired(&self) {
-        self.publish_route_state(|state| state.retired = true);
+        self.ended_epoch
+            .store(epoch, std::sync::atomic::Ordering::SeqCst);
+        *guard = None;
+        self.transition(WorkerTransition::ConnectionLost);
     }
 
     pub(crate) fn identity_persist_pending(&self) -> bool {
@@ -354,7 +465,8 @@ pub(crate) struct WorkerRegistration {
 }
 
 /// Accepted registration state per worker: the identity plus the
-/// registration count (epoch 1 = boot, epoch > 1 = re-registration after a supervisor restart).
+/// registration count (epoch 1 = boot; every later epoch is an in-place
+/// re-registration, e.g. `notify_session_created` after a create).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegistrationRecord {
     pub(crate) registration: WorkerRegistration,

@@ -11,10 +11,7 @@ use std::sync::Arc;
 use pa_models::cache::{CatalogCache, RefreshOptions, PUBLIC_SCOPE};
 use pa_models::fetch::CatalogFetcher;
 use pa_models::pinning::{parse_provider_model_catalog, PinnedTemplates};
-use pa_models::prime_inference::{
-    build_prime_inference_models, parse_prime_inference_model_catalog, PrimeInferenceCatalog,
-    PrimeInferenceCredentials,
-};
+use pa_models::prime_inference::{PrimeInferenceCatalog, PrimeInferenceCredentials};
 use serde_json::{json, Value};
 
 /// A cache over the models catalog parse pipeline (the same closure
@@ -393,12 +390,14 @@ async fn prime_inference_cache_is_scope_keyed_and_isolated() {
         .refresh(&team_a, true)
         .await
         .expect("team-a live models");
-    assert_eq!(a.len(), 60, "public live entries only");
-    // The public models cache never includes private ids (the private
-    // entitlement flow is the registry's, over its own authorization).
+    assert_eq!(
+        a.len(),
+        61,
+        "public live entries plus the scope's private route"
+    );
     assert!(
-        !a.iter().any(|m| m.id == "internal/team-a-secret"),
-        "private ids are filtered from the public models cache"
+        a.iter().any(|m| m.id == "internal/team-a-secret"),
+        "the scoped snapshot carries the account's private routes"
     );
     let request = &server.recorded_requests()[0];
     assert!(request.contains("authorization: Bearer key-a"), "{request}");
@@ -424,6 +423,66 @@ async fn prime_inference_cache_is_scope_keyed_and_isolated() {
     .unwrap();
     let expected_scope = pa_models::prime_inference::scope_key("key-a", "team-a");
     assert_eq!(stored["scope"], expected_scope, "scope fingerprint on disk");
+}
+
+/// The scoped snapshot is the private-route authorization: a normal
+/// response without a private route revokes it, while an empty or thin
+/// authenticated response fails the public coverage gate and keeps the
+/// last-good snapshot, so it can never wipe the public routes.
+#[tokio::test]
+async fn private_routes_revoke_through_normal_responses_but_public_routes_survive_thin_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let compiled = pa_models::transports::prime_inference_offline_entries();
+    let entry = |id: &str| {
+        json!({
+            "id": id,
+            "pricing": {"input_usd_per_mtok": 1.0, "output_usd_per_mtok": 2.0},
+            "specs": {
+                "context_window": 200_000, "max_output_tokens": 32_768,
+                "supports_reasoning": true,
+                "modalities": {"input": ["text"], "output": ["text"]},
+            },
+        })
+    };
+    let public: Vec<Value> = compiled.iter().map(|m| entry(&m.id)).collect();
+    let mut entitled = public.clone();
+    entitled.push(entry("internal/entitled"));
+    let server = common::MockServer::start(vec![
+        common::ok_json(json!({"data": entitled}).to_string(), None),
+        common::ok_json(json!({"data": []}).to_string(), None),
+        common::ok_json(
+            json!({"data": [entry(&compiled[0].id), entry("internal/entitled")]}).to_string(),
+            None,
+        ),
+        common::ok_json(json!({"data": public}).to_string(), None),
+    ])
+    .await;
+    let catalog = PrimeInferenceCatalog::with_base_url(
+        Some(PathBuf::from(dir.path())),
+        &server.url("/api/v1"),
+    );
+    let creds = PrimeInferenceCredentials {
+        api_key: "key-a".into(),
+        team_id: Some("team-a".into()),
+    };
+    let has = |models: &[pa_models::Model], id: &str| models.iter().any(|m| m.id == id);
+
+    let entitled = catalog.refresh(&creds, true).await.expect("entitled fetch");
+    assert!(has(&entitled, "internal/entitled"));
+
+    for thin in ["empty", "thin"] {
+        let _ = catalog.refresh(&creds, true).await;
+        let kept = catalog.get(&creds).expect("last-good snapshot kept");
+        assert_eq!(
+            kept.len(),
+            compiled.len() + 1,
+            "{thin} response kept every route"
+        );
+    }
+
+    let revoked = catalog.refresh(&creds, true).await.expect("normal fetch");
+    assert!(!has(&revoked, "internal/entitled"), "private route revoked");
+    assert_eq!(revoked.len(), compiled.len(), "public routes kept");
 }
 
 #[tokio::test]
@@ -480,17 +539,6 @@ async fn unauthorized_prime_inference_clears_only_that_scope() {
     assert!(catalog.get(&other).is_none());
 }
 
-#[test]
-fn prime_inference_parse_and_coverage_gate_use_public_fns() {
-    // Sanity for the closure the PrimeInferenceCatalog installs: an empty
-    // live catalog parses (allowEmpty) but fails the coverage gate, so a
-    // degraded fetch never replaces a good snapshot.
-    let compiled = pa_models::transports::prime_inference_offline_entries();
-    let payload = json!({"data": []});
-    let entries = parse_prime_inference_model_catalog(&payload, true).expect("empty ok");
-    assert!(build_prime_inference_models(&compiled, &entries, false, None).is_none());
-}
-
 #[tokio::test]
 async fn mid_session_refresh_never_retargets() {
     let dir = tempfile::tempdir().unwrap();
@@ -545,18 +593,21 @@ async fn a_dropped_refresh_resolves_the_gate_and_the_next_refresh_starts_fresh()
     let cache = Arc::new(models_cache(dir.path(), server.url("/catalog")));
 
     // A coalesced waiter joins the dropped driver: it must wake with a
-    // failed refresh (None), never hang on the abandoned gate. Both waits
-    // are bounded — the 2s bound fails the test instead of wedging it.
-    let dropped = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        cache.refresh(
-            PUBLIC_SCOPE,
-            RefreshOptions {
-                force: true,
-                ..Default::default()
-            },
-        ),
-    );
+    // failed refresh (None), never hang on the abandoned gate. The driver
+    // drops once the server holds its fetch; the 2s bound fails the test
+    // instead of wedging it.
+    let dropped = async {
+        tokio::select! {
+            _ = cache.refresh(
+                PUBLIC_SCOPE,
+                RefreshOptions {
+                    force: true,
+                    ..Default::default()
+                },
+            ) => panic!("the held fetch settled before the drop"),
+            () = server.wait_for_requests(1) => {}
+        }
+    };
     let joined = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         cache.refresh(
@@ -567,11 +618,7 @@ async fn a_dropped_refresh_resolves_the_gate_and_the_next_refresh_starts_fresh()
             },
         ),
     );
-    let (dropped, joined) = tokio::join!(dropped, joined);
-    assert!(
-        dropped.is_err(),
-        "the bounded wait must return while the fetch is held"
-    );
+    let ((), joined) = tokio::join!(dropped, joined);
     let joined = joined.expect("the coalesced waiter wakes on the abandoned gate");
     assert!(
         joined.is_none(),

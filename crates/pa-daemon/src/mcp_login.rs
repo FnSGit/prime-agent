@@ -231,13 +231,18 @@ mod tests {
                 disabled_tools: None,
                 startup_timeout_ms: None,
                 call_timeout_ms: None,
+                client_id: None,
+                callback_port: None,
+                client_secret: None,
+                scopes: None,
             },
         );
         let manager = McpManager::new(McpManagerOptions {
             auth_storage: AuthStorage::create_with_oauth(
                 agent.path(),
                 Arc::new(pa_core::mcp::McpOAuth::with_http(
-                    Arc::clone(&http) as Arc<dyn pa_core::mcp::OAuthHttp>
+                    Arc::clone(&http) as Arc<dyn pa_core::mcp::OAuthHttp>,
+                    Arc::new(|| None),
                 )),
             ),
             get_user_servers: Box::new(move || Some(user_servers.clone())),
@@ -280,7 +285,6 @@ mod tests {
         let login = tokio::spawn(async move {
             begin_login(HostRequestPayload {
                 data: json!({ "server": "fixture" }),
-                cell_source_code: None,
             })
             .await
         });
@@ -386,7 +390,8 @@ mod tests {
             auth_storage: AuthStorage::create_with_oauth(
                 agent.path(),
                 Arc::new(pa_core::mcp::McpOAuth::with_http(
-                    Arc::clone(&http) as Arc<dyn pa_core::mcp::OAuthHttp>
+                    Arc::clone(&http) as Arc<dyn pa_core::mcp::OAuthHttp>,
+                    Arc::new(|| None),
                 )),
             ),
             get_user_servers: Box::new(|| None),
@@ -407,7 +412,6 @@ mod tests {
         let begin_login = handlers.get("mcp.begin_login").expect("wired").clone();
         let error = begin_login(HostRequestPayload {
             data: json!({ "server": "nope" }),
-            cell_source_code: None,
         })
         .await
         .unwrap_err()

@@ -5,8 +5,10 @@ ci.yml's `changes` job resolves the selection: the test phase narrows to the
 touched crates and their reverse dependencies (scripts/ci_test_shard.py
 --crates) on PRs; push and merge-queue waves run the full union. The
 mapping is fail-safe by construction: a selection that cannot be made is
-the FULL selection — a wrong guess can
-only cost runner minutes, never coverage.
+the FULL selection — a wrong guess can only cost runner minutes, never
+coverage. Guaranteed-metadata paths (GUARANTEED_METADATA_PREFIXES) are
+skipped for selection instead of failing it: no test unit reads changelog
+fragments or documentation, so those changes do not defeat crate narrowing.
 
 The input is the pull-requests files API (`GET /repos/{o}/{r}/pulls/{n}/files`,
 paginated by gh), one TSV row per file: `<filename>` TAB `<previous_filename>`
@@ -38,6 +40,31 @@ from pathlib import Path
 # truncated and the mapping is not trustworthy, so the full selection runs.
 FILES_API_CEILING = 3000
 
+# Guaranteed-metadata paths: prefixes of paths whose change cannot alter
+# any test unit's outcome. Unlike the fail-safe classes in select_crates,
+# these are skipped for selection (and logged) - and they never narrow on
+# their own: a list with no crate path still gets the full selection. Keep
+# this list minimal and justify every entry: unlike a fail-safe, a wrong
+# entry here SKIPS coverage for a real change.
+#
+#   .changes/ - release changelog fragments are read at release cut time;
+#               no crate, cargo test unit, or shipped binary reads them.
+#   docs/ - documentation files are not inputs to test units.
+# These paths are skipped so a real crate change can still narrow its test
+# selection when the PR also updates its changelog or documentation.
+#
+# Near misses stay fail-safe, not metadata: top-level *.md (pa-cli's
+# packaged-layout e2e copies README.md into its staged layout), skills/,
+# vendor/, install scripts, the runtime sidecar, workspace Cargo files,
+# scripts/, and the workflows.
+GUARANTEED_METADATA_PREFIXES: tuple[str, ...] = (".changes/", "docs/")
+
+
+def is_guaranteed_metadata(path: str) -> bool:
+    """True when the path is in the guaranteed-metadata class."""
+    return path.startswith(GUARANTEED_METADATA_PREFIXES)
+
+
 # Conservative CI impact graph: some edges cover behavior beyond a direct
 # Cargo.toml link. Over-selecting is safe; missing a dependent test is not.
 # The changes job must select without installing Rust or running Cargo.
@@ -45,13 +72,15 @@ WORKSPACE_DEPS = {
     "pa-types": set(),
     "pa-telemetry": set(),
     "pa-ai": {"pa-types"},
-    "pa-models": {"pa-ai"},
+    "pa-models": {"pa-ai", "pa-types"},
     "pa-agent": {"pa-ai", "pa-types"},
     "pa-core": {"pa-agent", "pa-ai", "pa-models", "pa-types", "pa-telemetry"},
-    "pa-daemon": {"pa-core"},
+    "pa-daemon": {"pa-types", "pa-core", "pa-agent", "pa-ai", "pa-telemetry",
+                  "pa-models"},
     "pa-tui": {"pa-types", "pa-core"},
     "pa-cli": {"pa-types", "pa-telemetry", "pa-ai", "pa-models",
                "pa-agent", "pa-core", "pa-daemon", "pa-tui"},
+    "pa-perf": {"pa-types", "pa-core", "pa-daemon"},
 }
 
 
@@ -72,11 +101,15 @@ def read_rows(path: Path) -> list[tuple[str, str]]:
 def select_crates(rows: list[tuple[str, str]]) -> list[str] | None:
     """The touched crates and reverse dependencies, or None for a full wave.
 
-    Only known `crates/<pkg>/**` narrows. Everything else — the workflows,
-    CI tooling, vendor/, the runtime sidecar, workspace-level Cargo files,
-    install scripts, docs — affects more than any crate subset, and a rename
-    counts both sides. An undecidable list (empty rows, the API ceiling or
-    an unknown crate) fails safe to the full selection.
+    Only known `crates/<pkg>/**` narrows. Guaranteed-metadata paths
+    (GUARANTEED_METADATA_PREFIXES) are skipped — no test unit reads them —
+    and they never narrow on their own: a metadata-only list gets the full
+    selection. Everything else — the workflows, CI tooling, vendor/, the
+    runtime sidecar, workspace-level Cargo files, install scripts, and
+    top-level README files — can affect tests beyond a crate subset. A rename
+    counts both sides. An
+    undecidable list (empty rows, the API ceiling or an unknown crate)
+    fails safe to the full selection.
     """
     if not rows:
         return None
@@ -100,9 +133,15 @@ def select_crates(rows: list[tuple[str, str]]) -> list[str] | None:
                     print(f"unknown crate {parts[1]}: the full selection runs")
                     return None
                 crates.add(parts[1])
+            elif is_guaranteed_metadata(candidate):
+                print(f"guaranteed-metadata path {candidate}: "
+                      "skipped for selection")
             else:
                 print(f"non-crate path {candidate}: the full selection runs")
                 return None
+    if not crates:
+        print("no crate paths in the change list: the full selection runs")
+        return None
     # pa-types owns the shared wire vocabulary: run every workspace test for
     # its changes, including the independent pa-telemetry leaf crate.
     if "pa-types" in crates:

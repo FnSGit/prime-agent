@@ -342,7 +342,7 @@ fn worker_roster_delta_requires_authentication() {
 /// `parentSessionPath#childId` (TS `rosterAgentIdForSummary`).
 #[tokio::test]
 async fn rlm_children_key_the_roster_by_parent_path_and_child_id() {
-    use pa_core::session_engine::rlm_host::{RlmSpawnRequest, RlmSubagentHost};
+    use pa_core::session_engine::rlm_host::{RlmSpawnKind, RlmSpawnRequest, RlmSubagentHost};
     use pa_daemon::rlm_children::{ParentIdentity, SupervisorChildSessions};
 
     let dir = tempfile::TempDir::new().expect("temp dir");
@@ -405,6 +405,7 @@ async fn rlm_children_key_the_roster_by_parent_path_and_child_id() {
             agent_dir.clone(),
             /*telemetry_disabled*/ true,
         )),
+        String::new(),
     );
     children.set_identity(ParentIdentity {
         rlm_depth: 0,
@@ -423,8 +424,10 @@ async fn rlm_children_key_the_roster_by_parent_path_and_child_id() {
             name: Some("child-a".to_string()),
             model: None,
             thinking: None,
-            cell_source_code: None,
+            cwd: None,
+            kind: RlmSpawnKind::Subagent,
             spawned_by_request_id: None,
+            factory: None,
         })
         .await
         .expect("spawn child");

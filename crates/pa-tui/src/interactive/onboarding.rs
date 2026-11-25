@@ -166,7 +166,7 @@ async fn drive_onboarding_pane(
                 barrier = Some(armed);
             }
         }
-        view.onboarding = Some(screen);
+        view.overlay = Some(crate::view::Overlay::Onboarding(screen));
         match drive.renderer {
             Renderer::Terminal { .. } => {
                 if let Some(renderer) = drive.renderer.is_terminal_mut() {
@@ -183,7 +183,7 @@ async fn drive_onboarding_pane(
             }
             Renderer::Headless { .. } => drive.renderer.render_headless_pane(view),
         }
-        let Some(mut pane) = view.onboarding.take() else {
+        let Some(crate::view::Overlay::Onboarding(mut pane)) = view.overlay.take() else {
             unreachable!("the pane mounts at the top of every iteration");
         };
         tokio::select! {
@@ -202,12 +202,9 @@ async fn drive_onboarding_pane(
                         screen = pane;
                         continue;
                     };
-                    // The onboarding exit keys include Ctrl+C: report the handled press so the
-                    // force-quit guard's handled counter stays in sync with the reader's
-                    // observations.
-                    if key_id == "ctrl+c" {
-                        drive.exit_guard.note_ctrl_c_handled();
-                    }
+                    // Every key that reaches the pane is handled (the force-quit guard counts
+                    // the Ctrl+C presses).
+                    drive.exit_guard.note_key_handled(&key_id);
                     if let Some(decision) = pane.handle_key(&key_id, &drive.keybindings, osc_sink) {
                         // A decision tears the pane down mid-drive: end a still-running login flow.
                         if let Some(task) = flow.take() {
@@ -222,6 +219,12 @@ async fn drive_onboarding_pane(
                 // The headless plan completed while the pane owned the channel: mark the run loop's
                 // flag (the pane keeps driving until the channel closes or a decision ends it).
                 UiInput::HeadlessDone => *drive.headless_done = true,
+                UiInput::Timestamp(_) => {
+                    if let Some(task) = flow.take() {
+                        task.end().await;
+                    }
+                    anyhow::bail!("headless timing markers require an attached session");
+                }
                 // The plan's render barriers (pane-scoped): a condition that already holds pops
                 // immediately; a pending one arms and holds the input batch behind it until a later
                 // frame satisfies it or the deadline pops (the timeout proceeds silently — the
@@ -257,6 +260,7 @@ async fn drive_onboarding_pane(
                 UiInput::Submit(_)
                 | UiInput::SubmitAndSettle { .. }
                 | UiInput::SettleIdle
+                | UiInput::InputChunkEnd
                 | UiInput::Mouse(_)
                 | UiInput::WaitIdle { .. }
                 | UiInput::ScrollTop
@@ -456,8 +460,9 @@ async fn run_onboarding_flow(
     // daemon resolves the model against its own registry — read fresh at the switch, so the
     // just-stored credential is what makes the default available (the client's startup snapshot
     // predates the sign-in). A resolution failure surfaces as the switch's error row and the flow
-    // still completes.
-    if task.current_model.is_none() {
+    // still completes. The picker below words its prompt and continue row from the same fact.
+    let prime_default = task.current_model.is_none();
+    if prime_default {
         session
             .apply_model_selection(
                 crate::provider_auth::PRIME_INFERENCE_PROVIDER_ID,
@@ -494,7 +499,7 @@ async fn run_onboarding_flow(
             break;
         }
         screen.mount_panel(crate::onboarding_flow::OnboardingPanel::Providers(
-            crate::onboarding_flow::ProviderPicker::new(options),
+            crate::onboarding_flow::ProviderPicker::new(options, prime_default),
         ));
         let (picked_screen, outcome) =
             drive_onboarding_pane(view, &mut *drive, screen, None, &mut session.osc_sink).await?;
@@ -695,4 +700,74 @@ fn warn_onboarding_persist_failure(
         kind: crate::chat::StatusKind::Warning,
     });
     session.dirty = true;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejected_timing_marker_ends_active_login_flow() {
+        let (auth_tx, mut auth_rx) = mpsc::unbounded_channel();
+        let panel = crate::auth_panel::AuthPanelHandle::new(auth_tx);
+        let cancel = panel.cancel_signal();
+        let flow_cancel = cancel.clone();
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        let flow = OnboardingFlowTask::spawn(
+            async move {
+                while !flow_cancel.cancelled() {
+                    tokio::task::yield_now().await;
+                }
+                done_tx.send(()).expect("flow completion receiver");
+                crate::provider_auth::ProviderAuthOutcome::Cancelled
+            },
+            cancel.clone(),
+        );
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let (timing_tx, _timing_rx) = std::sync::mpsc::channel();
+        ui_tx
+            .send(UiInput::Timestamp(timing_tx))
+            .expect("queued marker");
+        let mut view = AgentView::new(crate::theme::Theme::builtin(
+            "prime",
+            crate::theme::ColorMode::TrueColor,
+        ));
+        let mut renderer = Renderer::Headless {
+            width: 80,
+            height: 24,
+            frames: Vec::new(),
+            renders: 0,
+        };
+        let exit_guard = ExitGuard::new();
+        let mut headless_done = false;
+        let mut drive = PaneDrive {
+            ui_rx: &mut ui_rx,
+            renderer: &mut renderer,
+            exit_guard: &exit_guard,
+            keybindings: KeybindingsManager::new(),
+            auth_panel_rx: &mut auth_rx,
+            headless_done: &mut headless_done,
+        };
+        let mut osc_sink = crate::clipboard::OscSink::Buffer(Vec::new());
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            drive_onboarding_pane(
+                &mut view,
+                &mut drive,
+                crate::onboarding::OnboardingScreen::new(),
+                Some(flow),
+                &mut osc_sink,
+            ),
+        )
+        .await
+        .expect("pane exits promptly")
+        .err()
+        .expect("onboarding rejects session timing markers");
+        assert_eq!(
+            error.to_string(),
+            "headless timing markers require an attached session"
+        );
+        assert!(cancel.cancelled());
+        assert_eq!(done_rx.try_recv(), Ok(()));
+    }
 }

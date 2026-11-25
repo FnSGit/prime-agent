@@ -22,6 +22,10 @@ pub(crate) struct SessionCore {
     pub(crate) created: bool,
     pub(crate) attached_client_ids: Vec<String>,
     pub(crate) abort_requested: bool,
+    /// Explicit cancellation of this picked delivery; graceful shutdown is excluded.
+    pub(crate) turn_cancelled: bool,
+    /// A successful terminal Done was observed for this picked delivery.
+    pub(crate) turn_completed: bool,
     /// A flow that detaches from the interrupted turn's events (a manual
     /// `compact`, a branch navigation) swallowed the aborted row in TS, so the
     /// gate's aborted-row exception stays closed while it settles its turn.
@@ -32,6 +36,11 @@ pub(crate) struct SessionCore {
     /// The turn's tool calls in flight, keyed by tool-call id: the
     /// roster summary derives `isRunningTools` from its size.
     pub(crate) running_tool_calls: std::collections::HashSet<String>,
+    /// The session's tool executions so far (the summary's `toolUseCount`):
+    /// bumped per `tool_execution_start` under the same core lock the frames
+    /// sequence under, and seeded from the session file when a worker opens
+    /// it, so a revived session never resets the count.
+    pub(crate) tool_use_count: u64,
     /// Admission ids belonging to the current in-flight turn. The queue
     /// handoff and owned cancellation both inspect this under the core lock.
     pub(crate) running_admission_ids: std::collections::HashSet<String>,
@@ -48,6 +57,10 @@ pub(crate) struct SessionCore {
     pub(crate) last_activity_ms: u64,
     /// `top-level` | `subagent` (summary `runtimeKind`).
     pub(crate) runtime_kind: String,
+    /// The Decision API child flag (create `decisionChild`, worker launch
+    /// env): summary `decisionChild`, so the agents view hides System 1
+    /// children from the user while costs still roll up.
+    pub(crate) decision_child: bool,
     /// The subagent runtime identity (create `runtimeMetadata`): the child id
     /// and the parent's ids, so the roster keys children `parentPath#childId`.
     pub(crate) rlm_child_id: Option<String>,
@@ -90,6 +103,17 @@ pub(crate) struct SessionCore {
     /// (`preparing` at pickup, `committing` at the first row, `running` at the
     /// first assistant frame) and clears it once the turn settles.
     pub(crate) active_action: Option<crate::types::SessionActionActive>,
+    /// The earliest instant the queued inbox arrival row may start a turn on
+    /// an idle session (the success hold or the debounce, see
+    /// `inbox_router::wake_delay`); cleared when the row delivers.
+    pub(crate) inbox_wake_due: Option<tokio::time::Instant>,
+    /// The inbox items the picked arrival row shows: its accepted
+    /// transcript row withdraws them, so a turn that never accepts the row
+    /// leaves them waiting.
+    pub(crate) inbox_shown_unaccepted: std::collections::BTreeSet<String>,
+    /// The last run ended at a tool boundary with a steer queued: that steer
+    /// cut it, so the row that cut it continues the turn at once.
+    pub(crate) run_cut_at_tool_boundary: bool,
 }
 
 impl SessionCore {
@@ -97,6 +121,36 @@ impl SessionCore {
     /// `hasOngoingSessionWork`); the supervisor-lost exit waits for it to settle.
     pub(crate) fn has_ongoing_work(&self) -> bool {
         self.busy || self.compacting || !self.steering.is_empty() || !self.follow_up.is_empty()
+    }
+
+    /// Whether the turn runner holds queued input instead of admitting it:
+    /// an input pause, the queued-input suspension, or a manual compaction.
+    pub(crate) fn queued_input_parked(
+        &self,
+        input_pauses: &crate::session_input_pause::InputPauseTable,
+    ) -> bool {
+        input_pauses.paused() || self.queued_input_suspended || self.compacting
+    }
+
+    /// The instant the turn runner waits for instead of taking queued work:
+    /// `Some` only while the inbox arrival row is the only queued item (in
+    /// either lane), its due time is still ahead, and the last run ended on
+    /// its own. Any other
+    /// queued work starts a turn the row joins, and a run cut at a tool
+    /// boundary continues at once with the row that cut it.
+    pub(crate) fn inbox_wake_hold(
+        &self,
+        now: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        let mut queued = self.steering.iter().chain(self.follow_up.iter());
+        let only_the_arrival_row = matches!(
+            (queued.next(), queued.next()),
+            (Some(item), None) if item.queue_key.as_deref() == Some(super::INBOX_ARRIVAL_QUEUE_KEY)
+        );
+        if !only_the_arrival_row || self.run_cut_at_tool_boundary {
+            return None;
+        }
+        self.inbox_wake_due.filter(|due| *due > now)
     }
 
     /// A created session core for command modules' unit tests (the private
@@ -118,16 +172,20 @@ impl SessionCore {
             created: true,
             attached_client_ids: Vec::new(),
             abort_requested: false,
+            turn_cancelled: false,
+            turn_completed: false,
             suppress_aborted_row: false,
             shutdown_requested: false,
             last_activity_ms: 0,
             compacting: false,
             running_tool_calls: std::collections::HashSet::new(),
             running_admission_ids: std::collections::HashSet::new(),
+            tool_use_count: 0,
             auto_compaction_enabled: true,
             last_action_snapshot: Some(SessionActionSnapshot::default()),
             rlm_depth: 0,
             runtime_kind: "top-level".to_string(),
+            decision_child: false,
             rlm_child_id: None,
             parent_active_session_id: None,
             parent_session_id: None,
@@ -142,6 +200,9 @@ impl SessionCore {
             queued_input_suspended: false,
             pending_next_turn: Vec::new(),
             active_action: None,
+            inbox_wake_due: None,
+            inbox_shown_unaccepted: std::collections::BTreeSet::new(),
+            run_cut_at_tool_boundary: false,
         }
     }
 }

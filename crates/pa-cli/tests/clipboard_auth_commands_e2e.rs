@@ -52,6 +52,7 @@ fn kill_worker(pid: u32) {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn process_alive(pid: u32) -> bool {
     std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
         let rest = stat
@@ -62,6 +63,7 @@ fn process_alive(pid: u32) -> bool {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn child_pids_of(ppid: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     let entries = std::fs::read_dir("/proc").expect("read /proc");
@@ -85,6 +87,30 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
         }
     }
     pids
+}
+
+/// The children of `ppid` without `/proc`: one `ps` listing of every pid's parent.
+#[cfg(not(target_os = "linux"))]
+fn child_pids_of(parent_pid: u32) -> Vec<u32> {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .expect("run ps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let parent: u32 = fields.next()?.parse().ok()?;
+            (parent == parent_pid).then_some(pid)
+        })
+        .collect()
+}
+
+/// Liveness without `/proc`: the platform probe, which also reads zombies as dead.
+#[cfg(not(target_os = "linux"))]
+fn process_alive(pid: u32) -> bool {
+    pa_types::platform::process::is_process_alive(pid).unwrap_or(false)
 }
 
 fn graceful_shutdown(socket: &Path) {
@@ -124,6 +150,7 @@ fn spawn_supervisor(dir: &Path) -> Supervisor {
     let socket = dir.join("daemon.sock");
     let agent_dir = dir.join("agent");
     std::fs::create_dir_all(&agent_dir).expect("agent dir");
+    let stderr_path = dir.join("supervisor.stderr");
     let mut command = Command::new(env!("CARGO_BIN_EXE_prime-agent"));
     command
         .args(["--mode", "daemon", "--daemon-socket"])
@@ -131,7 +158,7 @@ fn spawn_supervisor(dir: &Path) -> Supervisor {
         .env("PRIME_AGENT_CODING_AGENT_DIR", &agent_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(std::fs::File::create(&stderr_path).expect("supervisor stderr"));
     for var in [
         pa_daemon::worker::WORKER_ROLE_ENV,
         pa_daemon::worker::WORKER_TOKEN_ENV,
@@ -156,15 +183,22 @@ fn spawn_supervisor(dir: &Path) -> Supervisor {
         pa_daemon::worker::WORKER_SUPERVISOR_LOST_EXIT_MS_ENV,
         "15000",
     );
-    let child = command.spawn().expect("spawn prime-agent --mode daemon");
+    let mut child = command.spawn().expect("spawn prime-agent --mode daemon");
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if socket.exists() {
+        if let Some(status) = child.try_wait().expect("check supervisor exit") {
+            let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+            panic!("supervisor exited before accepting connections ({status}); stderr: {stderr}");
+        }
+        if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
             return Supervisor { child, socket };
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("supervisor socket never appeared");
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    panic!("supervisor never accepted a connection within 15s; stderr: {stderr}");
 }
 
 // Scripted hooks (composition-root seams; the verifier drives the traits directly).
@@ -850,11 +884,18 @@ async fn tui_prime_login_renders_the_inline_team_picker() {
         steps: vec![
             pa_tui::interactive::HeadlessStep::Submit("/login".to_string()),
             enter(),
-            pa_tui::interactive::HeadlessStep::WaitMs(400),
+            // The team rows exist only once the picker loaded its teams.
+            pa_tui::interactive::HeadlessStep::WaitRender {
+                needle: "slug: acme".to_string(),
+                timeout_ms: 10_000,
+            },
             // Personal rides first (TS order): down selects Acme Corp.
             key(crossterm::event::KeyCode::Down),
             enter(),
-            pa_tui::interactive::HeadlessStep::WaitMs(400),
+            pa_tui::interactive::HeadlessStep::WaitRender {
+                needle: "Using team \"Acme Corp\".".to_string(),
+                timeout_ms: 10_000,
+            },
         ],
         width: 120,
         height: 36,
@@ -966,9 +1007,16 @@ async fn tui_prime_login_escape_keeps_the_default_team_status() {
         steps: vec![
             pa_tui::interactive::HeadlessStep::Submit("/login".to_string()),
             enter(),
-            pa_tui::interactive::HeadlessStep::WaitMs(400),
+            // The team rows exist only once the picker loaded its teams.
+            pa_tui::interactive::HeadlessStep::WaitRender {
+                needle: "slug: acme".to_string(),
+                timeout_ms: 10_000,
+            },
             key(crossterm::event::KeyCode::Esc),
-            pa_tui::interactive::HeadlessStep::WaitMs(400),
+            pa_tui::interactive::HeadlessStep::WaitRender {
+                needle: "Using personal account.".to_string(),
+                timeout_ms: 10_000,
+            },
         ],
         width: 120,
         height: 36,
@@ -1804,7 +1852,7 @@ async fn tui_update_failure_lands_the_error_row() {
         "the guard clears when the outcome lands:\n{rendered}"
     );
     assert!(
-        rendered.contains("Update uninstalls the TypeScript version"),
+        rendered.contains("Update installs the latest Prime Agent build"),
         "the second run re-opens the confirm:\n{rendered}"
     );
     assert_eq!(*update_view.calls.lock().unwrap(), 1, "one funnel run");

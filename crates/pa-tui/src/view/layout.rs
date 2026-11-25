@@ -7,6 +7,9 @@ use crate::chat::{render_loader, ChatEntry};
 use crate::chrome::render_splash;
 use crate::Line;
 
+/// Inputs shared by local entry caches and cross-view handoffs.
+pub(super) type LayoutOptions = (crate::theme::Theme, String, bool, bool, Option<url::Url>);
+
 #[cfg(test)]
 thread_local! {
     pub(super) static ENTRY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -185,6 +188,11 @@ pub(crate) struct TranscriptLayout {
 }
 
 impl TranscriptLayout {
+    /// The absolute first row of chat entry `index` (the end sentinel past the last entry).
+    pub(super) fn entry_start(&self, index: usize) -> usize {
+        self.offsets[index.min(self.offsets.len() - 1)]
+    }
+
     pub(super) fn cursor_at(&self, row: usize) -> (usize, usize) {
         if row < self.splash.len() {
             return (0, row);
@@ -215,6 +223,8 @@ impl AgentView {
             | ChatEntry::InjectedPrompt(_)
             | ChatEntry::RefinementOutcome(_)
             | ChatEntry::CustomPanel(_) => true,
+            // A collapsed run's counter line counts the notices AFTER its head.
+            ChatEntry::InboxNotice(_) => false,
             ChatEntry::Assistant(message) => !message.streaming,
             ChatEntry::Tool(card) => {
                 !matches!(
@@ -253,6 +263,9 @@ impl AgentView {
             ChatEntry::AgentMessage(_) | ChatEntry::ShellCompletion(_) | ChatEntry::Tool(_) => {
                 self.conversation_leading(index, self.entry_detail(index).tool_output_expanded())
             }
+            ChatEntry::InboxNotice(_) => {
+                self.conversation_leading(index, self.inbox_run_expanded(index))
+            }
             // The bash card's own mount rule (TS `Spacer(1)` unless the
             // chat's last child is an agent message).
             ChatEntry::BashExecution(card) => !card.suppress_leading_space,
@@ -264,6 +277,22 @@ impl AgentView {
         }
     }
 
+    /// The rows above the first entry: the splash, or, once a transcript suppressed it, the
+    /// marker of an older history page on its way (styled like the gap row's status row).
+    pub(super) fn top_section_rows(&self, width: usize) -> Vec<Line> {
+        if !self.splash_suppressed {
+            return render_splash(&self.chrome, &self.theme, width);
+        }
+        if self.older_history_loading {
+            return crate::chat::render_text_rows(
+                "Loading older history\u{2026}",
+                self.theme.fg_style(crate::theme::ThemeColor::Dim),
+                width,
+            );
+        }
+        Vec::new()
+    }
+
     /// Measure entries through shared count-only render geometry.
     pub(crate) fn layout_pass(&mut self, width: usize) -> TranscriptLayout {
         self.sparse_enabled = false;
@@ -273,13 +302,7 @@ impl AgentView {
             crate::chat::Detail::Details => 1,
             crate::chat::Detail::All => 2,
         };
-        // A suppressed splash contributes no rows: the offsets start at
-        // the first entry.
-        let splash = if self.splash_suppressed {
-            Vec::new()
-        } else {
-            render_splash(&self.chrome, &self.theme, width)
-        };
+        let splash = self.top_section_rows(width);
         let mut offsets = Vec::with_capacity(self.chat.len() + 1);
         offsets.push(splash.len());
         let mut first = true;
@@ -318,6 +341,7 @@ impl AgentView {
             self.code_block_indent.clone(),
             self.show_images,
             crate::image_component::fullscreen_image_fallback_active(),
+            url::Url::from_directory_path(&self.chrome.cwd).ok(),
         );
         if self.layout_width != width || self.layout_options.as_ref() != Some(&options) {
             self.entry_heights.clear();

@@ -1,9 +1,9 @@
 //! The terminal input grammar: key dispatch, mouse reports, paste,
 //! selection/auto-scroll, and the input-state seams.
 use super::{
-    key_event_to_id, AgentView, ChatEntry, DaemonCommand, DockFocusSource, Duration,
-    EffortPickerAction, Instant, KeyEvent, Map, QueueBrowseDirection, QueueLane, Result, SessionUi,
-    StatusKind, SubmitBehavior,
+    key_event_to_id, AgentView, ChatEntry, ChoicePickerAction, ChoicePurpose, DaemonCommand,
+    DockFocusSource, Duration, Instant, InterruptOrigin, KeyEvent, Map, Overlay,
+    QueueBrowseDirection, QueueLane, Result, SessionUi, StatusKind, SubmitBehavior,
 };
 
 /// How long the Ctrl+C exit hint arms the second-press exit.
@@ -84,18 +84,17 @@ impl SessionUi {
         if !crate::mouse_tracking::active() {
             return;
         }
-        let overlay_focused = view.model_picker.is_some()
-            || view.effort_picker.is_some()
-            || view.heartbeats_picker.is_some()
-            || view.goal_panel.is_some()
-            || view.bash_view.is_some()
-            || view.info_panel.is_some()
-            || view.tree_selector.is_some()
-            || view.fork_selector.is_some()
-            || view.share_loader.is_some()
-            || view.mcp_view.is_some()
-            || view.factory_view.is_some()
-            || view.onboarding.is_some();
+        // The confirm, sign-in, auth, settings and reload panels leave the wheel to the transcript.
+        let overlay_focused = view.overlay.as_ref().is_some_and(|overlay| {
+            !matches!(
+                overlay,
+                Overlay::Confirm { .. }
+                    | Overlay::ProviderAuth(_)
+                    | Overlay::AuthPanel(_)
+                    | Overlay::Settings(_)
+                    | Overlay::Reload(_)
+            )
+        });
         let left = event.button == crate::mouse::BUTTON_LEFT;
         let release_was_drag = left && !event.press && self.left_mouse_dragged;
         let row = event.y.saturating_sub(1) as usize;
@@ -109,7 +108,7 @@ impl SessionUi {
         }
         if let Some(delta) = crate::mouse::wheel_scroll_delta(&event) {
             if !overlay_focused {
-                view.scroll_by(delta);
+                self.window.scroll(delta, view);
                 self.dirty = true;
             }
             return;
@@ -270,7 +269,9 @@ impl SessionUi {
             return;
         }
         if view.selection_auto_scroll_direction(armed.row) != Some(armed.direction)
-            || !view.scroll_selection(armed.direction, armed.col)
+            || !self
+                .window
+                .scroll_selection(armed.direction, armed.col, view)
         {
             self.selection_auto_scroll = None;
             return;
@@ -291,7 +292,9 @@ impl SessionUi {
         let _ = view.editor.handle_paste(text);
     }
 
-    async fn handle_effort_picker_key(
+    /// One key press while the `/effort` picker is open: Esc/Ctrl+C close it
+    /// without applying; Enter applies the picked row.
+    async fn handle_choice_picker_key(
         &mut self,
         key: KeyEvent,
         view: &mut AgentView,
@@ -299,24 +302,24 @@ impl SessionUi {
         let Some(id) = key_event_to_id(&key) else {
             return Ok(());
         };
-        // The picker consumes Ctrl+C (close, not exit); report it so the force-quit
-        // guard can disarm.
-        if id == "ctrl+c" {
-            self.exit_guard.note_ctrl_c_handled();
-        }
-        let action = view
-            .effort_picker
-            .as_mut()
-            .map(|picker| picker.handle_key(&id, view.editor.keybindings()));
+        let action = match view.overlay.as_mut() {
+            Some(Overlay::ChoicePicker(picker)) => {
+                Some(picker.handle_key(&id, view.editor.keybindings()))
+            }
+            _ => None,
+        };
         match action {
-            Some(EffortPickerAction::None) | None => {}
-            Some(EffortPickerAction::Cancel) => {
-                view.effort_picker = None;
+            Some(ChoicePickerAction::None) | None => {}
+            Some(ChoicePickerAction::Cancel) => {
+                view.overlay = None;
                 self.dirty = true;
             }
-            Some(EffortPickerAction::Apply { level }) => {
-                view.effort_picker = None;
-                self.apply_thinking_level(&level, view).await;
+            Some(ChoicePickerAction::Apply { purpose, key }) => {
+                view.overlay = None;
+                self.dirty = true;
+                match purpose {
+                    ChoicePurpose::Effort => self.apply_thinking_level(&key, view).await,
+                }
             }
         }
         Ok(())
@@ -328,60 +331,42 @@ impl SessionUi {
         view: &mut AgentView,
         running: &mut bool,
     ) -> Result<()> {
+        let id = key_event_to_id(&key);
+        // Every key that reaches the session is handled, whichever surface consumes it (the
+        // force-quit guard counts the Ctrl+C presses; an exit re-arms it from the loop's break).
+        if let Some(id) = &id {
+            self.exit_guard.note_key_handled(id);
+        }
         // Any non-Escape key re-arms the double-Esc tree shortcut (one shot per input chain);
         // Escape itself never resets, so repeated Escape converges to the inert empty state.
-        if key_event_to_id(&key).is_some_and(|id| id != "escape") {
+        if id.is_some_and(|id| id != "escape") {
             self.escape_tree_shortcut_spent = false;
         }
-        // The `/model` picker owns the frame while open: its keys go before the
-        // editor, viewport keys, and Ctrl+C.
-        if view.model_picker.is_some() {
-            return self.handle_model_picker_key(key, view).await;
-        }
-        if view.effort_picker.is_some() {
-            return self.handle_effort_picker_key(key, view).await;
-        }
-        if view.mcp_view.is_some() {
-            return self.handle_mcp_view_key(key, view);
-        }
-        // The factory page owns the frame the same way.
-        if view.factory_view.is_some() {
-            return self.handle_factory_view_key(key, view).await;
-        }
-        // The `/heartbeats` view owns the frame the same way.
-        if view.heartbeats_picker.is_some() {
-            return self.handle_heartbeats_picker_key(key, view).await;
-        }
-        if view.bash_view.is_some() {
-            return self.handle_bash_view_key(key, view);
-        }
-        if view.goal_panel.is_some() {
-            return self.handle_goal_panel_key(key, view);
-        }
-        if view.info_panel.is_some() {
-            return self.handle_info_panel_key(key, view);
-        }
-        if view.tree_selector.is_some() {
-            return self.handle_tree_selector_key(key, view).await;
-        }
-        if view.fork_selector.is_some() {
-            return self.handle_fork_selector_key(key, view).await;
-        }
-        if view.confirm.is_some() {
-            return self.handle_confirm_key(key, view).await;
-        }
-        if view.provider_auth.is_some() {
-            return self.handle_provider_auth_key(key, view).await;
-        }
-        if view.auth_panel.is_some() {
-            return self.handle_auth_panel_key(key, view);
-        }
-        if view.settings_menu.is_some() {
-            return self.handle_settings_menu_key(key, view).await;
-        }
-        // The `/share` loader owns the frame while an upload runs.
-        if view.share_loader.is_some() {
-            return self.handle_share_loader_key(key, view);
+        // The open overlay owns the frame: its keys go before the editor, viewport keys, and
+        // Ctrl+C. The onboarding pane drives its own input loop, and the reload box takes no keys.
+        match view.overlay {
+            Some(Overlay::ModelPicker(_)) => return self.handle_model_picker_key(key, view).await,
+            Some(Overlay::ChoicePicker(_)) => {
+                return self.handle_choice_picker_key(key, view).await
+            }
+            Some(Overlay::Mcp(_)) => return self.handle_mcp_view_key(key, view),
+            Some(Overlay::Factory(_)) => return self.handle_factory_view_key(key, view).await,
+            Some(Overlay::Heartbeats(_)) => {
+                return self.handle_heartbeats_picker_key(key, view).await;
+            }
+            Some(Overlay::Bash(_)) => return self.handle_bash_view_key(key, view),
+            Some(Overlay::Goal(_)) => return self.handle_goal_panel_key(key, view),
+            Some(Overlay::Info(_)) => return self.handle_info_panel_key(key, view),
+            Some(Overlay::Tree(_)) => return self.handle_tree_selector_key(key, view).await,
+            Some(Overlay::Fork(_)) => return self.handle_fork_selector_key(key, view).await,
+            Some(Overlay::Confirm { .. }) => return self.handle_confirm_key(key, view).await,
+            Some(Overlay::ProviderAuth(_)) => {
+                return self.handle_provider_auth_key(key, view).await;
+            }
+            Some(Overlay::AuthPanel(_)) => return self.handle_auth_panel_key(key, view),
+            Some(Overlay::Settings(_)) => return self.handle_settings_menu_key(key, view).await,
+            Some(Overlay::ShareLoader(_)) => return self.handle_share_loader_key(key, view),
+            None | Some(Overlay::Onboarding(_) | Overlay::Reload(_)) => {}
         }
         let Some(id) = key_event_to_id(&key) else {
             return Ok(());
@@ -402,70 +387,72 @@ impl SessionUi {
             // The viewport consumes the key before the editor, so a selection must
             // collapse here or it survives the scroll as a stale replace range.
             view.editor.clear_selection();
-            view.scroll_by(-(view.page_size() as isize));
+            self.window.scroll(-(view.page_size() as isize), view);
             self.track_scroll("page_up", view.is_following());
             self.dirty = true;
             return Ok(());
         }
         if page_down {
             view.editor.clear_selection();
-            view.scroll_by(view.page_size() as isize);
+            self.window.scroll(view.page_size() as isize, view);
             self.track_scroll("page_down", view.is_following());
             self.dirty = true;
             return Ok(());
         }
         if to_top {
             view.scroll_to_top();
+            self.window.request_head();
             self.track_scroll("top", view.is_following());
             self.dirty = true;
             return Ok(());
         }
         if follow {
+            self.collapse_transcript_window(view);
             view.scroll_to_bottom();
             self.track_scroll("follow", view.is_following());
             self.dirty = true;
             return Ok(());
         }
-        // The activity dock owns focus while focused; every other key falls
-        // through after releasing the focus.
+        // The focused (expanded) dock owns these keys; every other key falls through after
+        // releasing the focus. Configured bindings match first, so a rebound arrow keeps its
+        // configured action; the literal Left/Right fallbacks apply only after none matched.
         if self.subagents_focused {
             let kb = view.editor.keybindings();
-            if kb.matches(&id, "tui.select.confirm") || kb.matches(&id, "app.subagents.focus") {
+            let open =
+                kb.matches(&id, "tui.select.confirm") || kb.matches(&id, "app.subagents.focus");
+            let down = kb.matches(&id, "tui.select.down");
+            let up = kb.matches(&id, "tui.select.up");
+            let back = kb.matches(&id, "tui.select.cancel") || kb.matches(&id, "app.agents.back");
+            let expand = kb.matches(&id, "app.tools.expand");
+            if open {
                 self.open_dock_group_view(view);
                 return Ok(());
             }
-            if id == "left" && self.activity_group == crate::chrome::ActivityGroup::Subagents {
-                // Left from the subagents selection opens the agents view (the operator's
-                // 2026-09-28 muscle-memory ask; left reads as `agents back` everywhere else).
-                self.open_dock_group_view(view);
-                return Ok(());
-            }
-            if id == "left" || id == "right" {
-                // One press, one group: the step wraps at the row's ends, so an empty group is
-                // still visited (the operator's 2026-09-26 directive).
-                let direction = if id == "left" {
-                    crate::chrome::ActivityDirection::Prev
-                } else {
+            let dock = self.activity_dock_state();
+            // Up from the top row leaves the dock; Down from the bottom row wraps to the top.
+            if down || (up && dock.groups()[0] != self.activity_group) {
+                let direction = if down {
                     crate::chrome::ActivityDirection::Next
+                } else {
+                    crate::chrome::ActivityDirection::Prev
                 };
-                self.activity_group = self
-                    .activity_dock_state()
-                    .step(self.activity_group, direction);
+                self.activity_group = dock.step(self.activity_group, direction);
                 self.update_subagent_summary(view);
                 self.dirty = true;
                 return Ok(());
             }
-            if kb.matches(&id, "tui.select.up")
-                || kb.matches(&id, "tui.select.cancel")
-                || kb.matches(&id, "app.agents.back")
-            {
+            if expand {
+                self.cycle_detail(view);
+                return Ok(());
+            }
+            if up || back || id == "left" {
                 self.subagents_focused = false;
                 self.update_subagent_summary(view);
                 self.dirty = true;
                 return Ok(());
             }
-            if kb.matches(&id, "app.tools.expand") {
-                self.cycle_detail(view);
+            if id == "right" {
+                self.open_dock_group_view(view);
                 return Ok(());
             }
             self.subagents_focused = false;
@@ -535,15 +522,17 @@ impl SessionUi {
                 "clear"
             };
             if action == "tree" && self.escape_tree_shortcut_spent {
-                // The gesture already fired: this press interrupts like every Escape
-                // but arms no reopen.
-                self.interrupt_running_work(view);
+                // The gesture already fired: this press interrupts like every
+                // Escape but arms no reopen — the one bare press the idle
+                // backgrounded-cell cancel may ride.
+                self.interrupt_running_work(view, InterruptOrigin::Bare);
                 return Ok(());
             }
             self.arm_escape_repeat(action);
-            // The repeat arms, then the same abort ladder as the Ctrl+C interrupt
-            // runs, minus the exit hint.
-            self.interrupt_running_work(view);
+            // The repeat arms, then the same abort ladder as the Ctrl+C
+            // interrupt runs, minus the exit hint. The press ARMS the
+            // clear/tree repeat, so the idle scoped cancel never rides it.
+            self.interrupt_running_work(view, InterruptOrigin::Arming);
             return Ok(());
         }
         if view.editor.keybindings().matches(&id, "app.exit") && view.editor.get_text().is_empty() {
@@ -555,11 +544,6 @@ impl SessionUi {
         // second-press exit is ctrl+c's alone.
         let interrupt = view.editor.keybindings().matches(&id, "app.interrupt");
         if interrupt || view.editor.keybindings().matches(&id, "app.clear") {
-            // One handled Ctrl+C press: the force-quit guard disarms once every
-            // observed press of the pair was handled without an exit.
-            if id == "ctrl+c" {
-                self.exit_guard.note_ctrl_c_handled();
-            }
             if view.editor.is_showing_autocomplete() {
                 view.editor.cancel_autocomplete();
                 self.clear_ctrl_c_hint();
@@ -592,7 +576,9 @@ impl SessionUi {
                     }
                 });
             }
-            self.interrupt_running_work(view);
+            // The press ARMS the Ctrl+C exit pair, so the idle scoped
+            // cancel never rides it.
+            self.interrupt_running_work(view, InterruptOrigin::Arming);
             self.show_ctrl_c_hint();
             self.dirty = true;
             return Ok(());
@@ -827,7 +813,7 @@ impl SessionUi {
                         self.open_model_picker(view, partial.trim()).await?;
                         // Belt-and-braces (the picker always mounts here); keeps the
                         // failed-open contract symmetric with the mcp arm.
-                        if view.model_picker.is_none() {
+                        if !matches!(view.overlay, Some(Overlay::ModelPicker(_))) {
                             self.picker_restored_draft = false;
                         }
                         self.track_menu_opened("model", "tab");
@@ -838,7 +824,7 @@ impl SessionUi {
                         self.open_mcp_view("/mcp", view, partial.trim()).await?;
                         // A failed roster load leaves no view mounted; the flag must not leak into
                         // the NEXT picker.
-                        if view.mcp_view.is_none() {
+                        if !matches!(view.overlay, Some(Overlay::Mcp(_))) {
                             self.picker_restored_draft = false;
                         }
                         self.track_menu_opened("mcp", "tab");

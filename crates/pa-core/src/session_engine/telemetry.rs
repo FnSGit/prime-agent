@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use pa_agent::agent::Subscription;
-use pa_agent::types::{AgentEvent, AssistantMessage, StopReason, Usage};
+use pa_agent::types::{AgentEvent, AssistantMessage, StopReason, ToolResultContent, Usage};
 use pa_telemetry::{
     base_properties, Properties, RunTrigger, TelemetryClient, TelemetryClientConfig, ToolCategory,
 };
@@ -36,8 +36,8 @@ use super::error_classify::classify_error_message;
 mod track;
 pub use track::{
     track_catalog_refresh, track_compaction_abort_declared, track_daemon_event_summary,
-    track_deleted_child_usage_captured, track_model_refused, track_sessions_archived,
-    track_worker_adoption, track_worker_children_closed,
+    track_deleted_child_usage_captured, track_model_refused, track_worker_adoption,
+    track_worker_children_closed,
 };
 
 mod classify;
@@ -47,7 +47,7 @@ mod status;
 use classify::{error_category, model_category, opt_value, run_outcome};
 pub use status::{
     set_telemetry_enabled_text, telemetry_endpoint, telemetry_status_text, telemetry_switch,
-    TelemetrySwitch,
+    TelemetrySwitch, TELEMETRY_SWITCH_VARS,
 };
 
 #[cfg(test)]
@@ -183,6 +183,7 @@ struct SessionTotals {
     aborted_run_count: u64,
     prompt_count: u64,
     tool_call_count: u64,
+    video_attachment_count: u64,
     compaction_count: u64,
     retry_count: u64,
     failover_count: u64,
@@ -240,6 +241,8 @@ struct ActiveRun {
     turn_count: u64,
     tool_call_count: u64,
     tool_error_count: u64,
+    /// Video blocks the tool results carried (the `attach_video` adoption count).
+    video_attachment_count: u64,
     compaction_count: u64,
     retry_count: u64,
     failover_count: u64,
@@ -517,6 +520,25 @@ impl SessionTelemetry {
         }
     }
 
+    /// A model call outside the agent loop billed the session (a row
+    /// [`billed_row`](crate::session::billed_row) classifies: a compaction,
+    /// a branch summary, a refinement or side-question call). Like
+    /// [`Self::note_compaction`], its cost counts toward the active run.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the telemetry state mutex is poisoned.
+    pub fn note_billed_call(&self, usage: &pa_types::ai::Usage) {
+        let mut state = self.state.lock().expect("telemetry state poisoned");
+        if !state.recording {
+            sever_off_period_run(&mut state);
+            return;
+        }
+        if let Some(run) = state.active_run.as_mut() {
+            run.cost_usd += usage.cost.total.as_f64();
+        }
+    }
+
     /// One auto-retry event from the retry seam (TS `auto_retry_start`):
     /// `Start` counts the retry (and a backup-provider switch as a
     /// failover) into the active run, sums the retry wait, and keeps the
@@ -616,6 +638,10 @@ impl SessionTelemetry {
             properties.set("failed_run_count", Value::from(totals.failed_run_count));
             properties.set("aborted_run_count", Value::from(totals.aborted_run_count));
             properties.set("tool_call_count", Value::from(totals.tool_call_count));
+            properties.set(
+                "video_attachment_count",
+                Value::from(totals.video_attachment_count),
+            );
             properties.set("compaction_count", Value::from(totals.compaction_count));
             properties.set(
                 "model_call_count",
@@ -751,6 +777,7 @@ fn handle_event(
                 turn_count: 0,
                 tool_call_count: 0,
                 tool_error_count: 0,
+                video_attachment_count: 0,
                 compaction_count: 0,
                 retry_count: 0,
                 failover_count: 0,
@@ -897,8 +924,8 @@ fn handle_event(
         AgentEvent::ToolExecutionEnd {
             tool_call_id,
             tool_name,
+            result,
             is_error,
-            ..
         } => {
             let started_at = state.tool_starts.remove(&tool_call_id);
             let duration_ms = started_at.map_or(0, |start| now.saturating_sub(start));
@@ -908,6 +935,12 @@ fn handle_event(
                 if is_error {
                     run.tool_error_count += 1;
                 }
+                // The kernel turns only accepted video attachments into video blocks.
+                run.video_attachment_count += result
+                    .content
+                    .iter()
+                    .filter(|block| matches!(block, ToolResultContent::Video(_)))
+                    .count() as u64;
                 run.tool_duration_ms += duration_ms;
                 let tool_stats = run.tool_summary.entry(category).or_default();
                 tool_stats.calls += 1;
@@ -927,7 +960,9 @@ fn handle_event(
         // Both are still run-scoped events: while the cached decision is
         // off they sever (a tool whose execution spans an opt-out observed
         // at a boundary never counts into a surviving run).
-        AgentEvent::TurnEnd { .. } | AgentEvent::ToolExecutionUpdate { .. } => {}
+        AgentEvent::TurnEnd { .. }
+        | AgentEvent::ToolExecutionUpdate { .. }
+        | AgentEvent::ToolExecutionProgress { .. } => {}
     }
 }
 
@@ -953,6 +988,7 @@ fn finalize_run_locked(client: &TelemetryClient, execution_mode: &str, state: &m
     let outcome = run_outcome(run.last_assistant.as_ref());
     state.totals.run_count += 1;
     state.totals.tool_call_count += run.tool_call_count;
+    state.totals.video_attachment_count += run.video_attachment_count;
     state.totals.compaction_count += run.compaction_count;
     match outcome {
         "success" => state.totals.successful_run_count += 1,
@@ -1139,7 +1175,10 @@ pub fn build_client(
             config.install_id = id;
             let mut sinks: Vec<Arc<dyn pa_telemetry::TelemetrySink>> = Vec::new();
             if let Some(endpoint) = telemetry_endpoint() {
-                sinks.push(Arc::new(pa_telemetry::AnalyticsSink::new(endpoint)));
+                sinks.push(Arc::new(pa_telemetry::AnalyticsSink::new(
+                    endpoint,
+                    pa_ai::utils::tls::http_client_builder(),
+                )));
             }
             let local_mirror = settings
                 .settings()

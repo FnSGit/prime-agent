@@ -54,6 +54,10 @@ pub(crate) fn wants_chunked(capabilities: &[String]) -> bool {
     capabilities.iter().any(|cap| cap == "chunked_snapshot")
 }
 
+pub(crate) fn wants_windowed(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|cap| cap == "windowed_snapshot")
+}
+
 /// True when the client asked for image payloads to leave the snapshot (`elide_snapshot_images`).
 pub(crate) fn wants_image_elision(capabilities: &[String]) -> bool {
     capabilities
@@ -66,6 +70,7 @@ pub(crate) fn wants_image_elision(capabilities: &[String]) -> bool {
 /// `widthPx`/`heightPx`. The transcript's image rows are fallback-only metadata
 /// (TS mounts `Image` components with `fallbackOnly`), so an image-heavy session
 /// stops shipping megabytes of base64 per attach; the store keeps the payload.
+/// A `toolResult` video block is elided the same way, with `elidedBytes` only.
 pub(crate) fn elide_snapshot_image_payloads(messages: &mut [Value]) {
     for message in messages.iter_mut() {
         if message.get("role").and_then(Value::as_str) != Some("toolResult") {
@@ -76,6 +81,7 @@ pub(crate) fn elide_snapshot_image_payloads(messages: &mut [Value]) {
         };
         for block in content.iter_mut() {
             let is_image = block.get("type").and_then(Value::as_str) == Some("image");
+            let is_video = block.get("type").and_then(Value::as_str) == Some("video");
             // The immutable reads (payload length, the bounded-prefix dimension parse) end
             // here; the marker writes below borrow the block mutably.
             let (payload_chars, dimensions) = match (
@@ -91,6 +97,8 @@ pub(crate) fn elide_snapshot_image_payloads(messages: &mut [Value]) {
                         pa_core::IMAGE_DIMENSIONS_PREFIX_BYTES,
                     ),
                 ),
+                // A video has no pixel dimensions to keep: the size alone marks the elision.
+                (false, Some(data), Some(_)) if is_video && !data.is_empty() => (data.len(), None),
                 _ => continue,
             };
             let Some(object) = block.as_object_mut() else {
@@ -143,20 +151,23 @@ pub(crate) fn stream_attach(
         .get_mut("snapshot")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| anyhow!("Session worker did not provide a snapshot"))?;
-    let message_count = snapshot
-        .get("summary")
-        .and_then(|summary| summary.get("messageCount"))
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("Session snapshot is missing its message count"))?;
+    // The transcript leaves the response; the snapshot header keeps an
+    // empty `messages` array so the streamed shape matches the full one.
+    let messages = snapshot.remove("messages").unwrap_or(Value::Null);
+    snapshot.insert("messages".to_string(), Value::Array(Vec::new()));
+    // The stream's count is the transcript it carries: a windowed attach
+    // streams the tail alone, while `summary.messageCount` stays the
+    // session's total (the page cursor is `historyBeforeEntryId`).
+    let message_count = match &messages {
+        Value::Array(messages) => messages.len() as u64,
+        // A missing or malformed transcript fails the transfer below.
+        _ => 0,
+    };
     let stream = SnapshotStream {
         id: snapshot_stream_id(active_session_id, &generation, last_event_sequence),
         message_count,
         target_chunk_bytes: SNAPSHOT_TARGET_CHUNK_BYTES as u64,
     };
-    // The transcript leaves the response; the snapshot header keeps an
-    // empty `messages` array so the streamed shape matches the full one.
-    let messages = snapshot.remove("messages").unwrap_or(Value::Null);
-    snapshot.insert("messages".to_string(), Value::Array(Vec::new()));
     // Legacy (non-slim) attach results duplicate the transcript at the top
     // level; the streamed form drops the copy instead of shipping it empty.
     match object.get_mut("messages") {
@@ -355,9 +366,24 @@ mod tests {
         })
     }
 
+    fn video_tool_result(payload: &str) -> Value {
+        json!({
+            "role": "toolResult",
+            "toolCallId": "call-2",
+            "toolName": "ipython",
+            "content": [
+                { "type": "text", "text": "Loaded 1 video(s) into context: /tmp/clip.mp4" },
+                { "type": "video", "data": payload, "mimeType": "video/mp4" }
+            ],
+            "isError": false,
+            "timestamp": 3
+        })
+    }
+
     #[test]
     fn elision_empties_image_payloads_and_keeps_their_metadata() {
         let payload = format!("{}{}", tiny_png(64, 32), "A".repeat(500_000));
+        let video_payload = "B".repeat(600_000);
         let mut messages = vec![
             json!({ "role": "user", "content": "hello", "timestamp": 0 }),
             image_tool_result(&payload),
@@ -366,6 +392,7 @@ mod tests {
                 "content": [ { "type": "text", "text": "done" } ],
                 "timestamp": 2
             }),
+            video_tool_result(&video_payload),
         ];
         elide_snapshot_image_payloads(&mut messages);
         let block = &messages[1]["content"][1];
@@ -374,6 +401,11 @@ mod tests {
         assert_eq!(block["widthPx"], json!(64));
         assert_eq!(block["heightPx"], json!(32));
         assert_eq!(block["mimeType"], json!("image/png"));
+        // A video block keeps its mime type and size, with no pixel dimensions.
+        assert_eq!(
+            messages[3]["content"][1],
+            json!({ "type": "video", "data": "", "mimeType": "video/mp4", "elidedBytes": 600_000 })
+        );
         // The other messages and the text block stay verbatim.
         assert_eq!(
             messages[0],
@@ -485,15 +517,6 @@ mod tests {
             error.to_string(),
             "Session worker did not provide a snapshot"
         );
-        let mut data = attach_result(&[]);
-        data["snapshot"]["summary"]
-            .as_object_mut()
-            .unwrap()
-            .remove("messageCount");
-        assert!(stream_attach(data, "s1", SnapshotPurpose::Attach)
-            .unwrap_err()
-            .to_string()
-            .contains("message count"));
         let mut data = attach_result(&[]);
         data.as_object_mut().unwrap().remove("lastEventCursor");
         data["snapshot"]

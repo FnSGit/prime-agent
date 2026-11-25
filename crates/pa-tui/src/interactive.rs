@@ -39,18 +39,18 @@ use render::{
     TerminalHandoff,
 };
 
-mod reconnect;
+pub(crate) mod reconnect;
 
 use reconnect::{
-    arm_shutdown_recovery, ReconnectConnect, ReconnectLoop, SessionReconnect,
+    Connection, ConnectionEffect, ConnectionEvent, ReconnectConnect,
     SESSION_RECONNECT_ATTEMPT_TIMEOUT_S,
 };
 #[cfg(test)]
-use reconnect::{DAEMON_SHUTDOWN_RECONNECT_WINDOW, SHUTDOWN_RECONNECT_RETRY};
+use reconnect::{ReconnectLoop, DAEMON_SHUTDOWN_RECONNECT_WINDOW, SHUTDOWN_RECONNECT_RETRY};
 
 mod run;
 
-pub use run::{run_interactive, run_interactive_agents_view_open};
+pub use run::{run_interactive, run_interactive_agents_view_open, run_interactive_origin_open};
 
 use crossterm::event::KeyEvent;
 use crossterm::terminal;
@@ -58,7 +58,7 @@ use ratatui::Terminal;
 use tokio::sync::mpsc;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Which session the interactive run opens.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,12 +78,55 @@ pub enum SessionSelection {
     Resume(PathBuf),
 }
 
+impl SessionSelection {
+    /// How a roster summary opens: attach its live runtime
+    /// (`activeSessionId`), else resume its saved file (`sessionFile`);
+    /// `None` when it has neither.
+    pub(crate) fn open_summary(summary: &Value) -> Option<Self> {
+        let field = |name: &str| {
+            summary
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+        };
+        field("activeSessionId")
+            .map(|active| Self::Attach(active.to_string()))
+            .or_else(|| field("sessionFile").map(|file| Self::Resume(PathBuf::from(file))))
+    }
+}
+
+/// The session panel an agents-view activity line mounts when its session opens; the panel's close
+/// returns to the agents view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionPanel {
+    /// The Bash panel, on `shell_id`'s row when a persistent shell row opened it.
+    Shells { shell_id: Option<String> },
+    /// The factory page, on `row` when a return from a state's session reopened it.
+    FactoryRuns {
+        row: Option<crate::factory_view::FactoryRow>,
+    },
+}
+
+/// The page that requested a session (the factory page's state open): leaving the requested
+/// session reopens the requesting session with this panel mounted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionOrigin {
+    pub panel: SessionPanel,
+    /// The panel's close returns to the agents view (an agents-view activity line mounted it),
+    /// not to the chat.
+    pub closes_to_agents_view: bool,
+}
+
 /// Cap on the exit-path telemetry flush (the `tui exit` event's bound):
 /// the analytics sink alone allows up to 1.5s, so an exit-path event is
 /// dropped rather than awaited past the exit-within-1s contract. The
 /// interactive loop and the composition root's exit paths share this one
 /// bound.
 pub const TELEMETRY_EXIT_TIMEOUT_MS: u64 = 500;
+
+/// The kernel activity poll cadence: the session's shells/factory refresh and the agents view's
+/// activity-line counts and persistent shells list.
+pub(crate) const ACTIVITY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Explicit model selection carried into every `create` config: the CLI
 /// `--provider`/`--model`/`--api-key`/`--thinking` flags, authoritative end-to-end — the
@@ -241,7 +284,8 @@ pub trait InteractionTelemetry: Send + Sync {
         scoped: bool,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
     /// An agents-view action ran (`tui agents action`): `action` is `program_shown` (the ctrl+o
-    /// toggle turned a spawn program on) or `renamed` — primitives only.
+    /// toggle turned a spawn program on), `renamed`, or `content_search` (ctrl+f switched the
+    /// search to message text) — primitives only.
     fn agents_view_action(
         &self,
         action: &'static str,
@@ -256,6 +300,8 @@ pub trait InteractionTelemetry: Send + Sync {
         cell_lines: usize,
         count: usize,
     ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+    /// A tool call started executing with a live timer; counted on `tui exit`.
+    fn live_tool_timer_started(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
 }
 
 /// Options for one interactive run. `Debug` skips the telemetry handle (the trait object is not
@@ -309,7 +355,7 @@ pub struct InteractiveOptions {
     /// Telemetry opt-out: `Some(true)` only when the invocation disabled telemetry; carried on
     /// create/attach so the daemon worker installs no telemetry subscriber.
     pub telemetry_disabled: Option<bool>,
-    /// `/mcp login` / `/mcp logout`: the client-side auth flows the composition root provides;
+    /// MCP connect flows opened from the `/mcp` view, provided by the composition root;
     /// `None` reports the commands as unavailable.
     pub client_auth: Option<crate::client_auth::ClientAuthCommandsHandle>,
     /// `/traces`: the settings + credential state the composition root owns (the trace upload
@@ -444,6 +490,11 @@ pub struct InteractiveOutcome {
     pub agents_view_scope: Option<crate::agents_view::AgentsViewScope>,
     /// `/resume <selector>` requested this session next.
     pub selection_request: Option<SessionSelection>,
+    /// The requested session's RLM depth, when the requester read it from the roster.
+    pub selection_rlm_depth: Option<u32>,
+    /// Where leaving the requested session returns (see [`SelectionOrigin`]); `None` returns to
+    /// the agents view.
+    pub selection_origin: Option<SelectionOrigin>,
     /// Texts copied out by finished mouse selections (headless runs have no terminal for
     /// OSC 52; the verifiers read these).
     pub copies: Vec<String>,
@@ -474,6 +525,8 @@ enum UiInput {
     },
     /// One materialized input-idle tick (the headless `SettleIdle` step).
     SettleIdle,
+    /// The end of one terminal write ([`crate::input::ReaderInput::ChunkEnd`]).
+    InputChunkEnd,
     WaitIdle {
         timeout_ms: u64,
     },
@@ -486,6 +539,7 @@ enum UiInput {
         timeout_ms: u64,
     },
     ScrollTop,
+    Timestamp(std::sync::mpsc::Sender<(Instant, usize)>),
     Resize,
     HeadlessDone,
 }

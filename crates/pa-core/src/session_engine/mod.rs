@@ -6,28 +6,36 @@ pub mod agent_messaging;
 pub mod auto_refine_trigger;
 pub mod auto_retry;
 pub mod auxiliary_model;
+pub mod bash_notices;
 pub mod branch_summarization;
 pub mod compact_session;
 pub mod compaction;
 pub mod compaction_exec;
 pub mod compaction_trace;
 pub mod compaction_utils;
+pub mod decision_api;
 pub mod engine;
 pub mod error_classify;
 pub mod factory_host;
 pub mod goal_boundary;
+pub mod goal_continuation;
 pub mod goal_driver;
 pub mod harness_digest;
 pub mod headless;
 pub mod host_requests;
 pub mod image_model_routing;
+pub mod inbox;
 pub mod ipython_state;
+pub mod late_sent_messages;
 pub mod messages;
+pub mod model_resolution_notice;
+pub mod model_usage;
 pub mod provider_adapter;
 pub mod provider_failover;
 pub mod provider_park;
 pub mod provider_retry;
 pub mod refine;
+mod refinement_gate;
 pub mod request_timing;
 pub mod rlm_host;
 pub mod rlm_notices;
@@ -38,6 +46,7 @@ pub mod semantic_edges;
 pub mod session_commands;
 pub mod session_events;
 pub mod side_question;
+pub mod skill_problems_notice;
 pub mod skills_unavailable_notice;
 pub mod slash_commands;
 pub mod state_restore_notice;
@@ -74,6 +83,12 @@ pub enum PromptOutcome {
     /// Input recognized as a session command; execution is the session
     /// engine's job.
     SessionCommand(SessionSlashCommand),
+    /// The session was busy and the delivery's streaming behavior parked
+    /// the row on the agent's lane instead of running it (the TS
+    /// `queueIfBusy` contract): the running turn's next boundary — or the
+    /// next run's poll — delivers it. The caller must not report the
+    /// parked row as a finished turn.
+    Queued,
 }
 
 /// Options for `AgentSession::prompt`.
@@ -135,11 +150,12 @@ pub struct AgentSession {
     /// Whether this session may auto-refine; defaults off until the
     /// engine wiring resolves it.
     auto_refine_allowed: bool,
+    refinement_settings: Option<crate::settings::SettingsManager>,
     /// The resolved auto-refine gates; the compact trigger reads them.
     auto_refine: refine::AutoRefineGates,
     /// Session-side auto-refine state the transport surfaces arm and
     /// consume.
-    compact_auto_refine: std::sync::Mutex<auto_refine_trigger::CompactAutoRefineState>,
+    compact_auto_refine: Arc<std::sync::Mutex<auto_refine_trigger::CompactAutoRefineState>>,
     /// The kernel-state probe behind the post-compaction
     /// `ipython_state` notice; `None` without a kernel.
     kernel_state: Option<std::sync::Arc<dyn ipython_state::CompactionKernelProbe>>,
@@ -161,7 +177,11 @@ pub struct AgentSession {
     /// One compaction at a time: a second `compact` waits for the
     /// in-flight run and prepares against its result; reads and writes
     /// keep using the session lock meanwhile.
-    compaction_flight: tokio::sync::Mutex<()>,
+    compaction_flight: Arc<tokio::sync::Mutex<()>>,
+    /// Refinement runs currently planning or committing (`refine.status`'s
+    /// `in_flight`): every run holds its flight guard for its whole body.
+    refinements_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    refinement_cancel: std::sync::Mutex<pa_agent::abort::AbortController>,
     /// The session's semantic-edge recorder (TS
     /// `AgentSession._semanticEdges`): `None` in sessions the engine
     /// built without a semantic identity (verification harnesses
@@ -181,6 +201,10 @@ pub struct AgentSession {
     /// resolves it (verification harnesses building the session directly
     /// keep `None`, which reads as the fail-closed disabled default).
     agent_dir: Option<std::path::PathBuf>,
+    /// Where the session's own model calls outside the agent loop record
+    /// their `model_usage` rows: the session file unless the host binds
+    /// its durable store (the daemon worker's).
+    usage_store: std::sync::Arc<dyn rlm_usage::RlmChildUsageStore>,
 }
 
 impl AgentSession {
@@ -218,6 +242,7 @@ impl AgentSession {
         harness_digest: Option<harness_digest::HarnessDigestContext>,
     ) -> anyhow::Result<Self> {
         let persistence = session.clone();
+        let usage_store = std::sync::Arc::new(rlm_usage::SessionUsageStore(session.clone()));
         agent
             .subscribe(move |event, _signal| {
                 let persistence = persistence.clone();
@@ -237,8 +262,9 @@ impl AgentSession {
             compaction: std::sync::RwLock::new(compaction::CompactionSettings::default()),
             auxiliary_model: None,
             auto_refine_allowed: false,
+            refinement_settings: None,
             auto_refine: refine::AutoRefineGates::default(),
-            compact_auto_refine: std::sync::Mutex::default(),
+            compact_auto_refine: Arc::default(),
             kernel_state: None,
             pending_next_turn_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             skills: Vec::new(),
@@ -248,7 +274,10 @@ impl AgentSession {
             semantic_edges: std::sync::Mutex::new(None),
             side_question_stream_fn: std::sync::Mutex::new(None),
             agent_dir: None,
-            compaction_flight: tokio::sync::Mutex::new(()),
+            compaction_flight: Arc::new(tokio::sync::Mutex::new(())),
+            refinements_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            refinement_cancel: std::sync::Mutex::default(),
+            usage_store,
         };
         this.ensure_harness_digest_context().await?;
         Ok(this)
@@ -402,6 +431,36 @@ async fn persist_event(
                 eprintln!("pa-core: message row not persisted: {error}");
             }
         }
+        // Tool-call lifecycle rows: the start and running sides of the
+        // trace (the completion side is the toolResult message row). Like
+        // the message arm, a failed durable write never fails the run.
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => {
+            let result = session
+                .lock()
+                .await
+                .append_tool_started(&tool_call_id, &tool_name, args);
+            if let Err(error) = result {
+                eprintln!("pa-core: tool_started row not persisted: {error}");
+            }
+        }
+        AgentEvent::ToolExecutionProgress {
+            tool_call_id,
+            tool_name,
+            elapsed_ms,
+        } => {
+            let result =
+                session
+                    .lock()
+                    .await
+                    .append_tool_progress(&tool_call_id, &tool_name, elapsed_ms);
+            if let Err(error) = result {
+                eprintln!("pa-core: tool_progress row not persisted: {error}");
+            }
+        }
         // Git state is captured at both run boundaries, exactly like the
         // TS run-boundary event path: a commit or branch switch made during the run
         // (e.g. via the bash tool) lands in the session file at `agent_end`.
@@ -488,3 +547,12 @@ mod compaction_outcome_tests;
 
 #[cfg(test)]
 mod compaction_unblocked_tests;
+
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        self.refinement_cancel
+            .get_mut()
+            .expect("refinement cancellation lock")
+            .abort();
+    }
+}

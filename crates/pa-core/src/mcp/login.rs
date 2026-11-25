@@ -11,7 +11,7 @@ use crate::auth::{AuthStorage, OAuthIntegration};
 
 use super::oauth::{mcp_login, McpLoginUi, McpOAuthConfig};
 use super::oauth_http::OAuthHttp;
-use super::McpManager;
+use super::{McpManager, McpServerConfig, UserServersFn};
 
 /// One server's login execution: the resolved OAuth config plus the auth store. Detached from the
 /// manager on purpose — the flow awaits UI input, so no manager lock may be held across it.
@@ -51,13 +51,29 @@ impl McpManager {
         if !integration.uses_oauth {
             return None;
         }
-        let url = integration.config_url().map(str::to_string)?;
+        let McpServerConfig::Http {
+            url,
+            client_id,
+            callback_port,
+            client_secret,
+            scopes,
+            ..
+        } = &integration.config
+        else {
+            unreachable!("uses_oauth implies an http config");
+        };
+        // Slack defaults follow the endpoint; explicit user settings take precedence.
+        let slack = url == "https://mcp.slack.com/mcp";
         Some(McpOAuthConfig {
             server: integration.server.clone(),
             label: integration.label.clone(),
-            url,
-            client_id: None,
-            scopes: None,
+            url: url.clone(),
+            client_id: client_id
+                .clone()
+                .or_else(|| slack.then(|| "1601185624273.8899143856786".to_string())),
+            callback_port: (*callback_port).or(slack.then_some(3118)),
+            client_secret: client_secret.clone(),
+            scopes: scopes.clone(),
         })
     }
 
@@ -121,25 +137,19 @@ pub fn wire_begin_login(
 /// asks the stored endpoint for a fresh token.
 pub struct McpOAuth {
     http: Arc<dyn OAuthHttp>,
-}
-
-impl Default for McpOAuth {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Reads `mcpServers`: a configured `clientSecret` stays in settings, never in the credential.
+    user_servers: UserServersFn,
 }
 
 impl McpOAuth {
     #[must_use]
-    pub fn new() -> Self {
-        McpOAuth {
-            http: Arc::new(super::ReqwestOAuthHttp::new()),
-        }
+    pub fn new(user_servers: UserServersFn) -> Self {
+        Self::with_http(Arc::new(super::ReqwestOAuthHttp::new()), user_servers)
     }
 
     /// A fixed transport (tests and embedded hosts).
-    pub fn with_http(http: Arc<dyn OAuthHttp>) -> Self {
-        McpOAuth { http }
+    pub fn with_http(http: Arc<dyn OAuthHttp>, user_servers: UserServersFn) -> Self {
+        McpOAuth { http, user_servers }
     }
 }
 
@@ -159,11 +169,22 @@ impl McpOAuth {
         else {
             return None;
         };
+        // Only the server entry the credential was issued for may lend its secret.
+        let client_secret = (self.user_servers)()
+            .and_then(|mut servers| servers.remove(&server))
+            .and_then(|config| match config {
+                McpServerConfig::Http {
+                    url, client_secret, ..
+                } if url == *endpoint => client_secret,
+                McpServerConfig::Http { .. } | McpServerConfig::Stdio { .. } => None,
+            });
         let config = McpOAuthConfig {
             server: server.clone(),
             label: server,
             url: endpoint.clone(),
             client_id: None,
+            callback_port: None,
+            client_secret,
             scopes: None,
         };
         let http = Arc::clone(&self.http);
@@ -206,9 +227,11 @@ impl OAuthIntegration for McpOAuth {
         &self,
         provider_id: &str,
         credentials: &crate::auth::AuthStorageData,
-    ) -> Option<AuthCredential> {
-        let credential = credentials.credential(provider_id)?;
-        self.refresh_blocking(provider_id, &credential)
+    ) -> Result<AuthCredential, String> {
+        credentials
+            .credential(provider_id)
+            .and_then(|credential| self.refresh_blocking(provider_id, &credential))
+            .ok_or_else(|| "the MCP token refresh failed".to_string())
     }
 }
 
@@ -221,13 +244,16 @@ mod tests {
     use serde_json::json;
     use std::collections::HashMap;
 
-    /// A scripted transport (url -> response); unknown urls fail.
-    struct ScriptedHttp(HashMap<String, OAuthHttpResponse>);
+    /// A scripted transport (url -> response) that records request bodies; unknown urls fail.
+    struct ScriptedHttp {
+        responses: HashMap<String, OAuthHttpResponse>,
+        bodies: Mutex<Vec<(String, Option<String>)>>,
+    }
 
     impl ScriptedHttp {
         fn new(responses: Vec<(&str, u16, &str)>) -> Self {
-            ScriptedHttp(
-                responses
+            ScriptedHttp {
+                responses: responses
                     .into_iter()
                     .map(|(url, status, body)| {
                         (
@@ -243,7 +269,8 @@ mod tests {
                         )
                     })
                     .collect(),
-            )
+                bodies: Mutex::default(),
+            }
         }
     }
 
@@ -253,7 +280,11 @@ mod tests {
             request: super::super::oauth_http::OAuthHttpRequest,
         ) -> futures::future::BoxFuture<'_, Result<OAuthHttpResponse>> {
             Box::pin(async move {
-                self.0
+                self.bodies
+                    .lock()
+                    .unwrap()
+                    .push((request.url.clone(), request.body.clone()));
+                self.responses
                     .get(&request.url)
                     .cloned()
                     .ok_or_else(|| anyhow!("unexpected request: {}", request.url))
@@ -303,12 +334,13 @@ mod tests {
         user_servers: Option<HashMap<String, McpServerConfig>>,
         http: Arc<dyn OAuthHttp>,
     ) -> Arc<Mutex<McpManager>> {
+        let user_servers: UserServersFn = Arc::new(move || user_servers.clone());
         let manager = McpManager::new(McpManagerOptions {
             auth_storage: AuthStorage::create_with_oauth(
                 agent_dir,
-                Arc::new(McpOAuth::with_http(http)),
+                Arc::new(McpOAuth::with_http(http, Arc::clone(&user_servers))),
             ),
-            get_user_servers: Box::new(move || user_servers.clone()),
+            get_user_servers: Box::new(move || user_servers()),
             begin_login: None,
             agent_dir: None,
             get_catalog_sources: None,
@@ -329,6 +361,10 @@ mod tests {
             disabled_tools: None,
             startup_timeout_ms: None,
             call_timeout_ms: None,
+            client_id: None,
+            callback_port: None,
+            client_secret: None,
+            scopes: None,
         }
     }
 
@@ -358,6 +394,277 @@ mod tests {
                 r#"{"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_in":3600}"#,
             ),
         ])
+    }
+
+    #[test]
+    fn oauth_config_threads_client_id_and_callback_port() {
+        for endpoint in ["https://fixture.example/mcp", "https://mcp.slack.com/mcp"] {
+            let agent = tempfile::tempdir().unwrap();
+            let user_servers: HashMap<String, McpServerConfig> = serde_json::from_value(json!({
+                "slack": {
+                    "type": "http",
+                    "url": endpoint,
+                    "oauth": true,
+                    "clientId": "custom-client",
+                    "callbackPort": 4567
+                }
+            }))
+            .unwrap();
+            let http = Arc::new(fixture_http());
+            let manager = manager(agent.path(), Some(user_servers), http);
+            let config = manager.lock().unwrap().oauth_config("slack").unwrap();
+            assert_eq!(config.client_id.as_deref(), Some("custom-client"));
+            assert_eq!(config.callback_port, Some(4567));
+        }
+    }
+
+    /// Slack has no DCR; drive its public desktop client through the real manager and auth store.
+    #[tokio::test]
+    async fn slack_login_persists_refreshes_and_can_login_again() {
+        struct SlackHttp {
+            responses: ScriptedHttp,
+            seen: Mutex<Vec<super::super::OAuthHttpRequest>>,
+        }
+        impl OAuthHttp for SlackHttp {
+            fn request(
+                &self,
+                request: super::super::OAuthHttpRequest,
+            ) -> futures::future::BoxFuture<'_, Result<OAuthHttpResponse>> {
+                self.seen.lock().unwrap().push(request.clone());
+                let response = self.responses.request(request);
+                Box::pin(async move {
+                    let mut response = response.await?;
+                    if response.status == 401 {
+                        response.headers.push(("www-authenticate".to_string(),
+                            "Bearer resource_metadata=\"https://mcp.slack.com/.well-known/oauth-protected-resource\"".to_string()));
+                    }
+                    Ok(response)
+                })
+            }
+        }
+        let http = Arc::new(SlackHttp {
+            responses: ScriptedHttp::new(vec![
+                ("https://mcp.slack.com/mcp", 401, ""),
+                (
+                    "https://mcp.slack.com/.well-known/oauth-protected-resource",
+                    200,
+                    r#"{"resource":"https://mcp.slack.com","authorization_servers":["https://mcp.slack.com"],"scopes_supported":["search:read.public","channels:history","chat:write"]}"#,
+                ),
+                (
+                    "https://mcp.slack.com/.well-known/oauth-authorization-server",
+                    200,
+                    r#"{"issuer":"https://mcp.slack.com","authorization_endpoint":"https://slack.com/oauth/v2_user/authorize","token_endpoint":"https://slack.com/api/oauth.v2.user.access","code_challenge_methods_supported":["S256"]}"#,
+                ),
+                (
+                    "https://slack.com/api/oauth.v2.user.access",
+                    200,
+                    r#"{"ok":true,"access_token":"slack-access","refresh_token":"slack-refresh","expires_in":43200}"#,
+                ),
+            ]),
+            seen: Mutex::default(),
+        });
+        let agent = tempfile::tempdir().unwrap();
+        let manager = manager(agent.path(), None, http.clone());
+        let ui = PasteUi {
+            auth_url: Arc::default(),
+        };
+        for _ in 0..2 {
+            let context = manager.lock().unwrap().login_context("slack").unwrap();
+            let credential = context.run(&ui, http.as_ref()).await.unwrap();
+            let auth_url = url::Url::parse(&ui.auth_url.lock().unwrap()).unwrap();
+            let params: HashMap<_, _> = auth_url.query_pairs().into_owned().collect();
+            assert_eq!(params["client_id"], "1601185624273.8899143856786");
+            assert_eq!(params["redirect_uri"], "http://localhost:3118/callback");
+            assert_eq!(params["code_challenge_method"], "S256");
+            assert!(!params["state"].is_empty());
+            assert!(!params["code_challenge"].is_empty());
+
+            let config = manager.lock().unwrap().oauth_config("slack").unwrap();
+            let refreshed = super::super::mcp_refresh_token(http.as_ref(), &config, &credential)
+                .await
+                .unwrap();
+            let mut refreshed = serde_json::to_value(refreshed).unwrap();
+            let mut original = serde_json::to_value(&credential).unwrap();
+            refreshed.as_object_mut().unwrap().remove("expires");
+            original.as_object_mut().unwrap().remove("expires");
+            assert_eq!(refreshed, original);
+            let stored: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(agent.path().join("auth.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                stored["mcp:slack"],
+                serde_json::to_value(&credential).unwrap()
+            );
+        }
+        let requests = http.seen.lock().unwrap().clone();
+        let tokens: Vec<_> = requests
+            .iter()
+            .filter(|request| request.url == "https://slack.com/api/oauth.v2.user.access")
+            .map(|request| {
+                url::form_urlencoded::parse(request.body.as_ref().unwrap().as_bytes())
+                    .into_owned()
+                    .collect::<HashMap<_, _>>()
+            })
+            .collect();
+        assert_eq!(tokens.len(), 4);
+        for token in &tokens {
+            assert_eq!(token["client_id"], "1601185624273.8899143856786");
+            assert_eq!(token["resource"], "https://mcp.slack.com");
+            if token["grant_type"] == "authorization_code" {
+                assert_eq!(token["redirect_uri"], "http://localhost:3118/callback");
+                assert_eq!(token["code"], "the-code");
+                assert!(!token["code_verifier"].is_empty());
+            } else {
+                assert_eq!(token["refresh_token"], "slack-refresh");
+            }
+        }
+        let gating_manager = Arc::clone(&manager);
+        let enabled = tokio::task::spawn_blocking(move || {
+            gating_manager
+                .lock()
+                .unwrap()
+                .get_enabled_persistent_generic_servers()
+        })
+        .await
+        .unwrap();
+        assert!(enabled.contains(&"slack".to_string()));
+    }
+
+    /// Google Workspace MCP (live metadata captured 2026-10-19: a trailing-slash PRM issuer, no
+    /// registration endpoint) with a user-registered confidential client from `mcpServers`.
+    #[tokio::test]
+    async fn google_workspace_login_and_refresh_use_the_configured_client() {
+        const SHEETS: &str = "https://sheetsmcp.googleapis.com/mcp/v1";
+        const TOKEN: &str = "https://oauth2.googleapis.com/token";
+        const SCOPES: &str = "https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/spreadsheets";
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let http = Arc::new(ScriptedHttp::new(vec![
+            (SHEETS, 405, ""),
+            (
+                "https://sheetsmcp.googleapis.com/.well-known/oauth-protected-resource/mcp/v1",
+                200,
+                r#"{"authorization_servers":["https://accounts.google.com/"],"bearer_methods_supported":["header"],"resource":"https://sheetsmcp.googleapis.com/mcp/v1","scopes_supported":["https://www.googleapis.com/auth/drive.readonly","https://www.googleapis.com/auth/spreadsheets.readonly","https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/spreadsheets"]}"#,
+            ),
+            (
+                "https://accounts.google.com/.well-known/oauth-authorization-server",
+                200,
+                r#"{"issuer":"https://accounts.google.com","authorization_endpoint":"https://accounts.google.com/o/oauth2/v2/auth","token_endpoint":"https://oauth2.googleapis.com/token","token_endpoint_auth_methods_supported":["client_secret_post","client_secret_basic"],"code_challenge_methods_supported":["plain","S256"]}"#,
+            ),
+            // expires_in equals the expiry buffer, so the stored token is due for refresh at once.
+            (
+                TOKEN,
+                200,
+                r#"{"access_token":"google-access","refresh_token":"google-refresh","expires_in":300}"#,
+            ),
+        ]));
+        let user_servers = serde_json::from_value(json!({ "sheets": {
+            "type": "http", "url": SHEETS, "oauth": true, "callbackPort": port, "scopes": SCOPES,
+            "clientId": "byo.apps.googleusercontent.com", "clientSecret": "byo-secret"
+        }}))
+        .unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        let manager = manager(agent.path(), Some(user_servers), http.clone());
+        let ui = PasteUi {
+            auth_url: Arc::default(),
+        };
+        let context = manager.lock().unwrap().login_context("sheets").unwrap();
+        context.run(&ui, http.as_ref()).await.unwrap();
+        let mut handlers = HostRequestHandlers::default();
+        McpManager::register_host_handlers(&manager, &mut handlers);
+        let refresh = handlers.get("mcp.refresh").expect("wired").clone();
+        refresh(HostRequestPayload {
+            data: json!({ "server": "sheets" }),
+        })
+        .await
+        .unwrap();
+
+        let pairs = |entries: &[(&str, &str)]| -> HashMap<String, String> {
+            entries
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect()
+        };
+        let redirect_uri = format!("http://localhost:{port}/callback");
+        let mut authorize: HashMap<String, String> = url::Url::parse(&ui.auth_url.lock().unwrap())
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        authorize.remove("state");
+        authorize.remove("code_challenge");
+        assert_eq!(
+            authorize,
+            pairs(&[
+                ("client_id", "byo.apps.googleusercontent.com"),
+                ("response_type", "code"),
+                ("redirect_uri", redirect_uri.as_str()),
+                ("code_challenge_method", "S256"),
+                ("scope", SCOPES),
+                ("resource", SHEETS),
+                ("access_type", "offline"),
+                ("prompt", "consent"),
+            ])
+        );
+        let mut tokens: Vec<HashMap<String, String>> = http
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(url, _)| url == TOKEN)
+            .map(|(_, body)| {
+                url::form_urlencoded::parse(body.as_deref().unwrap().as_bytes())
+                    .into_owned()
+                    .collect()
+            })
+            .collect();
+        tokens[0].remove("code_verifier");
+        assert_eq!(
+            tokens,
+            vec![
+                pairs(&[
+                    ("grant_type", "authorization_code"),
+                    ("code", "the-code"),
+                    ("redirect_uri", redirect_uri.as_str()),
+                    ("client_id", "byo.apps.googleusercontent.com"),
+                    ("client_secret", "byo-secret"),
+                    ("resource", SHEETS),
+                ]),
+                pairs(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", "google-refresh"),
+                    ("client_id", "byo.apps.googleusercontent.com"),
+                    ("client_secret", "byo-secret"),
+                    ("resource", SHEETS),
+                ]),
+            ]
+        );
+    }
+
+    #[test]
+    fn registered_oauth_client_follows_endpoint_instead_of_connection_name() {
+        let agent = tempfile::tempdir().unwrap();
+        let user_servers = HashMap::from([
+            (
+                "slack".to_string(),
+                oauth_http_server("https://other.example/mcp"),
+            ),
+            (
+                "team-chat".to_string(),
+                oauth_http_server("https://mcp.slack.com/mcp"),
+            ),
+        ]);
+        let manager = manager(agent.path(), Some(user_servers), Arc::new(fixture_http()));
+        let manager = manager.lock().unwrap();
+        let impostor = manager.oauth_config("slack").unwrap();
+        assert_eq!((impostor.client_id, impostor.callback_port), (None, None));
+        let alias = manager.oauth_config("team-chat").unwrap();
+        assert_eq!(
+            (alias.client_id.as_deref(), alias.callback_port),
+            (Some("1601185624273.8899143856786"), Some(3118)),
+        );
     }
 
     /// `begin_login` -> persisted endpoint-bound credentials -> `is_authed`
@@ -395,7 +702,6 @@ mod tests {
         let begin_login = handlers.get("mcp.begin_login").expect("wired").clone();
         begin_login(HostRequestPayload {
             data: json!({ "server": "fixture" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
@@ -490,7 +796,6 @@ mod tests {
         let begin_login = handlers.get("mcp.begin_login").expect("wired").clone();
         begin_login(HostRequestPayload {
             data: json!({ "server": "linear" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
@@ -522,19 +827,15 @@ mod tests {
         let begin_login = handlers.get("mcp.begin_login").expect("wired").clone();
         let error = begin_login(HostRequestPayload {
             data: json!({ "server": "nope" }),
-            cell_source_code: None,
         })
         .await
         .unwrap_err()
         .to_string();
         assert_eq!(error, "Unknown MCP integration: nope");
-        let error = begin_login(HostRequestPayload {
-            data: json!({}),
-            cell_source_code: None,
-        })
-        .await
-        .unwrap_err()
-        .to_string();
+        let error = begin_login(HostRequestPayload { data: json!({}) })
+            .await
+            .unwrap_err()
+            .to_string();
         assert_eq!(error, "mcp.begin_login requires a server");
     }
 
@@ -544,8 +845,10 @@ mod tests {
     async fn mcp_oauth_refreshes_expired_credentials() {
         let agent = tempfile::tempdir().unwrap();
         let http = Arc::new(fixture_http());
-        let mut auth =
-            AuthStorage::create_with_oauth(agent.path(), Arc::new(McpOAuth::with_http(http)));
+        let mut auth = AuthStorage::create_with_oauth(
+            agent.path(),
+            Arc::new(McpOAuth::with_http(http, Arc::new(|| None))),
+        );
         auth.set(
             "mcp:fixture",
             AuthCredential::Oauth {
@@ -587,7 +890,6 @@ mod tests {
         let refresh = handlers.get("mcp.refresh").expect("wired").clone();
         let error = refresh(HostRequestPayload {
             data: json!({ "server": "fixture" }),
-            cell_source_code: None,
         })
         .await
         .unwrap_err()
@@ -616,7 +918,6 @@ mod tests {
 
         refresh(HostRequestPayload {
             data: json!({ "server": "fixture" }),
-            cell_source_code: None,
         })
         .await
         .unwrap();
@@ -645,7 +946,6 @@ mod tests {
         let refresh = handlers.get("mcp.refresh").expect("wired").clone();
         let error = refresh(HostRequestPayload {
             data: json!({ "server": "session-tool" }),
-            cell_source_code: None,
         })
         .await
         .unwrap_err()

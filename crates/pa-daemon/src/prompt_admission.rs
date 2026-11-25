@@ -581,12 +581,14 @@ impl Worker {
                 core.follow_up
                     .retain(|item| item.admission_id.as_deref() != Some(admission_id));
                 self.prompt_admissions.clear(admission_id);
+                crate::worker::clear_withdrawn_progress_note(&core, self.engine.as_ref());
             }
             let abort_running = cancel_owned
                 && status == Some(AdmissionStatus::Owned)
                 && core.running_admission_ids.contains(admission_id);
             if abort_running {
                 core.abort_requested = true;
+                core.turn_cancelled = true;
             }
             (status, dropped_queued, abort_running)
         };
@@ -594,6 +596,8 @@ impl Worker {
             self.checkpoint_queue(crate::worker::QueueCheckpoint::Settle {
                 operation: "queue_dropped",
             });
+            // A cancelled idle admission has no turn-end event to refresh the roster.
+            self.push_roster_delta();
         }
         if abort_running {
             self.engine.abort_in_flight_turn();

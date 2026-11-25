@@ -8,10 +8,15 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use pa_models::fetch::{CatalogFetcher, FetchOutcome};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::TlsAcceptor;
 
-type RequestLog = Arc<Mutex<Vec<String>>>;
+type RequestLog = Arc<tokio::sync::watch::Sender<Vec<String>>>;
 
 pub struct MockServer {
     port: u16,
@@ -33,7 +38,7 @@ impl MockServer {
             .await
             .expect("bind mock server");
         let port = listener.local_addr().unwrap().port();
-        let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+        let requests: RequestLog = Arc::new(tokio::sync::watch::Sender::new(Vec::new()));
         let responses: ResponseQueue = Arc::new(Mutex::new(VecDeque::from(scripts)));
         let handle = tokio::spawn(run(listener, Arc::clone(&requests), responses));
         Self {
@@ -48,11 +53,20 @@ impl MockServer {
     }
 
     pub fn recorded_requests(&self) -> Vec<String> {
-        self.requests.lock().unwrap().clone()
+        self.requests.borrow().clone()
     }
 
     pub fn request_count(&self) -> usize {
-        self.requests.lock().unwrap().len()
+        self.requests.borrow().len()
+    }
+
+    /// Resolve once the server has recorded `count` request heads.
+    pub async fn wait_for_requests(&self, count: usize) {
+        self.requests
+            .subscribe()
+            .wait_for(|log| log.len() >= count)
+            .await
+            .expect("the server owns the request log");
     }
 }
 
@@ -93,7 +107,7 @@ async fn run(listener: TcpListener, requests: RequestLog, responses: ResponseQue
                 }
             }
             let head = String::from_utf8_lossy(&buffer[..read]).to_string();
-            requests.lock().unwrap().push(head);
+            requests.send_modify(|log| log.push(head));
             let scripted = responses.lock().unwrap().pop_front().unwrap_or_else(|| {
                 Scripted::Response(b"HTTP/1.1 500 Drained\r\ncontent-length: 0\r\n\r\n".to_vec())
             });
@@ -157,4 +171,160 @@ pub fn oversized_stream() -> Vec<u8> {
     response.extend_from_slice(&vec![b'a'; 1024 * 1024]);
     response.extend_from_slice(b"\r\n");
     response
+}
+
+pub const TLS_TEST_BODY: &str = "{\"schemaVersion\":1,\"models\":[]}";
+
+pub struct TlsCatalogServer {
+    pub base_url: String,
+    pub ca_pem: String,
+    pub task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for TlsCatalogServer {
+    fn drop(&mut self) {
+        // Also cancel the owned listener/socket if a client assertion panics
+        // or the bounded fixture run times out.
+        self.task.abort();
+    }
+}
+
+struct FixtureEnvironment(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl Drop for FixtureEnvironment {
+    fn drop(&mut self) {
+        for (name, previous) in self.0.drain(..) {
+            match previous {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+pub async fn tls_catalog_server(connections: usize) -> TlsCatalogServer {
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(DnType::CommonName, "catalog test ca");
+    let ca_key = KeyPair::generate().expect("ca key");
+    let ca_cert = ca_params.self_signed(&ca_key).expect("ca cert");
+
+    let leaf_params = CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("leaf params");
+    let leaf_key = KeyPair::generate().expect("leaf key");
+    let leaf_cert = leaf_params
+        .signed_by(&leaf_key, &Issuer::from_params(&ca_params, &ca_key))
+        .expect("leaf cert");
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![leaf_cert.der().clone()],
+            PrivateKeyDer::Pkcs8(leaf_key.serialize_der().into()),
+        )
+        .expect("tls config");
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind tls server");
+    let port = listener.local_addr().expect("tls addr").port();
+    let response = ok_json(TLS_TEST_BODY, None);
+    let task = tokio::spawn(async move {
+        for _ in 0..connections {
+            let (socket, _) = listener.accept().await.expect("catalog connection");
+            let mut stream = acceptor
+                .accept(socket)
+                .await
+                .expect("catalog TLS handshake");
+            let mut buffer = [0u8; 8_192];
+            assert!(stream.read(&mut buffer).await.expect("catalog request") > 0);
+            stream.write_all(&response).await.expect("catalog response");
+            stream.flush().await.expect("catalog flush");
+        }
+    });
+    TlsCatalogServer {
+        base_url: format!("https://127.0.0.1:{port}"),
+        ca_pem: ca_cert.pem(),
+        task,
+    }
+}
+
+pub struct CaBundleEnv {
+    bundle: tempfile::NamedTempFile,
+    _environment: FixtureEnvironment,
+}
+
+impl CaBundleEnv {
+    // The env var keeps pointing at the deleted path: the next native load
+    // must fail to find the CA on its own.
+    pub fn delete_bundle(&self) {
+        std::fs::remove_file(self.bundle.path()).expect("delete ca bundle");
+    }
+}
+
+pub fn ca_bundle_env(env_var: &str, ca_pem: &str) -> CaBundleEnv {
+    let bundle = tempfile::NamedTempFile::new().expect("ca bundle");
+    std::fs::write(bundle.path(), ca_pem).expect("write ca bundle");
+    let environment = FixtureEnvironment(
+        [
+            "NODE_EXTRA_CA_CERTS",
+            "SSL_CERT_FILE",
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect(),
+    );
+    for name in [
+        "NODE_EXTRA_CA_CERTS",
+        "SSL_CERT_FILE",
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        std::env::remove_var(name);
+    }
+    std::env::set_var("NO_PROXY", "127.0.0.1,localhost");
+    std::env::set_var("no_proxy", "127.0.0.1,localhost");
+    std::env::set_var(env_var, bundle.path());
+    CaBundleEnv {
+        bundle,
+        _environment: environment,
+    }
+}
+
+pub async fn fetch_trusting_test_ca(env_var: &str) {
+    let mut server = tls_catalog_server(1).await;
+    let pem = if env_var == "NODE_EXTRA_CA_CERTS" {
+        // Keep native-loader input pure; only Node extra-cert parsing retains a prefix.
+        format!(
+            "{}-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n",
+            server.ca_pem
+        )
+    } else {
+        server.ca_pem.clone()
+    };
+    let _ca_env = ca_bundle_env(env_var, &pem);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let fetcher = CatalogFetcher::new();
+        let outcome = fetcher.fetch(&format!("{}/x", server.base_url), None).await;
+        let FetchOutcome::Fresh { body, .. } = outcome.expect("fetch") else {
+            panic!("expected a fresh body");
+        };
+        assert_eq!(body, TLS_TEST_BODY.as_bytes());
+        (&mut server.task).await.expect("catalog fixture completed");
+    })
+    .await
+    .expect("catalog TLS completes within the timeout");
 }

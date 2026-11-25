@@ -2,8 +2,7 @@ use super::*;
 
 /// The attribution fold survives the windowed fast open on both sides of the
 /// compaction boundary: the windowed store's `session_stats` equals the full
-/// open's — the ACTIVE totals (TS cuts `state.messages` at the compaction) —
-/// never losing or double-counting the attributed child spend.
+/// open's, never losing or double-counting the attributed child spend.
 #[test]
 fn windowed_open_folds_attributions_on_both_sides_of_the_boundary() {
     let dir = tempfile::tempdir().unwrap();
@@ -73,18 +72,57 @@ fn windowed_open_folds_attributions_on_both_sides_of_the_boundary() {
         json!(150)
     );
     assert!(windowed.entry(&old).is_none());
-    // Windowed and full opens agree on the ACTIVE stats: the pre-cut ancestry
-    // is spend the active stats must not report (the pre-cut fold survives on
-    // the whole-file surfaces).
+    // Windowed and full opens agree on the stats: the branch spend counts both
+    // attributed aggregates, the pre-cut one through the window's older path.
     assert_eq!(
         crate::session_stats::session_stats(&windowed, None),
         crate::session_stats::session_stats(&full, None)
     );
     let stats = crate::session_stats::session_stats(&full, None);
-    assert_eq!(stats["tokens"]["input"], json!(10));
-    assert_eq!(stats["tokens"]["output"], json!(3));
-    assert_eq!(stats["tokens"]["cacheRead"], json!(0));
-    assert_eq!(stats["cost"].as_f64(), Some(0.03));
+    assert_eq!(stats["tokens"]["input"], json!(150 + 10));
+    assert_eq!(stats["tokens"]["output"], json!(15 + 3));
+    assert_eq!(stats["tokens"]["cacheRead"], json!(5));
+    assert!((stats["cost"].as_f64().unwrap() - (0.165 + 0.03)).abs() < 1e-12);
+}
+
+/// Hydrating a windowed store keeps reporting the billed rows appended
+/// afterwards to the engine's sink.
+#[test]
+fn full_history_hydration_keeps_the_billed_row_sink() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hydrate.jsonl");
+    let mut full = SessionFile::create("/tmp", None, 0);
+    full.set_path(path.clone());
+    let mut boundary = String::new();
+    for i in 0..220 {
+        let id = full.append_message(&json!({
+            "role": "user", "content": format!("message {i}"), "timestamp": i,
+        }));
+        if i == 210 {
+            boundary = id;
+        }
+    }
+    full.append_entry(
+        "compaction",
+        json!({"summary":"summary","firstKeptEntryId":boundary,"tokensBefore":10000}),
+    );
+    full.rewrite().unwrap();
+    let mut windowed = SessionFile::open_windowed(&path).unwrap();
+    assert!(windowed.window.is_some());
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink_seen = std::sync::Arc::clone(&seen);
+    windowed.billed_row_sink = BilledRowSinkSlot(Some(std::sync::Arc::new(move |_row| {
+        sink_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    })));
+    windowed.install_full_history(SessionFile::open(&path).unwrap());
+    windowed
+        .persist_entry(
+            "compaction",
+            json!({"summary":"again","firstKeptEntryId":boundary,"tokensBefore":1,
+                   "usage":{"input":5,"output":1,"totalTokens":6}}),
+        )
+        .unwrap();
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -279,6 +317,61 @@ fn usage_of(input: u64, output: u64, cache_read: u64, total: f64) -> Value {
     })
 }
 
+/// The tool-call seed walk counts on both sides of the window cut: the
+/// folded prefix rides `older_path_stats`, the retained rows the store
+/// entries, and a windowed open seeds the same count a full open does.
+#[test]
+fn windowed_tool_call_count_matches_the_full_open_across_the_cut() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tools.jsonl");
+    let mut full = SessionFile::create("/tmp", None, 0);
+    full.set_path(path.clone());
+    let old = full.append_message(&json!({
+        "role":"assistant", "provider":"p", "model":"m",
+        "content":[{"type":"text","text":"old"},
+                   {"type":"toolCall","id":"call-1","name":"bash","arguments":{}}],
+        "stopReason":"toolUse", "timestamp":0
+    }));
+    let mut boundary = String::new();
+    for i in 1..220 {
+        let id = full.append_message(&json!({
+            "role":"user", "content": format!("message {i}"), "timestamp": i,
+        }));
+        if i == 210 {
+            boundary = id;
+        }
+    }
+    // The compaction boundary is what folds the windowed open's prefix.
+    full.append_entry(
+        "compaction",
+        json!({"summary":"summary","firstKeptEntryId":boundary,"tokensBefore":10000}),
+    );
+    let kept = full.append_message(&json!({
+        "role":"assistant", "provider":"p", "model":"m",
+        "content":[{"type":"toolCall","id":"call-2","name":"edit","arguments":{}},
+                   {"type":"toolCall","id":"call-3","name":"edit","arguments":{}}],
+        "stopReason":"toolUse", "timestamp":221
+    }));
+    full.rewrite().unwrap();
+
+    let windowed = SessionFile::open_windowed(&path).unwrap();
+    assert!(
+        windowed.window.is_some(),
+        "the fixture must serve a windowed open"
+    );
+    // The fixture really spans the cut: the pre-cut row folded away, the
+    // kept row retained.
+    assert!(windowed.entry(&old).is_none());
+    assert!(windowed.entry(&kept).is_some());
+    let full = SessionFile::open(&path).unwrap();
+    assert_eq!(full.tool_call_count(), 3);
+    assert_eq!(
+        windowed.tool_call_count(),
+        full.tool_call_count(),
+        "the windowed open seeds the same count as the full open"
+    );
+}
+
 /// One shared walk backs both the materialized fold and the scalar scan:
 /// across every window shape the scan must reproduce exactly the scalars the
 /// old full-clone fold computed.
@@ -341,8 +434,7 @@ fn scan_message_scalars_match_the_materialized_fold_across_window_shapes() {
         assert_eq!(scalars.message_count, 4); // summary + kept + two assistants
     }
 
-    // The kept id on a NON-bearing row never flips the keeping walk (the fold
-    // skips the row before the id check).
+    // A non-message boundary still retains every following message.
     {
         let path = dir.path().join("kept-on-custom.jsonl");
         let mut store = SessionFile::create("/tmp", None, 0);
@@ -356,7 +448,7 @@ fn scan_message_scalars_match_the_materialized_fold_across_window_shapes() {
         store.append_message(&assistant(&usage_of(2, 2, 0, 0.25), 20));
         assert_scan_matches_fold("kept id on non-bearing row", &store);
         let scalars = store.scan_message_scalars();
-        assert_eq!(scalars.message_count, 2); // summary + post-compaction assistant
+        assert_eq!(scalars.message_count, 3); // summary + retained + post-compaction assistant
     }
 
     // A kept id that does not exist keeps nothing before the compaction.
@@ -468,4 +560,121 @@ fn walk_pins_the_compaction_boundary_sequences() {
     assert_eq!(messages[1]["content"], "u2");
     assert_eq!(messages[2]["role"], "custom");
     assert_eq!(messages[4]["content"], "u3");
+}
+
+fn assert_windowed_restored_settings_match_the_full_open(name: &str, path: &std::path::Path) {
+    let windowed = SessionFile::open_windowed(path).unwrap();
+    assert!(
+        windowed.window.is_some(),
+        "{name}: the windowed reader must engage"
+    );
+    let restored = windowed.restored_settings();
+    let reference = SessionFile::open(path).unwrap().restored_settings();
+    assert_eq!(
+        (
+            restored.model,
+            restored.thinking_level,
+            restored.service_tier
+        ),
+        (
+            reference.model,
+            reference.thinking_level,
+            reference.service_tier
+        ),
+        "{name}"
+    );
+}
+
+#[test]
+fn windowed_restored_settings_match_the_full_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("resumed.jsonl");
+    let mut file = SessionFile::create("/tmp", None, 0);
+    file.set_path(path.clone());
+    file.append_entry(
+        "model_change",
+        json!({"provider":"old","modelId":"superseded"}),
+    );
+    file.append_entry("thinking_level_change", json!({"thinkingLevel":"high"}));
+    file.append_entry("service_tier_change", json!({"serviceTier":null}));
+    file.append_message(&json!({
+        "role":"assistant","provider":"old","model":"superseded","api":"openai-responses",
+        "content":[{"type":"text","text":"hello"}],"stopReason":"stop","timestamp":0
+    }));
+    let kept = file.append_message(&json!({"role":"user","content":"kept","timestamp":1}));
+    file.append_entry(
+        "compaction",
+        json!({"summary":"summary","firstKeptEntryId":kept,"tokensBefore":100}),
+    );
+    file.append_entry(
+        "model_change",
+        json!({"provider":"new","modelId":"current"}),
+    );
+    file.append_entry("thinking_level_change", json!({"thinkingLevel":"low"}));
+    file.append_entry("service_tier_change", json!({"serviceTier":"priority"}));
+    file.rewrite().unwrap();
+    assert_windowed_restored_settings_match_the_full_open("changes around the boundary", &path);
+
+    let path = dir.path().join("never-compacted.jsonl");
+    let mut file = SessionFile::create("/tmp", None, 0);
+    file.set_path(path.clone());
+    file.append_entry("model_change", json!({"provider":"p","modelId":"m"}));
+    file.append_entry("thinking_level_change", json!({"thinkingLevel":"medium"}));
+    file.append_entry("service_tier_change", json!({"serviceTier":"flex"}));
+    file.append_message(&json!({"role":"user","content":"hello","timestamp":0}));
+    file.rewrite().unwrap();
+    assert_windowed_restored_settings_match_the_full_open("whole-file window", &path);
+}
+
+#[test]
+fn non_message_compaction_boundary_retains_the_persisted_timeline() {
+    for boundary_type in ["custom", "session_state"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let mut store = SessionFile::create("/tmp", None, 0);
+        store.set_path(path.clone());
+        for i in 0..220 {
+            store
+                .append_message(&json!({"role":"user","content":format!("old {i}"),"timestamp":i}));
+        }
+        let kept = store.append_entry(
+            boundary_type,
+            json!({"customType":"test_boundary", "data":{}, "state":{"status":"active"}}),
+        );
+        store.append_entry("session_state", json!({"state":{"status":"active"}}));
+        store.append_entry(
+            "custom_message",
+            json!({"customType":"test_notice","content":"retained notice","display":true}),
+        );
+        store.append_message(&json!({"role":"user","content":"retained user","timestamp":221}));
+        store.append_message(&json!({"role":"assistant","provider":"synthetic","model":"mock","api":"openai-completions","content":[{"type":"text","text":"retained reply"}],"stopReason":"stop","timestamp":222,"usage":{"input":5,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":7,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}}));
+        store.append_entry(
+            "compaction",
+            json!({"summary":"summary","firstKeptEntryId":kept,"tokensBefore":1000}),
+        );
+        store.append_message(&json!({"role":"user","content":"after","timestamp":223}));
+        store.rewrite().unwrap();
+        let persisted = std::fs::read(&path).unwrap();
+        let full = SessionFile::open(&path).unwrap();
+        let windowed = SessionFile::open_windowed(&path).unwrap();
+        assert!(windowed.window.is_some());
+        for view in [&store, &full, &windowed] {
+            let messages = view.messages();
+            let roles: Vec<_> = messages
+                .iter()
+                .map(|message| message["role"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                roles,
+                ["compactionSummary", "custom", "user", "assistant", "user"],
+                "{boundary_type}"
+            );
+            assert_eq!(messages[0]["retainedMessageCount"], json!(3));
+            assert_eq!(messages[1]["content"], json!("retained notice"));
+            assert_eq!(messages[2]["content"], json!("retained user"));
+            assert_eq!(messages[4]["content"], json!("after"));
+            assert_eq!(view.scan_message_scalars().message_count, 5);
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), persisted);
+    }
 }

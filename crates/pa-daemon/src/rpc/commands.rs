@@ -120,6 +120,7 @@ pub fn kick_queue_pump(
     tokio::spawn(async move {
         let _lane = state.queue_pump.lock().await;
         if state.session.pump_generation() != generation
+            || state.session.shutdown_fired()
             || !state.session.engine_is_live(&engine).await
             || state.session.is_replacing()
         {
@@ -128,6 +129,7 @@ pub fn kick_queue_pump(
         let agent = engine.session.agent();
         loop {
             if state.session.pump_generation() != generation
+                || state.session.shutdown_fired()
                 || !state.session.engine_is_live(&engine).await
                 || state.session.is_replacing()
             {
@@ -173,6 +175,32 @@ pub fn kick_queue_pump(
             if agent.continue_run().await.is_err() {
                 break;
             }
+        }
+    });
+}
+
+/// Serve the live engine's background-bash wakes: every wake kicks the
+/// queued-work pump, so the `[bash-done]` row a completion steers onto
+/// the agent runs as a turn with no client command driving it. The
+/// handle's wake is re-read each cycle, so a replacement rebinds.
+pub fn serve_background_bash_wakes(state: &Arc<RpcState>) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        loop {
+            let (bash_wake, engine) = {
+                let handle = state.session.handle().await;
+                (Arc::clone(&handle.bash_wake), Arc::clone(&handle.engine))
+            };
+            let notified = bash_wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // A wake that fired between the handle read and the armed
+            // park already queued its row: kick before parking.
+            if engine.session.agent().has_queued_messages() {
+                kick_queue_pump(&state, &engine);
+            }
+            notified.await;
+            kick_queue_pump(&state, &engine);
         }
     });
 }
@@ -471,29 +499,26 @@ async fn refine(state: &Arc<RpcState>, payload: &Value) -> Result<ResponseData, 
             .and_then(Value::as_str)
             .map(str::to_string),
     };
-    // The handle guard stays held through the refinement: no replacement
-    // or `set_model` interleaves before the file writes.
     let handle = state.session.handle().await;
     let model = handle.model.clone();
     let api_key = handle.api_key.clone();
     let engine = handle.engine.clone();
-    let global_harness_dir = pa_core::refinement::get_global_harness_state_dir(&state.agent_dir);
-    // Refine appends durable rows into the live loop context; it shares
-    // compact's one-command-at-a-time serialization.
-    let _ops = state.session_ops.lock().await;
-    let result = engine
-        .session
-        .refine(
-            &options,
-            pa_core::session_engine::refine::RefinementSource::User,
-            &model,
-            api_key,
-            global_harness_dir,
-        )
+    // Register the job against this session, then release the lease before
+    // waiting. Other prompts and session replacement must not await planning.
+    let pending = engine.session.start_refinement(
+        options,
+        pa_core::session_engine::refine::RefinementSource::User,
+        model,
+        api_key,
+    );
+    drop(handle);
+    drop(engine);
+    let committed = pending
         .await
+        .map_err(|error| format!("refinement task failed: {error}"))?
         .map_err(|error| format!("{error:#}"))?;
     Ok(ResponseData::Present(
-        serde_json::to_value(result).unwrap_or(Value::Null),
+        serde_json::to_value(committed.result).unwrap_or(Value::Null),
     ))
 }
 

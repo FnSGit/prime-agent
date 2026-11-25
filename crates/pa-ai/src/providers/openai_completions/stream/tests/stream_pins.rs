@@ -204,3 +204,19 @@ async fn reasoning_content_deltas_assemble_the_thinking_block_with_the_field_sig
     );
     assert_eq!(message.stop_reason, StopReason::Stop);
 }
+
+/// Reasoning and reply starting in the same chunk assemble thinking first, then text.
+#[tokio::test]
+async fn reasoning_and_content_starting_in_one_chunk_assemble_thinking_then_text() {
+    let body = sse_body(&[
+        json!({ "choices": [{ "index": 0, "delta": { "reasoning_content": "Think.", "content": "Hi" } }] }),
+        json!({ "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }] }),
+    ]);
+    let (_, message) = stream_events(glm_fast_model(), body).await;
+    let [AssistantContent::Thinking(thinking), AssistantContent::Text(text)] = &message.content[..]
+    else {
+        panic!("expected thinking then text: {:?}", message.content);
+    };
+    assert_eq!(thinking.thinking, "Think.");
+    assert_eq!(text.text, "Hi");
+}

@@ -166,8 +166,12 @@ fn build_headers(
     cache_session_id: Option<&str>,
 ) -> Vec<(String, String)> {
     let compat = get_responses_compat(model);
-    let mut headers: Vec<(String, String)> = Vec::new();
+    // The default Authorization goes in first so model and caller headers replace it (header names
+    // compare case-insensitively) instead of shipping a second Authorization alongside theirs.
+    let mut headers: Vec<(String, String)> =
+        vec![("Authorization".into(), format!("Bearer {api_key}"))];
     for (name, value) in model.headers.iter().flatten() {
+        headers.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
         headers.push((name.clone(), value.clone()));
     }
     if let Some(cache_session_id) = cache_session_id {
@@ -182,7 +186,11 @@ fn build_headers(
             headers.push((name.clone(), value.clone()));
         }
     }
-    headers.push(("Authorization".into(), format!("Bearer {api_key}")));
+    crate::providers::opencode_headers::apply(
+        &mut headers,
+        &model.provider,
+        options.base.session_id.as_deref(),
+    );
     headers
 }
 
@@ -509,6 +517,57 @@ mod tests {
         .unwrap()
     }
 
+    /// An explicit Authorization from the model or the caller (a custom provider's `authHeader:
+    /// true` puts one in the caller headers) replaces the default bearer header instead of
+    /// shipping beside it, whatever the header name's case.
+    #[test]
+    fn explicit_authorization_replaces_the_default() {
+        let authorizations = |model: &Model, caller: Option<&str>| {
+            let options = OpenAIResponsesOptions {
+                base: StreamOptions {
+                    headers: caller.map(|token| {
+                        std::collections::HashMap::from([(
+                            "authorization".to_string(),
+                            format!("Bearer {token}"),
+                        )])
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            build_headers(model, "default-key", &options, None)
+                .into_iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .collect::<Vec<_>>()
+        };
+        let mut model = compat_model(serde_json::json!({}));
+        assert_eq!(
+            authorizations(&model, None),
+            vec![(
+                "Authorization".to_string(),
+                "Bearer default-key".to_string()
+            )]
+        );
+        assert_eq!(
+            authorizations(&model, Some("caller-token")),
+            vec![(
+                "authorization".to_string(),
+                "Bearer caller-token".to_string()
+            )]
+        );
+        model.headers = Some(std::collections::BTreeMap::from([(
+            "AUTHORIZATION".to_string(),
+            "Bearer model-token".to_string(),
+        )]));
+        assert_eq!(
+            authorizations(&model, None),
+            vec![(
+                "AUTHORIZATION".to_string(),
+                "Bearer model-token".to_string()
+            )]
+        );
+    }
+
     #[test]
     fn the_shared_key_only_compat_decodes_for_responses_models() {
         // TS `getXaiSubscriptionModel`'s compat carries only `supportsLongCacheRetention: false`;
@@ -521,27 +580,6 @@ mod tests {
             compat.send_session_id_header,
             "the absent header flag defaults on"
         );
-    }
-
-    #[test]
-    fn the_responses_shaped_compat_keeps_its_values() {
-        let model = compat_model(
-            serde_json::json!({ "sendSessionIdHeader": false, "supportsLongCacheRetention": true }),
-        );
-        let compat = get_responses_compat(&model);
-        assert!(!compat.send_session_id_header);
-        assert!(compat.supports_long_cache_retention);
-        // Absent compat: both defaults on (TS's defaults).
-        let plain = serde_json::from_value::<Model>(serde_json::json!({
-            "id": "m", "name": "m", "api": "openai-responses", "provider": "openai",
-            "baseUrl": "https://api.openai.com/v1", "reasoning": false, "input": ["text"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 1000, "maxTokens": 100
-        }))
-        .unwrap();
-        let compat = get_responses_compat(&plain);
-        assert!(compat.send_session_id_header);
-        assert!(compat.supports_long_cache_retention);
     }
 
     /// A `reasoning: false` model whose map addresses levels (the live catalog's

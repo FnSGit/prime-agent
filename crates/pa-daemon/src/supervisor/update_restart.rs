@@ -1,13 +1,13 @@
 //! The update/restart flow: prepare/commit/abort transactions, the prepared
 //! dir + watchdog, exit-for-update, and the attach-stream salvage helpers.
 use super::{
-    anyhow, build_update_roster, join_all, json, marker_expires_at_iso, paths, response_failure,
-    response_line, response_success, stop_workers_gracefully, stream_attach, supervisor_identity,
-    util, write_prepared_artifacts, AbortOutcome, Arc, BeginOutcome, ClientRouting, DaemonCommand,
-    DaemonErrorInfo, DaemonResponse, Duration, Map, Ordering, Path, PathBuf, PrepareOp, Result,
-    RouteAdmission, SnapshotPurpose, Supervisor, UpdateId, UpdatePreparedMarker,
-    UpdateRosterInputs, Value, WorkerSnapshot, WorkerStopVerdict, DAEMON_APP_VERSION,
-    WORKER_REQUEST_TIMEOUT_MS,
+    anyhow, app_version, build_update_roster, join_all, json, marker_expires_at_iso, paths,
+    response_failure, response_line, response_success, stop_workers_gracefully, stream_attach,
+    supervisor_identity, util, write_prepared_artifacts, AbortOutcome, Arc, BeginOutcome,
+    ClientRouting, DaemonCommand, DaemonErrorInfo, DaemonResponse, Duration, Map, Ordering, Path,
+    PathBuf, PrepareOp, Result, RouteAdmission, SnapshotPurpose, Supervisor, UpdateId,
+    UpdatePreparedMarker, UpdateRosterInputs, Value, WorkerSnapshot, WorkerStopVerdict,
+    WorkerTransition, WORKER_REQUEST_TIMEOUT_MS,
 };
 
 pub(super) fn streamed_attach_lines(
@@ -186,7 +186,7 @@ impl Supervisor {
             } else {
                 "disconnected"
             };
-            let connected = resident.cmd_tx.lock().await.is_some();
+            let connected = resident.route_state().connected;
             if self.is_stopping(resident) || !connected {
                 // TS #2515: the refusal names the blocking session (`sessionFile`, else the
                 // root active session id).
@@ -242,8 +242,8 @@ impl Supervisor {
             DaemonCommand::PrepareUpdateRestart { rest, .. } => rest
                 .get("toVersion")
                 .and_then(Value::as_str)
-                .unwrap_or(DAEMON_APP_VERSION),
-            _ => DAEMON_APP_VERSION,
+                .unwrap_or(app_version()),
+            _ => app_version(),
         };
         let ledger = self.rlm_spawn_ledger_for(None).await?;
         let now = util::now_ms();
@@ -254,7 +254,7 @@ impl Supervisor {
                 socket_path: self.options.socket_path.to_str().unwrap_or_default(),
                 agent_dir: &self.options.agent_dir,
                 supervisor: identity.clone(),
-                from_version: DAEMON_APP_VERSION,
+                from_version: app_version(),
                 to_version,
                 created_at_ms: now,
                 ledger: &ledger,
@@ -347,11 +347,17 @@ impl Supervisor {
                     for (resident, (_, verdict)) in residents.iter().zip(&verdicts) {
                         match verdict {
                             WorkerStopVerdict::Stopped => {
-                                resident.intentional_stop.store(false, Ordering::SeqCst);
-                                match self.relaunch_worker(resident).await {
-                                    Ok(child) => {
+                                // The old monitor may only now observe its
+                                // child's exit. Retire that watch before
+                                // reopening supervision: the bump lands
+                                // before the stop flag is cleared, so a
+                                // watch woken at the exit reads either the
+                                // intentional stop or the new generation.
+                                resident.monitor_epoch.fetch_add(1, Ordering::SeqCst);
+                                resident.transition(WorkerTransition::ResumeStopped);
+                                match self.relaunch_supervised(resident).await {
+                                    Ok(()) => {
                                         resident.consecutive_failures.store(0, Ordering::SeqCst);
-                                        self.spawn_monitor(Arc::clone(resident), Some(child), 0);
                                     }
                                     Err(error) => {
                                         self.log_line(&format!(
@@ -365,7 +371,7 @@ impl Supervisor {
                                 // Restore normal supervision: the stop request may still land late,
                                 // in which case the monitor treats the exit as a crash and
                                 // relaunches with backoff (the session file is the truth).
-                                resident.intentional_stop.store(false, Ordering::SeqCst);
+                                resident.transition(WorkerTransition::ResumeStopped);
                             }
                         }
                     }

@@ -17,6 +17,8 @@ use crate::worker::{SessionCore, Worker};
 pub(crate) struct PreparedReplacement {
     pub(crate) file: SessionFile,
     pub(crate) cwd: Option<String>,
+    // A successful fresh write owes scheduling only after publication.
+    trace_persisted: bool,
 }
 
 /// The navigation surface: the prepare and swap phases of the replacement
@@ -35,7 +37,12 @@ impl SessionNavigation {
     /// Swap the live session onto `file` (store, engine session file, rebuilt
     /// context). The caller retires the previous runtime and rebinds the cwd
     /// first, so the context park lands on the fresh session.
-    async fn replace_session(&self, file: SessionFile) -> Result<(), String> {
+    async fn replace_session(&self, target: PreparedReplacement) -> Result<(), String> {
+        let PreparedReplacement {
+            mut file,
+            trace_persisted,
+            ..
+        } = target;
         let branch_entries = file.branch_file_entries();
         let new_path = file.path.clone();
         // Prime the new store's usage fold before it enters the core: the
@@ -44,10 +51,24 @@ impl SessionNavigation {
         let _ =
             tokio::task::spawn_blocking(move || crate::session_store::read_session_info(&primed))
                 .await;
-        let previous = {
+        let (previous, traces) = {
             let mut core = self.core.lock().unwrap();
-            core.store.replace(file)
+            if file.trace_upload.is_none() {
+                file.trace_upload = core
+                    .store
+                    .as_ref()
+                    .and_then(|old| old.trace_upload.as_ref())
+                    .and_then(|traces| traces.rebind(std::path::Path::new(&core.cwd), &file.path));
+            }
+            let traces = file.trace_upload.clone();
+            // No await or fallible preparation between slot transfer and publication.
+            (core.store.replace(file), traces)
         };
+        if let Some(traces) = traces.filter(|_| trace_persisted) {
+            // The successful prepare wrote this file before its controller existed.
+            // Record bounded intent outside the core lock, after publication.
+            traces.persisted(&new_path);
+        }
         // The old store's lease release flushes the window and info
         // sidecars (megabytes for a large session): off the core lock
         // and the runtime.
@@ -131,9 +152,11 @@ impl SessionNavigation {
             }
         }
         // TS `newSession` keeps the runtime's cwd: the fresh session runs where the live one did.
+        let trace_persisted = !fresh.path.as_os_str().is_empty();
         Ok(PreparedReplacement {
             file: fresh,
             cwd: None,
+            trace_persisted,
         })
     }
 
@@ -274,7 +297,11 @@ impl SessionNavigation {
                 ));
             }
         }
-        Ok(PreparedReplacement { file, cwd })
+        Ok(PreparedReplacement {
+            file,
+            cwd,
+            trace_persisted: false,
+        })
     }
 }
 
@@ -316,7 +343,7 @@ impl Worker {
         if let Some(cwd) = target.cwd.as_deref() {
             self.rebind_worker_cwd(cwd);
         }
-        match self.navigation.replace_session(target.file).await {
+        match self.navigation.replace_session(target).await {
             Ok(()) => {
                 self.refresh_replaced_session_state().await;
                 self.reseed_service_tier_for_replacement();
@@ -483,14 +510,8 @@ mod tests {
     }
 
     /// A tree move is not a replacement: the built session stays warm.
-    // The faux provider registration is global; the lock must span the
-    // awaited turns that consume its queue.
-    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn replacement_flows_retire_only_on_a_prepared_file() {
-        let _faux = crate::agent_engine::FAUX_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::TempDir::new().expect("temp dir");
         let sessions_dir = dir.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
@@ -602,6 +623,90 @@ mod tests {
         let worker_for_drop = worker;
         drop(engine);
         tokio::task::spawn_blocking(move || drop(worker_for_drop))
+            .await
+            .expect("worker drop join");
+    }
+
+    /// A replaced session is live: the teardown closes the OLD session, and
+    /// the moved-to session still runs its goal loop (a stale close would
+    /// stop every continuation mint after the first turn).
+    // The faux provider registration is global; the lock must span the
+    // awaited turns that consume its queue.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn a_replaced_session_continues_its_goal() {
+        let _faux = crate::agent_engine::FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+        // No provider retry: the exhausted faux script ends the loop at once.
+        std::fs::create_dir_all(dir.path().join("agent")).expect("agent dir");
+        std::fs::write(
+            dir.path().join("agent").join("settings.json"),
+            json!({ "retry": { "enabled": false } }).to_string(),
+        )
+        .expect("settings");
+        let config = crate::worker::WorkerConfig {
+            socket_path: dir.path().join("worker.sock"),
+            supervisor_socket_path: std::path::PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "replaced-goal-session".to_string(),
+            agent_dir: dir.path().join("agent"),
+            recovery_journal_path: dir.path().join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({
+                "engine": "faux",
+                "responses": ["before the replacement", "goal start", "goal continuation"],
+            })),
+        };
+        let worker = Arc::new(Worker::new(config, None));
+        let created = worker
+            .dispatch(
+                "create",
+                &json!({
+                    "cwd": dir.path().to_string_lossy(),
+                    "sessionDir": sessions_dir.to_string_lossy(),
+                }),
+            )
+            .await;
+        assert!(created.success, "create failed: {created:?}");
+        let session_id = "replaced-goal-session";
+        let prompted = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": session_id, "message": "hello" }),
+            )
+            .await;
+        assert!(prompted.success, "prompt failed: {prompted:?}");
+        let replaced = worker
+            .dispatch("new_session", &json!({ "activeSessionId": session_id }))
+            .await;
+        assert_eq!(
+            replaced.data,
+            Some(json!({ "cancelled": false })),
+            "new_session failed: {replaced:?}"
+        );
+        let goal = worker
+            .dispatch(
+                "prompt_and_wait",
+                &json!({ "activeSessionId": session_id, "message": "/goal keep going" }),
+            )
+            .await;
+        assert!(goal.success, "the goal start failed: {goal:?}");
+        let idle = worker.dispatch("wait_for_idle", &json!({})).await;
+        assert!(idle.success, "the goal loop never settled: {idle:?}");
+        let state = worker.engine.goal_state_value();
+        assert!(
+            state["continuationsUsed"].as_u64().unwrap_or(0) >= 1,
+            "the replaced session never continued its goal: {state}"
+        );
+
+        // The worker (and its engine's private runtime) must drop off the
+        // async context.
+        tokio::task::spawn_blocking(move || drop(worker))
             .await
             .expect("worker drop join");
     }
@@ -868,5 +973,53 @@ mod tests {
             }
             other => panic!("expected the typed missing-cwd error info, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod trace_replacement_tests {
+    use super::*;
+
+    #[test]
+    fn failed_new_session_prepare_preserves_the_live_trace_registration() {
+        let _env = crate::trace_test_env::lock_env();
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, "synthetic blocker").unwrap();
+        let old_path = blocked.join("old.jsonl");
+        let agent_dir = dir.path().join("agent");
+        let (_, consent) =
+            pa_core::agent_traces::ContinuousTraceUpload::load_settings(dir.path(), &agent_dir);
+        let controller = pa_core::agent_traces::ContinuousTraceUpload::install(
+            dir.path(),
+            &agent_dir,
+            Some(&old_path),
+            consent,
+        )
+        .unwrap();
+        let mut store = SessionFile::create(dir.path().to_str().unwrap(), None, 0);
+        store.set_path(old_path.clone());
+        store.trace_upload = Some(controller.clone());
+        let core = Arc::new(Mutex::new(SessionCore::test_core(
+            Some(store),
+            dir.path().to_string_lossy().into_owned(),
+        )));
+        let navigation = SessionNavigation::new(
+            Arc::new(crate::engine::ScriptedEngine::default()),
+            core.clone(),
+        );
+        assert!(navigation.prepare_new_session(&json!({})).is_err());
+        let live = core.lock().unwrap();
+        assert_eq!(live.store.as_ref().unwrap().path, old_path);
+        assert!(Arc::ptr_eq(
+            live.store.as_ref().unwrap().trace_upload.as_ref().unwrap(),
+            &controller
+        ));
+        drop(live);
+        // A cancelled predecessor cannot transfer its registry slot again.
+        assert!(controller
+            .rebind(dir.path(), &dir.path().join("probe.jsonl"))
+            .is_some());
+        assert!(!agent_dir.join("agent-traces-outbox").exists());
     }
 }

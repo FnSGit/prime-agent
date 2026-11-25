@@ -87,6 +87,9 @@ fn serve_at(path: &'static str, body: &'static str) -> String {
 /// One sandbox: a HOME with the session store the update must preserve,
 /// and the install prefix the launcher lands under.
 struct Sandbox {
+    /// Removes the sandbox (installed binaries included) when the test ends,
+    /// passing or failing.
+    _dir: tempfile::TempDir,
     root: PathBuf,
     session_file: PathBuf,
     session_bytes: Vec<u8>,
@@ -95,12 +98,13 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!(
-            "pa-update-e2e-{}-{}",
-            std::process::id(),
-            uuid_probe()
-        ));
-        std::fs::create_dir_all(&root).expect("sandbox root");
+        let dir = tempfile::Builder::new()
+            .prefix("pa-update-e2e-")
+            .tempdir()
+            .expect("sandbox root");
+        // The installer reports resolved paths; macOS's temp dir sits behind
+        // the /var -> /private/var symlink.
+        let root = dir.path().canonicalize().expect("canonical sandbox root");
         let home = root.join("home");
         let session_file = home.join(".prime/agent/sessions/session.jsonl");
         std::fs::create_dir_all(session_file.parent().expect("session dir")).expect("session dir");
@@ -111,6 +115,7 @@ impl Sandbox {
         let prefix = root.join("prefix/.local");
         std::fs::create_dir_all(&prefix).expect("prefix");
         Self {
+            _dir: dir,
             root,
             session_file,
             session_bytes,
@@ -126,14 +131,6 @@ impl Sandbox {
             "the sandbox ~/.prime/agent session file is byte-identical"
         );
     }
-}
-
-/// A per-test disambiguator for the sandbox root (no uuid dependency in
-/// dev-deps: the pid plus the server port keeps concurrent runs apart).
-fn uuid_probe() -> String {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let next = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    format!("{next}")
 }
 
 fn run_prime_agent(args: &[&str], sandbox: &Sandbox, url: &str) -> std::process::Output {
@@ -559,7 +556,7 @@ fn update_rollback_reads_the_unsuffixed_installer_slot() {
         "install-rust.sh channel beta\nversion 1.0.0\n",
     )
     .expect("slot marker");
-    std::fs::write(slot.join("prime-agent"), b"payload\n").expect("slot payload");
+    std::fs::write(slot.join("prime-agent"), b"#!/bin/sh\necho 1.0.0\n").expect("slot payload");
     make_executable(&slot.join("prime-agent"));
 
     let mut command = Command::new(&binary);
@@ -693,6 +690,113 @@ fn archive_check_answers_synchronously_without_publishing() {
         "the check published nothing"
     );
     sandbox.assert_session_preserved();
+}
+
+/// A running daemon of this product takes the update restart: the installer
+/// runs the new payload's restart mode instead of the shutdown ladder, so the
+/// old supervisor exits and a new one greets on the same socket.
+#[test]
+fn an_installer_run_restarts_the_running_daemon() {
+    let sandbox = Sandbox::new();
+    let live = sandbox.prefix.join("share/prime-agent");
+    std::fs::create_dir_all(&live).expect("payload dir");
+    let binary = live.join("prime-agent");
+    std::fs::copy(env!("CARGO_BIN_EXE_prime-agent"), &binary).expect("copy this build");
+    std::fs::write(
+        live.join(".prime-agent-install"),
+        "install-rust.sh channel beta\nversion 9.9.9\n",
+    )
+    .expect("install marker");
+    // The release archive carries this build too, so the new payload can run the restart.
+    let version = env!("CARGO_PKG_VERSION");
+    let payload = sandbox.root.join("payload-restart");
+    std::fs::create_dir_all(&payload).expect("payload dir");
+    std::fs::copy(
+        env!("CARGO_BIN_EXE_prime-agent"),
+        payload.join("prime-agent"),
+    )
+    .expect("copy this build");
+    let platform = pa_core::update::install::current_platform_alias();
+    let archive = sandbox
+        .root
+        .join(format!("prime-agent-{version}-{platform}.tar.gz"));
+    let status = Command::new("tar")
+        .arg("-czf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(&payload)
+        .arg("prime-agent")
+        .status()
+        .expect("run tar");
+    assert!(status.success(), "tar the release");
+
+    // The daemon on the socket the launcher pins (the installer's own rule).
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().expect("id -u").stdout)
+        .expect("utf-8 uid");
+    let socket = sandbox
+        .root
+        .join(format!("tmp/prime-agent-rust-{}/daemon.sock", uid.trim()));
+    let mut daemon = Command::new(&binary);
+    installer_env(&mut daemon, &sandbox);
+    daemon
+        .args(["--mode", "daemon", "--daemon-socket"])
+        .arg(&socket)
+        .env(
+            "PRIME_AGENT_CODING_AGENT_DIR",
+            sandbox.root.join("home/.prime/agent"),
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut old_daemon = daemon.spawn().expect("start the daemon");
+    let old_pid = supervisor_pid_after(&socket, None).expect("the daemon greets");
+
+    let mut command = Command::new(&binary);
+    command.arg("update").arg("--archive").arg(&archive);
+    installer_env(&mut command, &sandbox);
+    let output = command.output().expect("run the installed build");
+    let new_pid = supervisor_pid_after(&socket, Some(old_pid));
+    // The installer always takes the old daemon down: restarted or stopped.
+    let _ = old_daemon.wait();
+    if let Some(pid) = new_pid {
+        let _ = Command::new("kill").arg(pid.to_string()).status();
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = assert_ran(&output, "update --archive");
+    assert!(
+        format!("{stdout}{stderr}").contains("Restarted the previous Rust daemon"),
+        "the summary reports the restart:\n{stdout}\n{stderr}"
+    );
+    assert!(new_pid.is_some(), "a new supervisor greets on the socket");
+}
+
+/// The `supervisorPid` the daemon on `socket` greets with, once it differs from `previous`.
+fn supervisor_pid_after(socket: &Path, previous: Option<u64>) -> Option<u64> {
+    use std::io::BufRead as _;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline {
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut hello = String::new();
+            if std::io::BufReader::new(stream)
+                .read_line(&mut hello)
+                .is_ok()
+            {
+                let pid = serde_json::from_str::<serde_json::Value>(&hello)
+                    .ok()
+                    .and_then(|hello| {
+                        hello
+                            .get("supervisorPid")
+                            .and_then(serde_json::Value::as_u64)
+                    });
+                if let Some(pid) = pid.filter(|pid| Some(*pid) != previous) {
+                    return Some(pid);
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    None
 }
 
 /// A release archive whose payload answers `reported` under the archive

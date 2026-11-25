@@ -70,6 +70,10 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                                 "type": "image_url",
                                 "image_url": { "url": format!("data:{mime_type};base64,{data}") },
                             }),
+                            crate::types::UserBlockPayload::Video { data, mime_type } => json!({
+                                "type": "video_url",
+                                "video_url": { "url": format!("data:{mime_type};base64,{data}") },
+                            }),
                             crate::types::UserBlockPayload::Opaque(json) => json!({
                                 "type": "text",
                                 "text": sanitize_surrogates(&json),
@@ -251,7 +255,7 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                 {
                     assistant_msg.insert("content".into(), json!(""));
                 }
-                // Skip assistant messages that have no content and no tool calls.
+                // Reasoning-only turns can hit the output limit before any answer or tool call.
                 let content_value = assistant_msg.get("content");
                 let has_content = match content_value {
                     Some(Value::Null) | None => false,
@@ -262,6 +266,7 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                 if !has_content
                     && !assistant_msg.contains_key("tool_calls")
                     && replay_reasoning_details.is_empty()
+                    && non_empty_thinking_blocks.is_empty()
                 {
                     index += 1;
                     continue;
@@ -270,6 +275,7 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
             }
             Message::ToolResult(_) => {
                 let mut image_blocks: Vec<Value> = Vec::new();
+                let mut video_blocks: Vec<Value> = Vec::new();
                 let mut j = index;
                 while j < transformed.len() {
                     let Message::ToolResult(tool_msg) = &transformed[j] else {
@@ -289,6 +295,10 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                         .content
                         .iter()
                         .any(|block| matches!(block, UserOrToolContent::Image(_)));
+                    let has_videos = tool_msg
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, UserOrToolContent::Video(_)));
 
                     let has_text = !text_result.is_empty();
                     let mut tool_result_msg = Map::new();
@@ -299,6 +309,8 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                             text_result.as_str()
                         } else if has_images {
                             "(see attached image)"
+                        } else if has_videos {
+                            "(see attached video)"
                         } else {
                             ""
                         })),
@@ -324,11 +336,26 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                             }
                         }
                     }
+                    if has_videos
+                        && model
+                            .input
+                            .iter()
+                            .any(|mode| matches!(mode, ModelInput::Video))
+                    {
+                        for block in &tool_msg.content {
+                            if let UserOrToolContent::Video(video) = block {
+                                video_blocks.push(json!({
+                                    "type": "video_url",
+                                    "video_url": { "url": format!("data:{};base64,{}", video.mime_type, video.data) },
+                                }));
+                            }
+                        }
+                    }
                     j += 1;
                 }
 
                 index = j;
-                if image_blocks.is_empty() {
+                if image_blocks.is_empty() && video_blocks.is_empty() {
                     last_role = Some("toolResult");
                 } else {
                     if compat.requires_assistant_after_tool_result {
@@ -339,9 +366,14 @@ pub fn convert_messages(model: &Model, context: &Context, compat: &ResolvedCompa
                     }
                     let mut content_items = vec![json!({
                         "type": "text",
-                        "text": "Attached image(s) from tool result:",
+                        "text": if video_blocks.is_empty() {
+                            "Attached image(s) from tool result:"
+                        } else {
+                            "Attached media from tool result:"
+                        },
                     })];
                     content_items.extend(image_blocks);
+                    content_items.extend(video_blocks);
                     params.push(json!({
                         "role": "user",
                         "content": content_items,
@@ -452,14 +484,11 @@ pub(crate) fn parse_chunk_usage(
             })
             .as_ref(),
     );
-    // OpenRouter reports billing truth in usage, already priced by the endpoint and service tier
-    // that served the request (https://openrouter.ai/docs/api-reference/overview). Trust it over
-    // the catalog-rate estimate, scaling the component breakdown to match.
-    let reported_cost = if model.provider == "openrouter" {
-        openrouter_reported_cost(raw_usage)
-    } else {
-        None
-    };
+    // A provider that reports `usage.cost` (OpenRouter, and gateways such as LiteLLM in front of
+    // it) already priced the request at the endpoint and service tier that served it
+    // (https://openrouter.ai/docs/api-reference/overview). Trust it over the catalog-rate
+    // estimate, whichever provider it came through, scaling the component breakdown to match.
+    let reported_cost = reported_cost(raw_usage);
     // Token counts sit far below f64's 2^53 exact-integer range; the cost apportioning math is f64 by design.
     #[allow(clippy::cast_precision_loss)]
     if let Some(reported_cost) = reported_cost {
@@ -483,12 +512,13 @@ pub(crate) fn parse_chunk_usage(
     usage
 }
 
-/// The user's real spend for an `OpenRouter` request, or `None` to keep the catalog estimate.
-/// `usage.cost` only carries what `OpenRouter` charged the account's credits: for BYOK requests
-/// that is just `OpenRouter`'s fee, so real spend is the upstream provider's bill plus that fee. A
-/// cost of 0 can mean not-billed-via-credits (e.g. `:free` endpoints) rather than free, so it keeps
-/// the catalog estimate.
-fn openrouter_reported_cost(raw_usage: &Value) -> Option<f64> {
+/// The user's real spend as reported in `usage`, or `None` to keep the catalog estimate. The
+/// field follows `OpenRouter`'s shape, which gateways forward or reproduce: `usage.cost` only
+/// carries what was charged to the account's credits, so for BYOK requests (just `OpenRouter`'s
+/// fee) real spend is the upstream provider's bill plus that fee. A missing cost, or a cost of 0
+/// (which can mean not-billed-via-credits, e.g. `:free` endpoints, rather than free), keeps the
+/// catalog estimate.
+fn reported_cost(raw_usage: &Value) -> Option<f64> {
     let credits = raw_usage
         .get("cost")
         .and_then(Value::as_f64)
@@ -553,6 +583,41 @@ mod tests {
             featured: None,
             headers: None,
             compat: None,
+            serving: None,
+        }
+    }
+
+    #[test]
+    fn reasoning_only_turn_survives_replay() {
+        let model = model("prime-inference", 0.0, 0.0);
+        for field in crate::providers::openai_completions::REASONING_FIELDS {
+            let mut output = crate::event_stream::initial_assistant_message(
+                &model.api,
+                &model.provider,
+                &model.id,
+            );
+            output.content = vec![AssistantContent::Thinking(ThinkingContent {
+                thinking: "Unfinished reasoning.".into(),
+                thinking_signature: Some(field.into()),
+                redacted: None,
+                rest: Map::default(),
+            })];
+            output.stop_reason = StopReason::Length;
+            let replay = convert_messages(
+                &model,
+                &Context {
+                    system_prompt: None,
+                    messages: vec![crate::types::Message::Assistant(output)],
+                    tools: None,
+                },
+                &crate::providers::openai_completions::get_compat(&model),
+            );
+            assert_eq!(
+                replay,
+                vec![json!({
+                    "role": "assistant", "content": null, field: "Unfinished reasoning."
+                })]
+            );
         }
     }
 
@@ -583,52 +648,133 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_zero_reported_cost_keeps_catalog_estimate() {
-        let model = model("openrouter", 0.5, 0.5);
-        // A cost of 0 can mean not-billed-via-credits (:free endpoints) rather than free, so the
-        // catalog estimate stays.
-        let usage = parse_chunk_usage(&raw_usage(0.0, ByokBilling::NotByok), &model, None);
-        assert!((usage.cost.total.as_f64() - 0.05).abs() < 1e-9);
-    }
-
-    #[test]
-    fn openrouter_byok_without_upstream_keeps_catalog_estimate() {
-        let model = model("openrouter", 0.5, 0.5);
-        // BYOK credits are only OpenRouter's fee; without the upstream bill the real spend is
-        // unknown, so the catalog estimate stays.
-        let usage = parse_chunk_usage(&raw_usage(0.003, ByokBilling::FeeOnly), &model, None);
-        assert!((usage.cost.total.as_f64() - 0.05).abs() < 1e-9);
-    }
-
-    #[test]
     fn openrouter_byok_upstream_cost_replaces_catalog_estimate() {
-        let model = model("openrouter", 0.5, 0.5);
+        let priced = model("openrouter", 0.5, 0.5);
         // Credits charged by OpenRouter plus the upstream provider's bill.
         let usage = parse_chunk_usage(
             &raw_usage(0.003, ByokBilling::WithUpstreamBill(0.2)),
-            &model,
+            &priced,
             None,
         );
         assert!((usage.cost.input.as_f64() - 0.1015).abs() < 1e-9);
         assert!((usage.cost.output.as_f64() - 0.1015).abs() < 1e-9);
         assert!((usage.cost.total.as_f64() - 0.203).abs() < 1e-9);
-    }
 
-    #[test]
-    fn openrouter_reported_cost_apportioned_by_tokens_without_rates() {
-        let model = model("openrouter", 0.0, 0.0);
+        // BYOK credits without the upstream bill are only OpenRouter's fee, and a cost of 0 can
+        // mean not billed via credits (:free endpoints): both keep the catalog estimate.
+        for raw in [
+            raw_usage(0.003, ByokBilling::FeeOnly),
+            raw_usage(0.0, ByokBilling::NotByok),
+        ] {
+            let usage = parse_chunk_usage(&raw, &priced, None);
+            assert!((usage.cost.total.as_f64() - 0.05).abs() < 1e-9);
+        }
+
+        // Without catalog rates the reported cost is apportioned by tokens.
+        let unpriced = model("openrouter", 0.0, 0.0);
         let raw = json!({"prompt_tokens": 40_000, "completion_tokens": 10_000, "total_tokens": 50_000, "cost": 0.15});
-        let usage = parse_chunk_usage(&raw, &model, None);
+        let usage = parse_chunk_usage(&raw, &unpriced, None);
         assert!((usage.cost.input.as_f64() - 0.12).abs() < 1e-9);
         assert!((usage.cost.output.as_f64() - 0.03).abs() < 1e-9);
         assert!((usage.cost.cache_read.as_f64() - 0.0).abs() < 1e-9);
         assert!((usage.cost.total.as_f64() - 0.15).abs() < 1e-9);
     }
 
+    /// Discussion #3483: a gateway in front of `OpenRouter` (e.g. `LiteLLM`) reports the same
+    /// `usage.cost`; it replaces the catalog estimate whatever the provider is called.
     #[test]
-    fn non_openrouter_provider_ignores_reported_cost() {
-        let model = model("zai", 0.5, 0.5);
-        let usage = parse_chunk_usage(&raw_usage(0.07, ByokBilling::NotByok), &model, None);
-        assert!((usage.cost.total.as_f64() - 0.05).abs() < 1e-9);
+    fn any_provider_uses_its_reported_cost() {
+        let priced = model("litellm", 0.5, 0.5);
+        let usage = parse_chunk_usage(&raw_usage(0.07, ByokBilling::NotByok), &priced, None);
+        assert!((usage.cost.input.as_f64() - 0.035).abs() < 1e-9);
+        assert!((usage.cost.output.as_f64() - 0.035).abs() < 1e-9);
+        assert!((usage.cost.total.as_f64() - 0.07).abs() < 1e-9);
+    }
+
+    fn video_context(model: &Model, role: &str) -> Context {
+        let video = json!({"type": "video", "data": "AAAA", "mimeType": "video/mp4"});
+        let mut messages = Vec::new();
+        if role == "toolResult" {
+            let mut assistant = crate::event_stream::initial_assistant_message(
+                &model.api,
+                &model.provider,
+                &model.id,
+            );
+            assistant.content = vec![AssistantContent::ToolCall(ToolCall {
+                id: "call_1".into(),
+                name: "python_repl".into(),
+                arguments: Map::default(),
+                thought_signature: None,
+                rest: Map::default(),
+            })];
+            assistant.stop_reason = StopReason::ToolUse;
+            messages.push(crate::types::Message::Assistant(assistant));
+        }
+        messages.push(
+            serde_json::from_value(json!({
+                "role": role, "toolCallId": "call_1", "toolName": "python_repl", "isError": false,
+                "content": [{"type": "text", "text": "Watch clip"}, video], "timestamp": 1,
+            }))
+            .expect("video message"),
+        );
+        Context {
+            system_prompt: None,
+            messages,
+            tools: None,
+        }
+    }
+
+    #[test]
+    fn video_is_serialized_from_user_and_tool_result_messages() {
+        let mut model = model("intercept", 0.0, 0.0);
+        model.input.push(ModelInput::Video);
+        for role in ["user", "toolResult"] {
+            let params = convert_messages(
+                &model,
+                &video_context(&model, role),
+                &crate::providers::openai_completions::get_compat(&model),
+            );
+            let mut content = vec![
+                json!({"type": "text", "text": "Watch clip"}),
+                json!({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}),
+            ];
+            if role == "toolResult" {
+                assert_eq!(
+                    params[params.len() - 2],
+                    json!({
+                        "role": "tool", "content": "Watch clip", "tool_call_id": "call_1",
+                    })
+                );
+                content[0] = json!({"type": "text", "text": "Attached media from tool result:"});
+            }
+            assert_eq!(
+                params.last(),
+                Some(&json!({"role": "user", "content": content}))
+            );
+        }
+    }
+
+    #[test]
+    fn videos_become_placeholders_without_declared_video_input() {
+        let mut model = model("intercept", 0.0, 0.0);
+        model.input.push(ModelInput::Image); // Image capability alone does not permit video.
+        for role in ["user", "toolResult"] {
+            let params = convert_messages(
+                &model,
+                &video_context(&model, role),
+                &crate::providers::openai_completions::get_compat(&model),
+            );
+            let expected = if role == "user" {
+                json!({"role": "user", "content": [
+                    {"type": "text", "text": "Watch clip"},
+                    {"type": "text", "text": "(video omitted: model does not support video)"}]})
+            } else {
+                json!({"role": "tool", "tool_call_id": "call_1",
+                    "content": "Watch clip
+(tool video omitted: model does not support video)"})
+            };
+            assert_eq!(params.last(), Some(&expected));
+            assert!(!Value::Array(params).to_string().contains("video_url"));
+        }
     }
 }

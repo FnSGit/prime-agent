@@ -77,10 +77,11 @@ RUNTIME_DIR ?=
 RUNTIME_FLAG = $(if $(RUNTIME_DIR),--runtime-dir $(RUNTIME_DIR),)
 
 # Bundled catalog assets (catalog spec §3.2 layer 2): generated at build
-# time, never committed. CI generates the offline fixture snapshot (it passes
-# the full packer gates: >= 42 transport tuples, >= 68 services) so builds
-# never depend on the catalog repo being reachable; CATALOG_ASSETS_MODE=network
-# switches the dry-runs to the live fetch for packaging parity.
+# time, never committed. Release and continuous CI ship the live catalog
+# (--network) at one prime-agent-catalog commit per run (`bundle_catalog.py
+# resolve-ref`). The local dry-runs default to the offline fixture snapshot
+# (it passes the full packer gates); CATALOG_ASSETS_MODE=network switches
+# them to the live fetch of the catalog's main.
 CATALOG_ASSETS_DIR = target/catalog-assets
 CATALOG_ASSETS_MODE ?= fixture
 CATALOG_ASSETS_FLAG = --catalog-assets $(CATALOG_ASSETS_DIR)
@@ -104,8 +105,7 @@ RELEASE_PACKAGE_BUILD = :
 RELEASE_PACKAGE_FLAGS =
 endif
 
-# Live-catalog asset generation (network fetch; packaging parity with the
-# TS release flow — CI itself uses the fixture snapshot for reliability).
+# Live-catalog asset generation (network fetch; what release CI ships).
 catalog-assets:
 	python3 scripts/release/bundle_catalog.py generate --network --out $(CATALOG_ASSETS_DIR)
 
@@ -165,6 +165,18 @@ package:
 catalog-assets-gates:
 	python3 scripts/release/test_catalog_assets.py
 
+# Local one-command perf run (crates/pa-perf/README.md documents the
+# scenario set): build the release binaries, generate the small corpus,
+# bench every scenario 10x, print the table. Run it on a quiet machine —
+# the numbers are wall-clock latencies of the interactive surfaces.
+perf:
+	cargo build --release --locked -p pa-cli --bin prime-agent -p pa-perf --bin pa-perf
+	./target/release/pa-perf run --binary target/release/prime-agent \
+		--profile small --out target/perf --runs 10
+	./target/release/pa-perf report --baseline crates/pa-perf/baseline.json \
+		--results target/perf/results/*.json
+
+
 # The changelog fold's contract battery (RELEASE-FLOW-PROPOSAL.md §8): the
 # fold is the release-PR's changelog half, and the pathspec security case is
 # first - a fragment NAME is data, never a git pathspec, so no root-level
@@ -179,12 +191,19 @@ fold-gates:
 restamp-gates:
 	python3 scripts/release/test_restamp.py
 
-# The CI shard tooling's contract battery (ci.yml's PR smoke): the stable
-# crc32 assignment under the narrowed selection, the scope-aware summary
+# The CI shard tooling's contract battery (ci.yml's PR smoke): the shard
+# assignment under the narrowed selection, the scope-aware summary
 # audit, the selection resolver the conditional bins build reads, and the
 # fail-safe PR-files mapping the changes job feeds it.
 shard-gates:
 	python3 scripts/test_ci_test_shard.py
 	python3 scripts/test_ci_pr_crates.py
 
-.PHONY: check deny windows-cross actionlint glibc-gate release-dry-run continuous-dry-run audit-build package catalog-assets catalog-assets-fixture catalog-assets-gates fold-gates restamp-gates shard-gates
+.PHONY: check deny windows-cross actionlint glibc-gate release-dry-run continuous-dry-run audit-build package catalog-assets catalog-assets-fixture catalog-assets-gates fold-gates restamp-gates shard-gates perf
+
+# Offline packaging contract tests for updaters shipped since Prime Agent 0.6.
+legacy-upgrade-gates:
+	python3 scripts/release/test_native_compat.py
+	python3 scripts/release/test_npm_bridge.py
+
+.PHONY: legacy-upgrade-gates

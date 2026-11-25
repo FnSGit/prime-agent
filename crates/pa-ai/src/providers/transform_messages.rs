@@ -12,6 +12,8 @@ use crate::types::{
 const NON_VISION_USER_IMAGE_PLACEHOLDER: &str = "(image omitted: model does not support images)";
 const NON_VISION_TOOL_IMAGE_PLACEHOLDER: &str =
     "(tool image omitted: model does not support images)";
+const NON_VIDEO_USER_VIDEO_PLACEHOLDER: &str = "(video omitted: model does not support video)";
+const NON_VIDEO_TOOL_VIDEO_PLACEHOLDER: &str = "(tool video omitted: model does not support video)";
 
 fn replace_images_with_placeholder(
     content: &[UserOrToolContent],
@@ -69,10 +71,109 @@ fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Mess
         .collect()
 }
 
+fn replace_videos_with_placeholder(
+    content: &[UserOrToolContent],
+    placeholder: &str,
+) -> Vec<UserOrToolContent> {
+    let mut result: Vec<UserOrToolContent> = Vec::new();
+    let mut previous_was_placeholder = false;
+    for block in content {
+        if let UserOrToolContent::Video(_) = block {
+            if !previous_was_placeholder {
+                result.push(UserOrToolContent::Text(TextContent {
+                    text: placeholder.to_string(),
+                    text_signature: None,
+                    rest: Map::default(),
+                }));
+            }
+            previous_was_placeholder = true;
+            continue;
+        }
+        previous_was_placeholder =
+            matches!(block, UserOrToolContent::Text(text) if text.text == placeholder);
+        result.push(block.clone());
+    }
+    result
+}
+
+/// Videos reach only models that declare `"video"` input; every other model gets a placeholder.
+fn downgrade_unsupported_videos(messages: Vec<Message>, model: &Model) -> Vec<Message> {
+    if model.supports_video_input() {
+        return messages;
+    }
+    messages
+        .iter()
+        .map(|msg| match msg {
+            Message::User(user) => {
+                let UserMessageContent::Blocks(blocks) = &user.content else {
+                    return msg.clone();
+                };
+                Message::User(UserMessage {
+                    content: UserMessageContent::Blocks(replace_videos_with_placeholder(
+                        blocks,
+                        NON_VIDEO_USER_VIDEO_PLACEHOLDER,
+                    )),
+                    ..user.clone()
+                })
+            }
+            Message::ToolResult(tool_result) => Message::ToolResult(ToolResultMessage {
+                content: replace_videos_with_placeholder(
+                    &tool_result.content,
+                    NON_VIDEO_TOOL_VIDEO_PLACEHOLDER,
+                ),
+                ..tool_result.clone()
+            }),
+            other @ Message::Assistant(_) => other.clone(),
+        })
+        .collect()
+}
+
+/// A tool call without a function name: some gateways synthesize a
+/// `tool_calls` entry from a model's native tool-call template and lose the
+/// name (often the id too). Nothing can execute it, and strict providers
+/// reject every request that replays it (`tool_calls[N] is missing a
+/// function name`), which would leave the session failing on every turn.
+fn is_unnamed_tool_call(tool_call: &ToolCall) -> bool {
+    tool_call.name.trim().is_empty()
+}
+
+/// Name given to the calls of a turn whose every tool call came without a function name. Strict
+/// providers accept it on replay, and the agent loop answers it with a `Tool unknown_tool not found`
+/// error, so the model learns its call was malformed and can retry in the same turn.
+pub(crate) const UNNAMED_TOOL_CALL: &str = "unknown_tool";
+
+/// Repair the tool calls a provider streamed without a function name in a finished assistant
+/// message, before it reaches the agent loop or the session file. A nameless call beside named
+/// calls is dropped: the turn goes on through the named ones. When a tool-use turn has only
+/// nameless calls, they are named [`UNNAMED_TOOL_CALL`] and given a stable id instead, so the turn
+/// keeps going with an error result rather than ending silently.
+pub(crate) fn repair_unnamed_tool_calls(output: &mut AssistantMessage) {
+    let has_named_call = output.content.iter().any(
+        |block| matches!(block, AssistantContent::ToolCall(tool_call) if !is_unnamed_tool_call(tool_call)),
+    );
+    if !has_named_call && output.stop_reason == StopReason::ToolUse {
+        let timestamp = output.timestamp;
+        for (index, block) in output.content.iter_mut().enumerate() {
+            if let AssistantContent::ToolCall(tool_call) = block {
+                tool_call.name = UNNAMED_TOOL_CALL.to_string();
+                if tool_call.id.is_empty() {
+                    tool_call.id = format!("call_unnamed_{timestamp}_{index}");
+                }
+            }
+        }
+        return;
+    }
+    output.content.retain(
+        |block| !matches!(block, AssistantContent::ToolCall(tool_call) if is_unnamed_tool_call(tool_call)),
+    );
+}
+
 type Normalizer<'a> = dyn Fn(&str, &Model, &AssistantMessage) -> Option<String> + 'a;
 
 /// Tool-call ID normalization plus synthetic tool results for unanswered calls, dropping errored
-/// assistant turns (TS `transformMessages`).
+/// assistant turns (TS `transformMessages`). Unnamed tool calls already stored in a session (written
+/// before the stream dropped them) are stripped here, and their results go with them as orphans, so
+/// a session poisoned by one replays again.
 // Long by design: mirrors the provider's stream shape.
 #[allow(clippy::too_many_lines)]
 pub fn transform_messages_with_normalizer(
@@ -81,22 +182,25 @@ pub fn transform_messages_with_normalizer(
     normalize_tool_call_id: &Normalizer<'_>,
 ) -> Vec<Message> {
     let mut tool_call_id_map: HashMap<String, String> = HashMap::new();
-    let image_aware = downgrade_unsupported_images(messages, model);
+    let image_aware =
+        downgrade_unsupported_videos(downgrade_unsupported_images(messages, model), model);
 
-    let transformed: Vec<Message> = image_aware
+    // `None` marks a dropped unnamed-only assistant turn: it still ends the previous turn's pending
+    // calls, so its own results cannot be replayed against an earlier call that reused the id.
+    let transformed: Vec<Option<Message>> = image_aware
         .iter()
         .map(|msg| match msg {
-            Message::User(_) => msg.clone(),
+            Message::User(_) => Some(msg.clone()),
             Message::ToolResult(tool_result) => {
                 if let Some(normalized) = tool_call_id_map.get(&tool_result.tool_call_id) {
                     if normalized != &tool_result.tool_call_id {
-                        return Message::ToolResult(ToolResultMessage {
+                        return Some(Message::ToolResult(ToolResultMessage {
                             tool_call_id: normalized.clone(),
                             ..tool_result.clone()
-                        });
+                        }));
                     }
                 }
-                msg.clone()
+                Some(msg.clone())
             }
             Message::Assistant(assistant) => {
                 let is_same_model = assistant.provider == model.provider
@@ -132,6 +236,11 @@ pub fn transform_messages_with_normalizer(
                             })]
                         }
                         AssistantContent::Text(_) => vec![block.clone()],
+                        AssistantContent::ToolCall(tool_call)
+                            if is_unnamed_tool_call(tool_call) =>
+                        {
+                            vec![]
+                        }
                         AssistantContent::ToolCall(tool_call) => {
                             let mut normalized: ToolCall = tool_call.clone();
                             if !is_same_model && tool_call.thought_signature.is_some() {
@@ -153,10 +262,18 @@ pub fn transform_messages_with_normalizer(
                     })
                     .collect();
 
-                Message::Assistant(crate::types::AssistantMessage {
+                // A turn that held nothing but unnamed tool calls has nothing left to replay.
+                if transformed_content.is_empty()
+                    && assistant.content.iter().any(|block| {
+                        matches!(block, AssistantContent::ToolCall(tool_call) if is_unnamed_tool_call(tool_call))
+                    })
+                {
+                    return None;
+                }
+                Some(Message::Assistant(crate::types::AssistantMessage {
                     content: transformed_content,
                     ..assistant.clone()
-                })
+                }))
             }
         })
         .collect();
@@ -194,6 +311,14 @@ pub fn transform_messages_with_normalizer(
         };
 
     for msg in transformed {
+        let Some(msg) = msg else {
+            insert_synthetic_tool_results(
+                &mut result,
+                &mut pending_tool_calls,
+                &mut existing_tool_result_ids,
+            );
+            continue;
+        };
         match &msg {
             Message::Assistant(assistant) => {
                 insert_synthetic_tool_results(
@@ -309,6 +434,7 @@ mod tests {
             featured: None,
             headers: None,
             compat: None,
+            serving: None,
         }
     }
 
@@ -373,5 +499,109 @@ mod tests {
         let transformed =
             transform_messages_with_normalizer(&messages, &test_model(), &|_, _, _| None);
         assert_eq!(transformed.len(), 2);
+    }
+
+    fn tool_call(id: &str, name: &str) -> AssistantContent {
+        AssistantContent::ToolCall(ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: Map::default(),
+            thought_signature: None,
+            rest: Map::default(),
+        })
+    }
+
+    fn text(text: &str) -> AssistantContent {
+        AssistantContent::Text(TextContent {
+            text: text.to_string(),
+            text_signature: None,
+            rest: Map::default(),
+        })
+    }
+
+    fn assistant(content: Vec<AssistantContent>, stop_reason: StopReason) -> AssistantMessage {
+        let Message::Assistant(assistant) = assistant_with_tool_call("unused") else {
+            unreachable!()
+        };
+        AssistantMessage {
+            content,
+            stop_reason,
+            ..assistant
+        }
+    }
+
+    fn tool_result(id: &str, name: &str, text: &str) -> Message {
+        Message::ToolResult(ToolResultMessage {
+            tool_call_id: id.into(),
+            tool_name: name.into(),
+            content: vec![UserOrToolContent::Text(TextContent {
+                text: text.into(),
+                text_signature: None,
+                rest: Map::default(),
+            })],
+            details: None,
+            is_error: true,
+            timestamp: 0,
+            rest: Map::default(),
+        })
+    }
+
+    #[test]
+    fn a_session_poisoned_by_an_unnamed_tool_call_replays_without_it() {
+        // The #3742 transcript: the gateway left the call without a name or id, the
+        // loop answered `Tool  not found`, and both rows were persisted.
+        let named = tool_call("call-1", "bash");
+        let messages = vec![
+            user("hi"),
+            Message::Assistant(assistant(
+                vec![text("probing"), tool_call("", "")],
+                StopReason::ToolUse,
+            )),
+            tool_result("", "", "Tool  not found"),
+            Message::Assistant(assistant(vec![tool_call("", "")], StopReason::ToolUse)),
+            tool_result("", "", "Tool  not found"),
+            Message::Assistant(assistant(
+                vec![named.clone(), tool_call("call-2", " ")],
+                StopReason::ToolUse,
+            )),
+            tool_result("call-1", "bash", "ok"),
+            tool_result("call-2", " ", "Tool   not found"),
+            user("again"),
+        ];
+        let transformed =
+            transform_messages_with_normalizer(&messages, &test_model(), &|_, _, _| None);
+        let expected = vec![
+            user("hi"),
+            Message::Assistant(assistant(vec![text("probing")], StopReason::ToolUse)),
+            Message::Assistant(assistant(vec![named], StopReason::ToolUse)),
+            tool_result("call-1", "bash", "ok"),
+            user("again"),
+        ];
+        assert_eq!(transformed, expected);
+    }
+
+    #[test]
+    fn a_dropped_unnamed_turn_does_not_answer_an_earlier_call_with_the_same_id() {
+        let named = tool_call("call-1", "bash");
+        let messages = vec![
+            user("hi"),
+            Message::Assistant(assistant(vec![named.clone()], StopReason::ToolUse)),
+            tool_result("call-1", "bash", "ok"),
+            Message::Assistant(assistant(
+                vec![tool_call("call-1", "")],
+                StopReason::ToolUse,
+            )),
+            tool_result("call-1", "", "Tool  not found"),
+            user("again"),
+        ];
+        let transformed =
+            transform_messages_with_normalizer(&messages, &test_model(), &|_, _, _| None);
+        let expected = vec![
+            user("hi"),
+            Message::Assistant(assistant(vec![named], StopReason::ToolUse)),
+            tool_result("call-1", "bash", "ok"),
+            user("again"),
+        ];
+        assert_eq!(transformed, expected);
     }
 }

@@ -43,6 +43,16 @@ fn windows_executable_candidates_skips_suffix_and_duplicates() {
 
 use super::*;
 
+#[cfg(unix)]
+fn kernel_ready(
+    python: &str,
+    venv: &Path,
+    runtime_identity: &str,
+    python_skills: &[BootstrapPythonSkill],
+) -> bool {
+    super::kernel_ready(python, venv, runtime_identity, python_skills)
+}
+
 #[test]
 fn venv_dir_honors_override() {
     // The default path lives under $HOME.
@@ -115,6 +125,37 @@ fn version_file_round_trips() {
         read_bootstrap_version(dir.path()),
         "sha256:other"
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn previous_schema_is_rejected_before_running_a_persisted_venv() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let python = dir.path().join("python");
+    let marker = dir.path().join("old-venv-ran");
+    std::fs::write(
+        &python,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_bootstrap_version(dir.path(), "sha256:runtime", &[]).unwrap();
+    let version_path = dir.path().join(".bootstrap-version");
+    let mut version: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&version_path).unwrap()).unwrap();
+    // Schema 9 shipped with editable project Python skills in the shared venv.
+    version["schema"] = serde_json::json!(9);
+    std::fs::write(version_path, version.to_string()).unwrap();
+
+    assert!(!kernel_ready(
+        python.to_str().unwrap(),
+        dir.path(),
+        "sha256:runtime",
+        &[]
+    ));
+    assert!(!marker.exists(), "stale interpreter ran before rebuild");
 }
 
 #[test]
@@ -679,7 +720,7 @@ fn live_probe_memo_reprobes_when_installed_rlm_is_removed() {
         std::fs::set_permissions(&python, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let identity = resolve_runtime_identity();
+    let identity = hash_runtime_source(&require_runtime_source_dir().unwrap()).unwrap();
     write_bootstrap_version(&fake, &identity, &[]).unwrap();
 
     let probe_count = || {
@@ -978,9 +1019,13 @@ async fn skill_sync_batches_missing_installs_into_one_uv_call() {
         ),
     ];
     sync_python_skills(
-        uv.to_str().unwrap(),
+        &UvCommand {
+            executable: uv.to_str().unwrap(),
+            project: None,
+        },
         &venv,
         dir.path().join("python").as_path(),
+        dir.path().join("prime-agent-runtime").as_path(),
         "sha256:rt",
         &skills,
         &EnsureKernelPythonOptions::default(),
@@ -989,6 +1034,7 @@ async fn skill_sync_batches_missing_installs_into_one_uv_call() {
     .unwrap();
     let calls = uv_invocations(dir.path());
     assert_eq!(calls.len(), 1, "one batched uv invocation: {calls:?}");
+    assert!(calls[0].starts_with("--no-config pip install "));
     assert!(
         calls[0].contains("goal"),
         "the missing skill installs: {calls:?}"
@@ -998,6 +1044,7 @@ async fn skill_sync_batches_missing_installs_into_one_uv_call() {
         "the installed skill is not reinstalled: {calls:?}"
     );
     assert_eq!(calls[0].matches("--editable").count(), 1);
+    assert!(calls[0].contains(dir.path().join("prime-agent-runtime").to_str().unwrap()));
     let version = read_bootstrap_version(&venv).expect("version written");
     assert_eq!(
         version.python_skills.as_ref().map(Vec::len),
@@ -1031,9 +1078,13 @@ async fn skill_sync_falls_back_to_per_skill_installs_on_batch_failure() {
         sink.lock().unwrap().push(message.to_string());
     }));
     sync_python_skills(
-        uv.to_str().unwrap(),
+        &UvCommand {
+            executable: uv.to_str().unwrap(),
+            project: None,
+        },
         &venv,
         dir.path().join("python").as_path(),
+        dir.path().join("prime-agent-runtime").as_path(),
         "sha256:rt",
         &skills,
         &options,
@@ -1050,6 +1101,9 @@ async fn skill_sync_falls_back_to_per_skill_installs_on_batch_failure() {
         calls[0].contains("edit") && calls[0].contains("broken"),
         "the batch covers both skills: {calls:?}"
     );
+    for call in &calls {
+        assert!(call.contains(dir.path().join("prime-agent-runtime").to_str().unwrap()));
+    }
     let warnings = warnings.lock().unwrap();
     assert!(
         warnings.len() == 1 && warnings[0].contains("broken"),
@@ -1064,4 +1118,425 @@ async fn skill_sync_falls_back_to_per_skill_installs_on_batch_failure() {
         .map(|s| s.import_name.clone())
         .collect::<Vec<_>>();
     assert_eq!(recorded, vec!["edit"], "only the healthy skill is recorded");
+}
+
+/// A pyproject on disk, so record project names come from the file instead
+/// of the import-name fallback.
+#[cfg(unix)]
+fn write_skill_pyproject(dir: &Path, project_name: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("pyproject.toml"),
+        format!("[project]\nname = \"{project_name}\"\nversion = \"0.1.0\"\n"),
+    )
+    .unwrap();
+}
+
+/// Switching the session's `goal` between the bundled skill (project
+/// `goal`) and a user override (project `user-goal`, selected after the
+/// user's `-goal` setting) must leave the selected code importable each
+/// time. uv keeps differently named distributions side by side, so the
+/// other source's editable install would shadow the selected one on
+/// sys.path, and its path-keyed record would let a later sync skip a needed
+/// reinstall.
+#[cfg(unix)]
+#[tokio::test]
+async fn switching_a_skill_between_sources_replaces_the_other_install() {
+    let dir = tempfile::tempdir().unwrap();
+    let uv = fake_uv(
+        dir.path(),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            dir.path().join("uv.log").display()
+        ),
+    );
+    let venv = dir.path().join("venv");
+    std::fs::create_dir_all(&venv).unwrap();
+    let packaged_path = dir.path().join("payload/skills/goal");
+    let user_path = dir.path().join("home/skills/goal");
+    write_skill_pyproject(&packaged_path, "goal");
+    write_skill_pyproject(&user_path, "user-goal");
+    let packaged_skill = skill("goal", packaged_path.to_str().unwrap(), "packaged-hash");
+    let user_skill = skill("goal", user_path.to_str().unwrap(), "user-hash");
+    let python = dir.path().join("python");
+    let mut recorded = Vec::new();
+    for selected in [&packaged_skill, &user_skill, &packaged_skill] {
+        sync_python_skills(
+            &UvCommand {
+                executable: uv.to_str().unwrap(),
+                project: None,
+            },
+            &venv,
+            &python,
+            dir.path().join("prime-agent-runtime").as_path(),
+            "sha256:rt",
+            std::slice::from_ref(selected),
+            &EnsureKernelPythonOptions::default(),
+        )
+        .await
+        .unwrap();
+        recorded.push(
+            read_bootstrap_version(&venv)
+                .expect("version written")
+                .python_skills
+                .expect("skills recorded"),
+        );
+    }
+    assert_eq!(
+        recorded,
+        vec![
+            vec![packaged_skill.clone()],
+            vec![user_skill.clone()],
+            vec![packaged_skill.clone()],
+        ],
+        "each sync records only the selected source"
+    );
+    let python = python.display();
+    let runtime = dir.path().join("prime-agent-runtime");
+    let runtime = runtime.display();
+    let install = |path: &Path| {
+        format!(
+            "--no-config pip install --python {python} {runtime} --editable {}",
+            path.display()
+        )
+    };
+    assert_eq!(
+        uv_invocations(dir.path()),
+        vec![
+            install(&packaged_path),
+            format!("--no-config pip uninstall --python {python} goal"),
+            install(&user_path),
+            format!("--no-config pip uninstall --python {python} user-goal"),
+            install(&packaged_path),
+        ],
+        "each switch uninstalls the other source's distribution first"
+    );
+}
+
+/// A failed uninstall of the distribution shadowing the selected skill
+/// must not stop the kernel from starting, and must not record the selected
+/// skill. Recording it would short-circuit `kernel_ready` on a record whose
+/// import keeps resolving to the surviving shadowing distribution, and
+/// dropping the displaced record would hide the uninstall requirement from
+/// every later sync.
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_shadowing_uninstall_keeps_the_retry_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let uv = fake_uv(
+        dir.path(),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\ncase \"$*\" in *uninstall*) exit 1;; esac\nexit 0\n",
+            dir.path().join("uv.log").display()
+        ),
+    );
+    let venv = dir.path().join("venv");
+    std::fs::create_dir_all(&venv).unwrap();
+    let packaged_path = dir.path().join("payload/skills/goal");
+    let user_path = dir.path().join("home/skills/goal");
+    write_skill_pyproject(&packaged_path, "goal");
+    write_skill_pyproject(&user_path, "user-goal");
+    let packaged_skill = skill("goal", packaged_path.to_str().unwrap(), "packaged-hash");
+    let user_skill = skill("goal", user_path.to_str().unwrap(), "user-hash");
+    // A previous session recorded the packaged goal; this session selects
+    // the user override, whose shadowing distribution must go first.
+    write_bootstrap_version(&venv, "sha256:rt", std::slice::from_ref(&packaged_skill)).unwrap();
+    let result = sync_python_skills(
+        &UvCommand {
+            executable: uv.to_str().unwrap(),
+            project: None,
+        },
+        &venv,
+        dir.path().join("python").as_path(),
+        dir.path().join("prime-agent-runtime").as_path(),
+        "sha256:rt",
+        std::slice::from_ref(&user_skill),
+        &EnsureKernelPythonOptions::default(),
+    )
+    .await;
+    assert!(result.is_ok(), "the kernel still starts: {result:?}");
+    let recorded = read_bootstrap_version(&venv)
+        .expect("version written")
+        .python_skills
+        .expect("skills recorded");
+    assert_eq!(
+        recorded,
+        vec![packaged_skill.clone()],
+        "the displaced record survives so the next sync retries the uninstall"
+    );
+    assert!(
+        !recorded_skills_cover(Some(&recorded), std::slice::from_ref(&user_skill)),
+        "kernel_ready must not short-circuit on the uninstalled skill"
+    );
+    let calls = uv_invocations(dir.path());
+    assert!(
+        calls[0].contains("uninstall"),
+        "the uninstall was attempted: {calls:?}"
+    );
+}
+
+/// uv replaces distributions by project name, so an install can displace a
+/// record with a DIFFERENT import name: a user skill importing `user_goal`
+/// from a distribution named `goal` (the bundled goal's project name) has
+/// its code replaced when a sync installs another `goal` distribution. The
+/// stale record must go, or the next session selecting the user skill
+/// short-circuits `kernel_ready` on it and imports a missing module.
+#[cfg(unix)]
+#[tokio::test]
+async fn installing_a_skill_drops_records_displaced_by_distribution_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let uv = fake_uv(
+        dir.path(),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 0\n",
+            dir.path().join("uv.log").display()
+        ),
+    );
+    let venv = dir.path().join("venv");
+    std::fs::create_dir_all(&venv).unwrap();
+    // The user's skill imports `user_goal`, but its distribution is named
+    // `goal` — the same project name as the bundled goal.
+    let user_path = dir.path().join("home/skills/mygoal");
+    let packaged_path = dir.path().join("payload/skills/goal");
+    write_skill_pyproject(&user_path, "goal");
+    write_skill_pyproject(&packaged_path, "goal");
+    let user_skill = skill("user_goal", user_path.to_str().unwrap(), "user-hash");
+    let packaged_skill = skill("goal", packaged_path.to_str().unwrap(), "packaged-hash");
+    let uv_command = UvCommand {
+        executable: uv.to_str().unwrap(),
+        project: None,
+    };
+    // A previous session installed and recorded the user's skill.
+    write_bootstrap_version(&venv, "sha256:rt", std::slice::from_ref(&user_skill)).unwrap();
+
+    // The session's set now carries the packaged goal: uv replaces the
+    // `goal` distribution, so the user's record must not survive.
+    sync_python_skills(
+        &uv_command,
+        &venv,
+        dir.path().join("python").as_path(),
+        dir.path().join("prime-agent-runtime").as_path(),
+        "sha256:rt",
+        std::slice::from_ref(&packaged_skill),
+        &EnsureKernelPythonOptions::default(),
+    )
+    .await
+    .unwrap();
+    let recorded = read_bootstrap_version(&venv)
+        .expect("version written")
+        .python_skills
+        .expect("skills recorded");
+    assert_eq!(
+        recorded,
+        vec![packaged_skill.clone()],
+        "the replaced-distribution record must not survive"
+    );
+    assert!(
+        !recorded_skills_cover(Some(&recorded), std::slice::from_ref(&user_skill)),
+        "the replaced record must not satisfy the next session's kernel_ready"
+    );
+
+    // The next session resyncs its own discovery: the user's skill returns
+    // and the packaged record goes, symmetrically.
+    sync_python_skills(
+        &uv_command,
+        &venv,
+        dir.path().join("python").as_path(),
+        dir.path().join("prime-agent-runtime").as_path(),
+        "sha256:rt",
+        std::slice::from_ref(&user_skill),
+        &EnsureKernelPythonOptions::default(),
+    )
+    .await
+    .unwrap();
+    let recorded = read_bootstrap_version(&venv)
+        .expect("version written")
+        .python_skills
+        .expect("skills recorded");
+    assert_eq!(
+        recorded,
+        vec![user_skill.clone()],
+        "the sync installs the user's skill back over the packaged record"
+    );
+    // Same-project displacement needs no uninstall: uv's install replaces
+    // the distribution itself.
+    assert!(
+        !uv_invocations(dir.path())
+            .iter()
+            .any(|call| call.contains("uninstall")),
+        "same-project displacement replaces via the install: {:?}",
+        uv_invocations(dir.path())
+    );
+}
+
+/// Permission semantics need a non-root runner: `chmod` cannot deny root, so these
+/// tests skip as root and the gate harness runs the binary via `runuser` as a
+/// non-root user (a shared install dir readable but not writable, like the verifiers
+/// harness's `agent_user` seats).
+#[cfg(unix)]
+fn skip_when_root() -> bool {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: run as a non-root user (chmod cannot deny root)");
+        return true;
+    }
+    false
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A base-ready venv whose directory cannot host the bootstrap lock (EACCES/EROFS on
+/// the candidate) must degrade like a `PRIME_AGENT_KERNEL_PYTHON` override: the
+/// uncovered skill is disabled with a warning and the venv python is returned, with
+/// nothing installed into the read-only venv. Red on the raw EACCES before the fix.
+#[cfg(unix)]
+#[tokio::test]
+async fn unwritable_venv_disables_uncovered_skills_instead_of_failing() {
+    if skip_when_root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let venv = dir.path().join("kernel-venv");
+    let rlm = venv.join("lib/python3.11/site-packages/rlm");
+    std::fs::create_dir_all(&rlm).unwrap();
+    std::fs::write(rlm.join("__init__.py"), "x = 1\n").unwrap();
+    // The fake interpreter passes the runtime and dill probes; only the skill import fails.
+    let python = venv.join("bin/python");
+    std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+    std::fs::write(
+        &python,
+        "#!/bin/sh\nif [ \"$4\" = \"import edit\" ]; then exit 1; fi\nexit 0\n",
+    )
+    .unwrap();
+    set_mode(&python, 0o755);
+    let skill_dir = dir.path().join("skills/edit");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("pyproject.toml"),
+        "[project]\nname = \"edit\"\n",
+    )
+    .unwrap();
+    let runtime_source = require_runtime_source_dir().unwrap();
+    let runtime_identity = hash_runtime_source(&runtime_source).unwrap();
+    write_bootstrap_version(&venv, &runtime_identity, &[]).unwrap();
+
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut options = EnsureKernelPythonOptions::default();
+    let sink = warnings.clone();
+    options.on_progress = Some(std::sync::Arc::new(move |message: &str| {
+        sink.lock().unwrap().push(message.to_string());
+    }));
+    options.python_skills = vec![KernelPythonSkill {
+        name: "edit".to_string(),
+        import_name: "edit".to_string(),
+        package_path: skill_dir.clone(),
+        pyproject_path: skill_dir.join("pyproject.toml"),
+    }];
+
+    set_mode(&venv, 0o555);
+    set_mode(dir.path(), 0o555);
+    let outcome = super::super::ensure_kernel_venv(
+        &options,
+        &normalize_python_skills(&options.python_skills),
+        venv.clone(),
+        None,
+        /*account_home*/ None,
+    )
+    .await;
+    set_mode(dir.path(), 0o755);
+    set_mode(&venv, 0o755);
+
+    let resolved = outcome.expect("a base-ready venv must still yield its python");
+    assert_eq!(resolved, python);
+    let warnings = warnings.lock().unwrap();
+    assert!(
+        warnings.len() == 1
+            && warnings[0].contains("Warning: Python skills unavailable in")
+            && warnings[0].contains(&venv.display().to_string())
+            && warnings[0].contains("edit (edit)"),
+        "one warning naming the venv and the disabled skill: {warnings:?}"
+    );
+    assert!(
+        !dir.path().join("kernel-venv.bootstrap.lock").exists(),
+        "the read-only directory hosts no lock"
+    );
+    let version = read_bootstrap_version(&venv).expect("the version file is still readable");
+    assert!(
+        version.python_skills.as_ref().is_none_or(Vec::is_empty),
+        "nothing was installed into the read-only venv: {version:?}"
+    );
+}
+
+/// A venv that cannot host the lock AND cannot run the kernel is a setup error that
+/// names the venv and both env overrides — not the raw candidate-file EACCES.
+/// Red on the raw EACCES before the fix.
+#[cfg(unix)]
+#[tokio::test]
+async fn unwritable_stale_venv_names_the_venv_and_both_env_overrides() {
+    if skip_when_root() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let venv = dir.path().join("kernel-venv");
+    let python = venv.join("bin/python");
+    std::fs::create_dir_all(python.parent().unwrap()).unwrap();
+    std::fs::write(&python, "#!/bin/sh\nexit 0\n").unwrap();
+    set_mode(&python, 0o755);
+    // A stale runtime identity: the base is not ready, so the venv needs a rebuild.
+    write_bootstrap_version(&venv, "sha256:stale", &[]).unwrap();
+
+    set_mode(&venv, 0o555);
+    set_mode(dir.path(), 0o555);
+    let error = super::super::ensure_kernel_venv(
+        &EnsureKernelPythonOptions::default(),
+        &[],
+        venv.clone(),
+        None,
+        /*account_home*/ None,
+    )
+    .await
+    .expect_err("an unusable venv in a read-only dir is a setup error");
+    set_mode(dir.path(), 0o755);
+    set_mode(&venv, 0o755);
+
+    let message = error.to_string();
+    assert!(
+        message.contains(&venv.display().to_string()),
+        "names the venv: {message}"
+    );
+    assert!(
+        message.contains("PRIME_AGENT_KERNEL_VENV")
+            && message.contains("PRIME_AGENT_KERNEL_PYTHON"),
+        "names both env overrides: {message}"
+    );
+    assert!(
+        !message.contains("candidate-"),
+        "no raw lock-candidate path: {message}"
+    );
+}
+
+/// The persisted sha256 witnesses keep their lowercase-hex format. The expected digests were
+/// computed independently with Python's hashlib.
+#[test]
+fn sha256_witnesses_are_lowercase_hex() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("pyproject.toml");
+    std::fs::write(&file, "[project]\nname = 'prime-agent-runtime'\n").unwrap();
+    std::fs::create_dir_all(temp.path().join("src").join("rlm")).unwrap();
+    assert_eq!(
+        hash_runtime_source(temp.path()).unwrap(),
+        "sha256:eceff75b2c14143a336e6e86e5bf5b0a3a2ae360055a28312533eedf44cad128"
+    );
+    std::fs::write(&file, "abc").unwrap();
+    assert_eq!(
+        file_content_hash(&file),
+        "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        runtime_probe_key("py", "rt", "3.11.9", "inst"),
+        "py\u{0}rt\u{0}inst\u{0}sha256:8f5d262b3bf12072437206a54a16f89e7ffac61876b9b22b78c71d2966887916"
+    );
 }

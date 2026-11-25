@@ -12,7 +12,7 @@ use crate::types::{
 };
 use crate::utils_inner::sanitize_unicode::sanitize_surrogates;
 
-fn get_model_match_candidates(model_id: &str, model_name: Option<&str>) -> Vec<String> {
+pub(crate) fn get_model_match_candidates(model_id: &str, model_name: Option<&str>) -> Vec<String> {
     let mut values = vec![model_id.to_string()];
     if let Some(name) = model_name {
         values.push(name.to_string());
@@ -30,7 +30,7 @@ fn get_model_match_candidates(model_id: &str, model_name: Option<&str>) -> Vec<S
         .collect()
 }
 
-/// Adaptive thinking support (Opus 4.6+, Sonnet 4.6).
+/// Adaptive thinking support (Opus 4.6+, Sonnet 4.6+, Haiku 5+).
 pub fn supports_adaptive_thinking(model_id: &str, model_name: Option<&str>) -> bool {
     get_model_match_candidates(model_id, model_name)
         .iter()
@@ -41,6 +41,7 @@ pub fn supports_adaptive_thinking(model_id: &str, model_name: Option<&str>) -> b
                 || s.contains("opus-5")
                 || s.contains("sonnet-4-6")
                 || s.contains("sonnet-5")
+                || s.contains("haiku-5")
                 || s.contains("fable-5")
                 || s.contains("mythos-5")
                 || s.contains("mythos-preview")
@@ -80,8 +81,27 @@ pub fn supports_prompt_caching(model: &Model) -> bool {
         return std::env::var("AWS_BEDROCK_FORCE_CACHE").as_deref() == Ok("1");
     }
     candidates.iter().any(|s| {
-        s.contains("-4-") || s.contains("claude-3-7-sonnet") || s.contains("claude-3-5-haiku")
+        s.contains("-4-")
+            || s.contains("claude-3-7-sonnet")
+            || s.contains("claude-3-5-haiku")
+            || claude_generation(s).is_some_and(|generation| generation >= 5)
     })
+}
+
+/// The generation number in a `claude-<family>-<generation>` id (`claude-opus-5-5` is 5), so Claude 5
+/// and later models are recognised without listing each release.
+fn claude_generation(candidate: &str) -> Option<u32> {
+    ["fable", "mythos", "opus", "sonnet", "haiku"]
+        .iter()
+        .find_map(|family| {
+            let marker = format!("claude-{family}-");
+            let start = candidate.find(&marker)? + marker.len();
+            let digits: String = candidate[start..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        })
 }
 
 pub fn supports_thinking_signature(model: &Model) -> bool {
@@ -150,6 +170,23 @@ pub fn build_system_prompt(
     Some(blocks)
 }
 
+/// Bedrock Converse rejects consecutive user messages ("A conversation must alternate between user
+/// and assistant roles"). A user turn that follows another one joins it: this happens when an
+/// assistant reply with no content (a turn ended with no text) is dropped, or when a user message
+/// follows tool results. Tool results always follow their assistant turn, so they open their own
+/// user turn.
+fn push_user_turn(result: &mut Vec<Value>, mut content: Vec<Value>) {
+    if let Some(blocks) = result
+        .last_mut()
+        .filter(|message| message["role"] == "user")
+        .and_then(|message| message["content"].as_array_mut())
+    {
+        blocks.append(&mut content);
+        return;
+    }
+    result.push(json!({ "role": "user", "content": content }));
+}
+
 // Long by design: mirrors the provider's stream shape.
 #[allow(clippy::too_many_lines)]
 pub fn convert_messages(
@@ -179,13 +216,16 @@ pub fn convert_messages(
                             crate::types::UserBlockPayload::Image { data, mime_type } => {
                                 json!({ "image": create_image_block(mime_type, data) })
                             }
+                            crate::types::UserBlockPayload::Video { .. } => {
+                                json!({ "text": crate::types::UNSUPPORTED_VIDEO_PLACEHOLDER })
+                            }
                             crate::types::UserBlockPayload::Opaque(json) => {
                                 json!({ "text": sanitize_surrogates(&json) })
                             }
                         })
                         .collect(),
                 };
-                result.push(json!({ "role": "user", "content": content_blocks }));
+                push_user_turn(&mut result, content_blocks);
                 i += 1;
             }
             Message::Assistant(assistant) => {
@@ -213,7 +253,20 @@ pub fn convert_messages(
                             }));
                         }
                         AssistantContent::Thinking(thinking) => {
-                            if thinking.thinking.trim().is_empty() {
+                            let signature = thinking
+                                .thinking_signature
+                                .as_deref()
+                                .filter(|signature| !signature.trim().is_empty());
+                            if thinking.redacted.unwrap_or(false) {
+                                if let Some(data) = signature {
+                                    content_blocks.push(json!({
+                                        "reasoningContent": { "redactedContent": data }
+                                    }));
+                                }
+                                continue;
+                            }
+                            // Omitted thinking has no text, but its signature must be replayed.
+                            if thinking.thinking.trim().is_empty() && signature.is_none() {
                                 continue;
                             }
                             // Only Anthropic models support the signature field in reasoningText.
@@ -224,10 +277,6 @@ pub fn convert_messages(
                                 // externally persisted message lacks a signature, Bedrock rejects
                                 // the replayed reasoning block. Fall back to plain text, matching
                                 // Anthropic.
-                                let signature = thinking
-                                    .thinking_signature
-                                    .as_deref()
-                                    .filter(|signature| !signature.trim().is_empty());
                                 match signature {
                                     None => {
                                         content_blocks.push(json!({
@@ -278,6 +327,9 @@ pub fn convert_messages(
                                 }
                                 crate::types::UserBlockPayload::Image { data, mime_type } => {
                                     json!({ "image": create_image_block(mime_type, data) })
+                                }
+                                crate::types::UserBlockPayload::Video { .. } => {
+                                    json!({ "text": crate::types::UNSUPPORTED_VIDEO_PLACEHOLDER })
                                 }
                                 crate::types::UserBlockPayload::Opaque(json) => {
                                     json!({ "text": sanitize_surrogates(&json) })
@@ -404,26 +456,198 @@ pub fn map_stop_reason(reason: Option<&str>) -> crate::types::StopReason {
 }
 
 #[cfg(test)]
+mod supports_adaptive_thinking_tests {
+    use super::supports_adaptive_thinking;
+
+    /// Discussion #3710: Haiku 5.x rejects budget-based thinking, so it must take the adaptive path.
+    #[test]
+    fn bedrock_haiku_5_uses_adaptive_thinking() {
+        assert!(supports_adaptive_thinking(
+            "us.anthropic.claude-haiku-5-5-v1",
+            Some("Claude Haiku 5.5")
+        ));
+        assert!(!supports_adaptive_thinking(
+            "us.anthropic.claude-haiku-4-5-v1",
+            Some("Claude Haiku 4.5")
+        ));
+    }
+}
+
+#[cfg(test)]
 mod supports_always_on_adaptive_thinking_tests {
     use super::supports_always_on_adaptive_thinking;
 
+    /// Which Bedrock ids take always-on adaptive thinking (and so drop sampling params).
     #[test]
-    fn bedrock_always_on_models_reject_sampling_params() {
-        assert!(supports_always_on_adaptive_thinking(
-            "us.anthropic.claude-opus-5-5-v1",
-            Some("Claude Opus 5.5")
-        ));
-        assert!(supports_always_on_adaptive_thinking(
-            "anthropic.claude-fable-5",
-            None
-        ));
+    fn bedrock_always_on_adaptive_thinking_follows_the_model_id() {
+        for (id, name, always_on) in [
+            (
+                "us.anthropic.claude-opus-5-5-v1",
+                Some("Claude Opus 5.5"),
+                true,
+            ),
+            ("anthropic.claude-fable-5", None, true),
+            (
+                "us.anthropic.claude-opus-5-v1",
+                Some("Claude Opus 5"),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                supports_always_on_adaptive_thinking(id, name),
+                always_on,
+                "{id}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod prompt_caching_gate_tests {
+    use super::*;
+
+    fn model_with_id(id: &str) -> Model {
+        Model {
+            id: id.into(),
+            name: id.into(),
+            api: crate::providers::bedrock::API_BEDROCK_CONVERSE_STREAM.to_string(),
+            provider: "amazon-bedrock".into(),
+            base_url: "https://bedrock-runtime.us-west-2.amazonaws.com".into(),
+            reasoning: true,
+            thinking_level_map: None,
+            input: vec![crate::types::ModelInput::Text],
+            cost: crate::types::zero_model_cost(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            max_tokens_explicit: false,
+            featured: None,
+            headers: None,
+            compat: None,
+            serving: None,
+        }
     }
 
     #[test]
-    fn bedrock_optional_thinking_models_keep_sampling_params() {
-        assert!(!supports_always_on_adaptive_thinking(
-            "us.anthropic.claude-opus-5-v1",
-            Some("Claude Opus 5")
-        ));
+    fn claude_5_and_later_get_cache_points_like_the_4_family() {
+        for id in [
+            "global.anthropic.claude-sonnet-5-5",
+            "global.anthropic.claude-opus-5-5",
+            "global.anthropic.claude-opus-5",
+            "us.anthropic.claude-sonnet-5",
+            "global.anthropic.claude-fable-5-1",
+            "us.anthropic.claude-opus-5-5-v1:0",
+            "us.anthropic.claude-opus-4-6-v1",
+            "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+            "global.anthropic.claude-opus-10-0",
+        ] {
+            assert!(supports_prompt_caching(&model_with_id(id)), "{id}");
+        }
+        for id in [
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            "anthropic.claude-v2:1",
+            "anthropic.claude-3-5-sonnet-20240620-v1:0",
+        ] {
+            assert!(!supports_prompt_caching(&model_with_id(id)), "{id}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod convert_messages_tests {
+    use serde_json::{json, Value};
+
+    use super::convert_messages;
+    use crate::types::{CacheRetention, Context, Message, Model};
+
+    fn model() -> Model {
+        Model {
+            id: "us.anthropic.claude-opus-5-5-v1".into(),
+            name: "Claude Opus 5.5".into(),
+            api: "bedrock-converse-stream".into(),
+            provider: "amazon-bedrock".into(),
+            base_url: String::new(),
+            reasoning: true,
+            thinking_level_map: None,
+            input: vec![crate::types::ModelInput::Text],
+            cost: crate::types::zero_model_cost(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            max_tokens_explicit: false,
+            featured: None,
+            headers: None,
+            compat: None,
+            serving: None,
+        }
+    }
+
+    fn assistant(content: &Value) -> Value {
+        json!({
+            "role": "assistant",
+            "content": content,
+            "api": "bedrock-converse-stream",
+            "provider": "amazon-bedrock",
+            "model": "us.anthropic.claude-opus-5-5-v1",
+            "usage": {
+                "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 0,
+                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0 },
+            },
+            "stopReason": "stop",
+            "timestamp": 2,
+        })
+    }
+
+    fn convert(messages: Vec<Value>) -> Vec<Value> {
+        let messages: Vec<Message> = messages
+            .into_iter()
+            .map(|message| serde_json::from_value(message).unwrap())
+            .collect();
+        convert_messages(
+            &Context {
+                system_prompt: None,
+                messages,
+                tools: None,
+            },
+            &model(),
+            CacheRetention::None,
+        )
+    }
+
+    /// `rlm.end_turn()` ends a turn on a tool result, so the next request's history is
+    /// `[..., toolResult, user]`. The tool results and the next prompt must join one user
+    /// turn (tool results first): Bedrock Converse rejects two user messages in a row.
+    #[test]
+    fn a_user_message_after_an_ended_turns_tool_results_joins_their_turn() {
+        let converted = convert(vec![
+            json!({ "role": "user", "content": "run it", "timestamp": 1 }),
+            assistant(&json!([
+                { "type": "toolCall", "id": "call_1", "name": "python_repl", "arguments": { "code": "await rlm.end_turn()" } },
+            ])),
+            json!({
+                "role": "toolResult",
+                "toolCallId": "call_1",
+                "toolName": "python_repl",
+                "content": [{ "type": "text", "text": "turn ended" }],
+                "isError": false,
+                "timestamp": 3,
+            }),
+            json!({ "role": "user", "content": "next turn", "timestamp": 4 }),
+        ]);
+        assert_eq!(
+            converted,
+            vec![
+                json!({ "role": "user", "content": [{ "text": "run it" }] }),
+                json!({
+                    "role": "assistant",
+                    "content": [{ "toolUse": { "toolUseId": "call_1", "name": "python_repl", "input": { "code": "await rlm.end_turn()" } } }],
+                }),
+                json!({
+                    "role": "user",
+                    "content": [
+                        { "toolResult": { "toolUseId": "call_1", "content": [{ "text": "turn ended" }], "status": "success" } },
+                        { "text": "next turn" },
+                    ],
+                }),
+            ]
+        );
     }
 }

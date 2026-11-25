@@ -19,7 +19,7 @@ pub(super) struct PendingDelete {
 
 /// One stop-or-delete dispatch the run loop executes (the wire variant follows the row kind).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum DeleteAction {
+pub(crate) enum DeleteAction {
     /// A running subagent: stop it via its parent's session
     /// (`cancel_rlm_child`).
     StopSubagent {
@@ -41,13 +41,22 @@ pub(super) enum DeleteAction {
     },
     /// A saved, non-live agent: delete the session file
     /// (`delete_saved_session`).
-    DeleteSavedSession { session_path: String, name: String },
+    DeleteSavedSession {
+        session_path: String,
+        name: String,
+    },
+    StopShell {
+        shell_id: String,
+        name: String,
+    },
 }
 
 impl DeleteAction {
     fn success_message(&self) -> String {
         match self {
-            DeleteAction::StopSubagent { name, .. } | DeleteAction::StopAgent { name, .. } => {
+            DeleteAction::StopSubagent { name, .. }
+            | DeleteAction::StopAgent { name, .. }
+            | DeleteAction::StopShell { name, .. } => {
                 format!("Stopped {name}")
             }
             DeleteAction::DeleteSubagent { name, .. } => {
@@ -61,7 +70,9 @@ impl DeleteAction {
 
     fn fail_word(&self) -> &'static str {
         match self {
-            DeleteAction::StopSubagent { .. } | DeleteAction::StopAgent { .. } => "Stop",
+            DeleteAction::StopSubagent { .. }
+            | DeleteAction::StopAgent { .. }
+            | DeleteAction::StopShell { .. } => "Stop",
             DeleteAction::DeleteSubagent { .. } | DeleteAction::DeleteSavedSession { .. } => {
                 "Delete"
             }
@@ -81,7 +92,7 @@ impl DeleteAction {
             DeleteAction::DeleteSubagent { .. } => {
                 data.get("deleted") != Some(&serde_json::json!(false))
             }
-            DeleteAction::StopAgent { .. } => true,
+            DeleteAction::StopAgent { .. } | DeleteAction::StopShell { .. } => true,
             DeleteAction::DeleteSavedSession { .. } => {
                 data.get("ok").map(serde_json::Value::as_bool) != Some(Some(false))
             }
@@ -108,6 +119,85 @@ pub(super) fn no_effect_summary(data: Option<&serde_json::Value>) -> String {
     )
 }
 
+/// Run one stop-or-delete on the wire and summarize its outcome: the status text and its tone
+/// (success muted, a no-effect warning, a failure error). The factory page's child stop shares it.
+pub(crate) async fn execute_delete_action(
+    client: &DaemonClient,
+    action: &DeleteAction,
+) -> (String, StatusTone) {
+    let request = match action {
+        DeleteAction::StopSubagent {
+            active_session_id,
+            child_id,
+            ..
+        } => DaemonCommand::CancelRlmChild {
+            id: None,
+            active_session_id: active_session_id.clone(),
+            child_id: child_id.clone(),
+            rest: serde_json::Map::default(),
+        },
+        DeleteAction::DeleteSubagent {
+            active_session_id,
+            child_id,
+            ..
+        } => DaemonCommand::DeleteRlmSubagent {
+            id: None,
+            active_session_id: active_session_id.clone(),
+            child_id: child_id.clone(),
+            rest: serde_json::Map::default(),
+        },
+        DeleteAction::StopAgent {
+            active_session_id, ..
+        } => DaemonCommand::Kill {
+            id: None,
+            active_session_id: active_session_id.clone(),
+            rest: serde_json::Map::default(),
+        },
+        DeleteAction::DeleteSavedSession { session_path, .. } => {
+            DaemonCommand::DeleteSavedSession {
+                id: None,
+                active_session_id: None,
+                session_path: session_path.clone(),
+                rest: serde_json::Map::default(),
+            }
+        }
+        DeleteAction::StopShell { shell_id, .. } => DaemonCommand::KillPersistentShell {
+            id: None,
+            shell_id: shell_id.clone(),
+            rest: serde_json::Map::default(),
+        },
+    };
+    // The outcome's tone is explicit: success muted, a no-effect stop warning, a
+    // failure error — the status line never re-derives it from the text.
+    match client.request(request).await {
+        Ok(response) if response.success && action.effect_happened(&response) => {
+            (action.success_message(), StatusTone::Muted)
+        }
+        Ok(response) if response.success => {
+            // The wire ran but changed nothing: the status carries
+            // what the wire said, never the button's hope.
+            let summary = no_effect_summary(response.data.as_ref());
+            (
+                format!("{} did not change anything: {summary}", action.fail_word()),
+                StatusTone::Warning,
+            )
+        }
+        Ok(response) => {
+            let error = response
+                .error
+                .unwrap_or_else(|| "the command failed".into());
+            (
+                format!("{} failed: {error}", action.fail_word()),
+                StatusTone::Error,
+            )
+        }
+        Err(error) => (
+            format!("{} failed: {error}", action.fail_word()),
+            StatusTone::Error,
+        ),
+    }
+}
+
 /// One stop-or-delete wire dispatch: the call runs off the key loop, its outcome re-enters as a
 /// `DeleteResult` status line — the roster push, not the status, refreshes the rows.
 pub(super) fn spawn_delete_dispatch(
@@ -117,72 +207,7 @@ pub(super) fn spawn_delete_dispatch(
 ) -> tokio::task::JoinHandle<()> {
     let client = client.clone();
     tokio::spawn(async move {
-        let request = match &action {
-            DeleteAction::StopSubagent {
-                active_session_id,
-                child_id,
-                ..
-            } => DaemonCommand::CancelRlmChild {
-                id: None,
-                active_session_id: active_session_id.clone(),
-                child_id: child_id.clone(),
-                rest: serde_json::Map::default(),
-            },
-            DeleteAction::DeleteSubagent {
-                active_session_id,
-                child_id,
-                ..
-            } => DaemonCommand::DeleteRlmSubagent {
-                id: None,
-                active_session_id: active_session_id.clone(),
-                child_id: child_id.clone(),
-                rest: serde_json::Map::default(),
-            },
-            DeleteAction::StopAgent {
-                active_session_id, ..
-            } => DaemonCommand::Kill {
-                id: None,
-                active_session_id: active_session_id.clone(),
-                rest: serde_json::Map::default(),
-            },
-            DeleteAction::DeleteSavedSession { session_path, .. } => {
-                DaemonCommand::DeleteSavedSession {
-                    id: None,
-                    active_session_id: None,
-                    session_path: session_path.clone(),
-                    rest: serde_json::Map::default(),
-                }
-            }
-        };
-        // The outcome's tone is explicit: success muted, a no-effect stop warning, a
-        // failure error — the status line never re-derives it from the text.
-        let (outcome, tone) = match client.request(request).await {
-            Ok(response) if response.success && action.effect_happened(&response) => {
-                (action.success_message(), StatusTone::Muted)
-            }
-            Ok(response) if response.success => {
-                // The wire ran but changed nothing: the status carries
-                // what the wire said, never the button's hope.
-                let summary = no_effect_summary(response.data.as_ref());
-                (
-                    format!("{} did not change anything: {summary}", action.fail_word()),
-                    StatusTone::Warning,
-                )
-            }
-            Ok(response) => {
-                let error = response
-                    .error
-                    .unwrap_or_else(|| "the command failed".into());
-                (
-                    format!("{} failed: {error}", action.fail_word()),
-                    StatusTone::Error,
-                )
-            }
-            Err(error) => (
-                format!("{} failed: {error}", action.fail_word()),
-                StatusTone::Error,
-            ),
-        };
+        let (outcome, tone) = execute_delete_action(&client, &action).await;
         let deleted_saved_path = match &action {
             DeleteAction::DeleteSavedSession { session_path, .. }
                 if outcome.starts_with("Deleted session") =>
@@ -192,7 +217,8 @@ pub(super) fn spawn_delete_dispatch(
             DeleteAction::DeleteSavedSession { .. }
             | DeleteAction::StopSubagent { .. }
             | DeleteAction::DeleteSubagent { .. }
-            | DeleteAction::StopAgent { .. } => None,
+            | DeleteAction::StopAgent { .. }
+            | DeleteAction::StopShell { .. } => None,
         };
         let _ = ui_tx.send(UiInput::DeleteResult {
             message: outcome,
@@ -225,7 +251,10 @@ impl AgentsViewMode {
         let row = self.rows.get(self.selected)?;
         let stop = Self::delete_arm_word(row);
         match row.kind {
-            RowKind::SubagentSummary | RowKind::Code => None,
+            RowKind::SubagentSummary | RowKind::Code | RowKind::Shells | RowKind::FactoryRuns => {
+                None
+            }
+            RowKind::PersistentShell => Some(()),
             // An agent with a live session stops (an idle-but-live row still stops, never
             // deletes its file); a saved-only row deletes.
             RowKind::Agent if row.summary.get("activeSessionId").is_some() => row
@@ -313,7 +342,10 @@ impl AgentsViewMode {
     /// The row's stop-or-delete word: true while the row rides a live session or the running
     /// section, false for a saved-only row.
     pub(super) fn delete_arm_word(row: &AgentsViewRow) -> bool {
-        if row.summary.get("rlmChildId").is_some() {
+        if row.kind == RowKind::PersistentShell {
+            // A listed shell is live: it always stops.
+            true
+        } else if row.summary.get("rlmChildId").is_some() {
             // A child rides its own activity: the running section is its live work, an idle
             // child deletes — the retained activeSessionId on an idle child is not live work.
             row.section == crate::agents_view_state::Section::Running
@@ -344,7 +376,10 @@ impl AgentsViewMode {
         // Subagent rows (and promoted children) target the child through
         // the parent's live session.
         if let Some(child_id) = child_id {
-            if row.kind == RowKind::SubagentSummary {
+            if matches!(
+                row.kind,
+                RowKind::SubagentSummary | RowKind::Shells | RowKind::FactoryRuns
+            ) {
                 return None;
             }
             // The child arms always run through the PARENT's session: a scoped promoted child has
@@ -366,7 +401,15 @@ impl AgentsViewMode {
         // Agent rows: a live session stops (idle-but-live included); a saved-only row deletes
         // its file.
         match row.kind {
-            RowKind::SubagentSummary | RowKind::Subagent | RowKind::Code => None,
+            RowKind::SubagentSummary
+            | RowKind::Subagent
+            | RowKind::Code
+            | RowKind::Shells
+            | RowKind::FactoryRuns => None,
+            RowKind::PersistentShell => {
+                let shell_id = row.summary.get("shellId")?.as_str()?.to_string();
+                Some(DeleteAction::StopShell { shell_id, name })
+            }
             RowKind::Agent => {
                 if let Some(active_session_id) = active_session_id {
                     Some(DeleteAction::StopAgent {

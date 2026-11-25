@@ -18,7 +18,7 @@ use pa_core::session_engine::agent_messaging::{
 };
 use pa_core::session_engine::engine::{SessionEngine as CoreSessionEngine, SessionEngineConfig};
 use pa_core::session_engine::provider_adapter::{
-    json_round_trip, map_thinking_level, switchable_stream_fn, ProviderTarget,
+    json_round_trip, map_thinking_level, switchable_stream_fn_with_live_auth, ProviderTarget,
 };
 use pa_core::session_engine::session_commands::{
     execute_session_command, SessionCommandExecution, SessionCommandParams,
@@ -50,6 +50,8 @@ mod goalcore;
 mod lifecycle;
 mod turn_types;
 
+pub(crate) use goalcore::GoalWakeKind;
+
 use turn_types::{
     aborted_message, drop_trailing_assistant, retry_event_to_engine_event, BoundaryRun,
     TurnAdmission, TurnOnce, TurnPrompt, TurnResult,
@@ -57,10 +59,10 @@ use turn_types::{
 
 mod model;
 
-use model::persisted_rlm_max_depth;
 pub(crate) use model::saved_session_context_from_parts;
 
 mod config;
+mod core_state;
 
 mod artifacts;
 
@@ -70,8 +72,12 @@ pub use config::AgentEngineConfig;
 pub(crate) use config::AutonomousAdmission;
 pub(crate) use config::CreateSessionResources;
 pub use config::SupervisorLinkConfig;
-use config::{GoalRuntimeHandles, ProducerUsageSink, RestoredSessionModel, StartupScope};
+use config::{
+    GoalRuntimeHandles, ModelResolutionWarning, ProducerUsageSink, RestoredSessionModel,
+    StartupScope,
+};
 
+mod reload;
 mod session_engine_impl;
 
 mod turn;
@@ -99,26 +105,34 @@ pub(crate) const QUOTA_WAKE_MAX_RETRIES: u32 = 3;
 pub(crate) type SettledKernelRelease =
     std::sync::Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
+/// A captured prompt boundary: an empty transcript or a stable durable leaf.
+/// The owning slot's None means no worker boundary has been supplied.
+#[derive(Clone, PartialEq, Eq)]
+enum PromptContextBoundary {
+    Empty,
+    Leaf(String),
+}
+
+/// Transfers completion reporting to the worker without retaining its turn runner.
+pub(crate) type RefinementCompletionSink = std::sync::Arc<
+    dyn Fn(
+            tokio::task::JoinHandle<
+                anyhow::Result<pa_core::session_engine::refine::CommittedRefinement>,
+            >,
+        ) + Send
+        + Sync,
+>;
+
 /// A [`SessionEngine`] running real agent turns.
 pub struct AgentSessionEngine {
     pub(crate) runtime: crate::async_safe_runtime::AsyncSafeRuntime,
     pub(crate) config: AgentEngineConfig,
     /// The session-scoped ACP MCP store, shared with the core engine's prompt gating.
     pub(crate) mcp: std::sync::Arc<std::sync::Mutex<pa_core::mcp::McpManager>>,
-    /// The last emitted `goal_update`; unchanged states stay silent.
-    pub(crate) published_goal: std::sync::Mutex<Option<pa_core::goals::GoalState>>,
+    /// Transfers refinement completion reporting to the worker sink.
+    pub(crate) refinement_completion_sink: std::sync::Mutex<Option<RefinementCompletionSink>>,
     pub(crate) late_agent_message_sink:
         std::sync::Mutex<Option<pa_core::LateSentAgentMessageHandler>>,
-    /// The session's goal driver and session-manager handles, mirrored from
-    /// the core session at build time: the core session's own mutex is held
-    /// across a turn's admission, so goal checks inside emit callbacks
-    /// (which may run in async context) must not lock it.
-    pub(crate) goal_runtime: std::sync::Mutex<Option<GoalRuntimeHandles>>,
-    /// The pending-continuation guard, mirrored lock-free at build: contexts
-    /// that cannot take the async driver lock release it through this atomic
-    /// handle.
-    pub(crate) pending_goal_continuation:
-        std::sync::Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
     /// Whether this run's usage crossed the goal's token budget: the boundary
     /// mints the budget-limit wrap-up steer. Shared with the agent-loop
     /// subscription (a plain field cannot cross the 'static handler).
@@ -131,40 +145,37 @@ pub struct AgentSessionEngine {
     /// The queued-goal-context purge (TS `_clearQueuedGoalContexts`):
     /// invoked by pause/clear/start and `goal.complete`.
     pub(crate) goal_queue_purge: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
-    /// The armed backoff wake's cron job id: `Some` while a one-shot
-    /// `goal-backoff-wake` is pending (cancelled by a successful mint).
-    pub(crate) goal_backoff_wake_job_id: std::sync::Mutex<Option<String>>,
+    /// `true` once the current goal deferral armed its one background-skip
+    /// fallback wake (the wake may have fired since); retiring the goal wakes
+    /// (`cancel_goal_wake`: the mint, the goal's transitions, a new arming)
+    /// clears it.
+    pub(crate) background_skip_wake_armed: std::sync::atomic::AtomicBool,
     /// The stale-row guard's DURABLE terminal row, deferred until after the
     /// context adoption; `Some` between the seed and the flush.
     pub(crate) stale_goal_terminal_pending: std::sync::Mutex<Option<pa_core::goals::GoalState>>,
-    /// The bash-completion queue seams: `bash.completed` admits through the
-    /// steering lane, `bash.consumed` withdraws its row. `None` outside a
-    /// daemon worker.
-    pub(crate) bash_completion_sink: std::sync::Mutex<Option<crate::engine::BashCompletionSink>>,
+    /// The kernel-notice queue seams: `bash.completed` and `factory.progress`
+    /// admit through the steering lane, `bash.consumed` withdraws a completion
+    /// row. `None` outside a daemon worker.
+    pub(crate) kernel_notice_sink: std::sync::Mutex<Option<crate::engine::KernelNoticeSink>>,
+    /// The session's shared cell wake (stable across session rebuilds): a user
+    /// message or inbox arrival fires it so a running cell's wait ends early
+    /// and the work auto-backgrounds.
+    pub(crate) cell_wake: std::sync::Arc<pa_core::kernel::cell_wake::CellWake>,
     pub(crate) bash_consumed_sink: std::sync::Mutex<Option<crate::engine::BashConsumedSink>>,
-    /// The live agent handle: the eager turn-abort funnel's target, mirrored
-    /// because a running turn holds the core session's mutex.
-    pub(crate) turn_agent: std::sync::Mutex<Option<std::sync::Arc<pa_agent::agent::Agent>>>,
+    /// The current session's agent inbox store (the notice sink routes
+    /// `bash.completed`/`factory.progress` messages into it); set at
+    /// every session build.
+    pub(crate) inbox:
+        std::sync::Mutex<Option<std::sync::Arc<pa_core::session_engine::inbox::SessionInbox>>>,
+    /// The worker's post-drain inbox seam (see `set_inbox_read_hook`).
+    pub(crate) inbox_read_hook:
+        std::sync::Mutex<Option<pa_core::session_engine::inbox::InboxReadHook>>,
     pub(crate) quota_park: std::sync::Arc<std::sync::Mutex<Option<QuotaParkState>>>,
     /// Whether the settled turn parked: the park's pause, not the goal's death.
     pub(crate) quota_parked_this_run: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The queue delivery modes: seeded from the start config, switched live;
     /// `None` keeps the default ("one-at-a-time").
     queue_modes: std::sync::Mutex<(Option<String>, Option<String>)>,
-    /// The in-run autonomous consult's deadlock-free mirror (see
-    /// [`crate::autonomous_continuation`]): read without the session mutex
-    /// (a compaction run holds it).
-    pub(crate) autonomous_boundary:
-        std::sync::Mutex<Option<crate::autonomous_continuation::AutonomousBoundaryMirror>>,
-    /// `true` while the kernel still runs background `bash()` handles, so the
-    /// continuation gates hold their turns without the session mutex. `None`
-    /// (unwired) answers `false`.
-    pub(crate) background_bash_probe:
-        std::sync::Mutex<Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>>,
-    /// The current session's stop-with-snapshot handle, adopted as a weak
-    /// provisioner reference (the park arm never takes the session mutex).
-    /// `None` when no session is built.
-    pub(crate) kernel_release_probe: std::sync::Mutex<Option<SettledKernelRelease>>,
     /// `true` while this session still owns an active or paused scheduled job
     /// (must not lose its kernel). `None` keeps the release open.
     pub(crate) registered_jobs_probe:
@@ -178,6 +189,7 @@ pub struct AgentSessionEngine {
     /// for: a revived session's saved model (or the fallback message); an
     /// explicit flag wins.
     restored_model: std::sync::Mutex<Option<RestoredSessionModel>>,
+    model_resolution_warning: std::sync::Mutex<ModelResolutionWarning>,
     /// The create-time `--models` scope (see [`config::StartupScope`]);
     /// `None` keeps the unscoped chain.
     startup_scope: std::sync::Mutex<Option<StartupScope>>,
@@ -192,13 +204,18 @@ pub struct AgentSessionEngine {
     /// Built once on the first prompt, reused across prompts: long-running
     /// arms clone the Arc and release this mutex before their awaits, so
     /// every read seam answers while a turn streams.
-    pub(crate) session: tokio::sync::Mutex<Option<Arc<CoreSessionEngine>>>,
+    pub(crate) session: Arc<tokio::sync::Mutex<Option<Arc<CoreSessionEngine>>>>,
+    core_state: std::sync::Mutex<core_state::CoreSessionState>,
+    threshold_yielded: Arc<std::sync::atomic::AtomicBool>,
+    threshold_checks_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// The build gate: at most one `build_session` in flight; the eager build
     /// and the first demand seam meet at one build.
     pub(crate) session_build: tokio::sync::Mutex<()>,
     /// A branch move that landed before the first turn: consumed at build so
     /// the session starts on the moved branch.
     pending_branch: std::sync::Mutex<Option<Vec<pa_types::session::FileEntry>>>,
+    /// The worker's captured pre-admission boundary; None means unset.
+    prompt_context_boundary: std::sync::Mutex<Option<PromptContextBoundary>>,
     /// The `goal_update` payload a branch rebuild's goal reload stashed,
     /// taken by the worker that announces it. `None` when it changed nothing.
     reloaded_goal_update: std::sync::Mutex<Option<Value>>,
@@ -207,6 +224,20 @@ pub struct AgentSessionEngine {
     pub(crate) provider_target: std::sync::Arc<
         std::sync::RwLock<Option<pa_core::session_engine::provider_adapter::ProviderTarget>>,
     >,
+    /// The OAuth integration the request-auth resolution refreshes expired
+    /// credentials through: production uses the built-in
+    /// [`pa_core::auth::ProviderOAuth`] (TS delegates to the oauth
+    /// registry on every auth-storage instance), set once at
+    /// construction; tests swap a scripted integration in before the
+    /// engine is shared. Read once per resolution.
+    pub(crate) request_auth_oauth: std::sync::Arc<dyn pa_core::auth::OAuthIntegration>,
+    /// The engine's long-lived request-auth registry and the store it owns
+    /// (TS's single `ModelRegistry`/`AuthStorage` instance): built over a
+    /// store from `request_auth_oauth`, rebuilt at the session build and a
+    /// model switch, and reused for every provider call in between, so a
+    /// failed `reload()` keeps the last read's data — a transiently-held
+    /// document lock or a corrupt auth.json is not a logout.
+    pub(crate) request_auth_registry: std::sync::Mutex<Option<pa_core::models::ModelRegistry>>,
     /// One shared supervisor-link client: agent messaging and RLM children
     /// multiplex the same connection.
     link: Arc<crate::supervisor_link::SupervisorLink>,
@@ -216,11 +247,18 @@ pub struct AgentSessionEngine {
     /// session. `None` without a worker pump.
     compaction_summary_sink:
         std::sync::Mutex<Option<pa_core::session_engine::compaction_exec::SummaryDeltaSink>>,
+    /// The worker's accepted-note announcer, threaded into every session
+    /// build; `None` without a worker pump.
+    progress_note_emit:
+        std::sync::Mutex<Option<pa_core::session_engine::rlm_host::RlmProgressNoteEmit>>,
     /// The attribution producer the children registry's sink last got:
     /// children outlive a rebuild, so their spawn registrations are adopted
     /// forward.
     usage_producer: std::sync::Mutex<
         Option<std::sync::Arc<pa_core::session_engine::rlm_usage::RlmChildUsageAttributions>>,
+    >,
+    rlm_usage_store: std::sync::Mutex<
+        Option<std::sync::Arc<dyn pa_core::session_engine::rlm_usage::RlmChildUsageStore>>,
     >,
     own_summary: std::sync::Arc<std::sync::Mutex<Option<Value>>>,
     pub(crate) create_resources: std::sync::RwLock<CreateSessionResources>,
@@ -242,10 +280,6 @@ pub struct AgentSessionEngine {
     /// Whether the in-run hook deferred the continuation behind unsettled
     /// RLM descendant work: the settle hook delivers it.
     pub(crate) autonomous_awaits_rlm_work: std::sync::atomic::AtomicBool,
-    /// Set by the worker's kill/shutdown closes: the continuation mint sites
-    /// and settle-hook retries bail — a stopped session stays stopped. The
-    /// create path clears it.
-    pub(crate) session_closed: std::sync::atomic::AtomicBool,
     /// The engine's own arc: the in-run continuation hook upgrades the weak so the agent's loop
     /// never pins the engine.
     pub(crate) self_weak: std::sync::Mutex<Option<std::sync::Weak<AgentSessionEngine>>>,
@@ -257,6 +291,9 @@ pub struct AgentSessionEngine {
     /// This session's RLM recursion depth (0 for top-level): gates the kernel `refine.*` host
     /// requests.
     rlm_depth: std::sync::atomic::AtomicU32,
+    /// Whether this session runs a factory state (its create carried a
+    /// factory run tag): selects the child prompt's factory line.
+    factory_child: std::sync::atomic::AtomicBool,
     /// The depth bound's source stamp (`default` | `env` | `global` |
     /// `inherited` | `chat`).
     rlm_max_depth_source: std::sync::Mutex<&'static str>,
@@ -272,7 +309,12 @@ pub struct AgentSessionEngine {
     /// every model-turn attempt so retries keep serving it; cleared when the
     /// episode settles.
     pub(crate) image_route: std::sync::Mutex<Option<ImageRoute>>,
-    /// Turn-boundary runs register their controller here;
+    /// The provider-slot writers' fence (`set_model`, the build, the
+    /// failover switch and restore, the image-route apply/clear): the
+    /// last writer leaves the newest target standing.
+    pub(crate) reload_lock: std::sync::Mutex<()>,
+
+    /// Turn-boundary runs and the prompt-route `/compact` register their controller here;
     /// [`SessionEngine::abort_auto_compaction`] aborts whatever holds it.
     pub(crate) auto_compaction_abort: std::sync::Mutex<Option<std::sync::Arc<AbortController>>>,
     /// The model-allowlist refusal telemetry, shared with the RLM children

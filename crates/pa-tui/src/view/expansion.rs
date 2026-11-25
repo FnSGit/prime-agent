@@ -4,17 +4,18 @@
 //! the Ctrl+O reset need no code.
 
 use super::AgentView;
-use crate::chat::Detail;
+use crate::chat::{ChatEntry, Detail};
 
 impl AgentView {
     /// The detail one entry's card renders at: the conversation level,
     /// flipped for the entries a click toggled away from it. Exact for
     /// both sides: the never-toggled entries get `self.detail` (a click
     /// can only toggle the kinds `transcript_click_target` matches),
-    /// and the card renderers read `Detail` only through
-    /// `tool_output_expanded()` — the level's other readers (thinking
-    /// blocks, edit diffs) belong to rows no click can toggle, so the
-    /// flip never leaks into them.
+    /// and the card renderers read this `Detail` only through
+    /// `tool_output_expanded()`. The level's other readers never see the
+    /// flip: thinking blocks belong to rows no click can toggle, and the
+    /// ipython card's edit diffs read the conversation level (`self.detail`)
+    /// passed beside this one.
     #[must_use]
     pub(super) fn entry_detail(&self, index: usize) -> Detail {
         if self.toggled_cards.contains(&index) {
@@ -28,14 +29,34 @@ impl AgentView {
         }
     }
 
-    /// Toggle the clicked card's own expansion; the invalidation rides the in-place-mutation
-    /// path, so a paused window keeps its absolute row while the clicked card grows or shrinks.
+    /// Toggle the clicked card's own expansion (an inbox-notice run head
+    /// toggles the whole run). The row change of every entry it resizes
+    /// folds into the tail bookkeeping, so a paused window keeps its
+    /// absolute row while the card grows or shrinks.
     pub(crate) fn toggle_card_expansion(&mut self, index: usize) {
-        self.prepare_entry_mutation(index);
+        let entries = match self.chat.get(index) {
+            Some(ChatEntry::InboxNotice(_)) => self.inbox_run(index),
+            _ => index..index + 1,
+        };
+        let width = self.layout_width;
+        let rows = |view: &Self| -> Vec<usize> {
+            entries
+                .clone()
+                .map(|entry| view.count_entry_rows(entry, width))
+                .collect()
+        };
+        let before = (self.sparse_window_is_tail_anchored() && width > 0).then(|| rows(self));
+        self.sparse_mutation = None;
         if !self.toggled_cards.remove(&index) {
             self.toggled_cards.insert(index);
         }
+        // The stale-mark also clears the run's later members (envelope rows).
         self.mark_entry_stale(index);
+        if let Some(before) = before {
+            for ((entry, before), after) in entries.clone().zip(before).zip(rows(self)) {
+                self.sparse_tail_delta(after as isize - before as isize, entry);
+            }
+        }
     }
 
     /// The Ctrl+O cycle (`app.tools.expand`, TS `toggleToolOutputExpansion` +

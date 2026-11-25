@@ -16,6 +16,7 @@
 #![cfg(unix)]
 
 use std::fmt::Write as _;
+#[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -109,6 +110,7 @@ impl Drop for DetachedDaemon {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn child_pids_of(ppid: u32) -> Vec<u32> {
     let mut pids = Vec::new();
     let entries = std::fs::read_dir("/proc").expect("read /proc");
@@ -137,6 +139,7 @@ fn child_pids_of(ppid: u32) -> Vec<u32> {
 
 /// Liveness that ignores zombies: a detached child nobody reaps keeps its
 /// `/proc` entry, so path existence alone would call an exited process alive.
+#[cfg(target_os = "linux")]
 fn process_alive(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
@@ -147,6 +150,30 @@ fn process_alive(pid: u32) -> bool {
     };
     let state = rest.split_whitespace().next().unwrap_or_default();
     !state.starts_with('Z') && !state.starts_with('X')
+}
+
+/// The children of `ppid` without `/proc`: one `ps` listing of every pid's parent.
+#[cfg(not(target_os = "linux"))]
+fn child_pids_of(parent_pid: u32) -> Vec<u32> {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .expect("run ps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let parent: u32 = fields.next()?.parse().ok()?;
+            (parent == parent_pid).then_some(pid)
+        })
+        .collect()
+}
+
+/// Liveness without `/proc`: the platform probe, which also reads zombies as dead.
+#[cfg(not(target_os = "linux"))]
+fn process_alive(pid: u32) -> bool {
+    pa_types::platform::process::is_process_alive(pid).unwrap_or(false)
 }
 
 /// Shut the supervisor down by protocol and assert it, its workers, and its
@@ -187,6 +214,9 @@ fn assert_daemon_stops_clean(socket: &Path) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+    // Only Linux can prove the listener closed (`unix_listener_definitely_closed`);
+    // elsewhere the exit cleanup keeps the file for the next bind to reclaim.
+    #[cfg(target_os = "linux")]
     assert!(
         !socket.exists(),
         "the spawned supervisor removed its socket file"
@@ -273,6 +303,8 @@ async fn run_headless_bounded(
 /// Kill supervisors leaked by earlier runs (a dead binary runs no `Drop`, so
 /// its daemons are reparented to init): a daemon matches when its socket dir
 /// is a `tempfile`-created `.tmpXXXXXX` dir and its parent is dead.
+/// Linux only: it walks `/proc`, and pairs with the Linux-only parent-death signal.
+#[cfg(target_os = "linux")]
 fn sweep_orphan_test_daemons() {
     static SWEEPED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     if SWEEPED.set(()).is_err() {
@@ -343,6 +375,7 @@ fn sweep_orphan_test_daemons() {
 
 #[allow(clippy::zombie_processes)]
 fn spawn_supervisor(dir: &Path) -> Supervisor {
+    #[cfg(target_os = "linux")]
     sweep_orphan_test_daemons();
     let socket = dir.join("daemon.sock");
     let agent_dir = dir.join("agent");
@@ -393,6 +426,7 @@ fn spawn_supervisor(dir: &Path) -> Supervisor {
     command.env("PA_DAEMON_WORKER_CONNECT_TIMEOUT_MS", "90000");
     // Die with this test binary: the kernel SIGKILLs a supervisor that gets
     // reparented to init; the guard's protocol teardown stays the exit path.
+    #[cfg(target_os = "linux")]
     unsafe {
         command.pre_exec(move || {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
@@ -1019,7 +1053,7 @@ async fn fresh_home_runs_the_full_sign_in_flow_to_completion() {
             wait_render("Paste a Prime API key below:"),
             pa_tui::interactive::HeadlessStep::Type("faux-prime-key".to_string()),
             enter(),
-            wait_render("Connect other providers, or continue."),
+            wait_render("Prime Inference is your default. Connect other providers, or continue."),
             down(),
             enter(),
             wait_render("Enter API key"),
@@ -1053,7 +1087,7 @@ async fn fresh_home_runs_the_full_sign_in_flow_to_completion() {
         "the paste prompt mounted inside the pane:\n{rendered}"
     );
     assert!(
-        rendered.contains("Connect other providers, or continue."),
+        rendered.contains("Prime Inference is your default. Connect other providers, or continue."),
         "the providers picker rendered:\n{rendered}"
     );
     assert!(
@@ -1566,8 +1600,7 @@ async fn tui_model_picker_applies_and_effort_reports() {
         &pa_core::auth::AuthStorageData::default(),
         std::sync::Arc::new(pa_core::auth::NoOAuth),
     );
-    let mut registry = pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
-    registry.load_private_authorization_from_cache();
+    let registry = pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
     let catalog: Vec<pa_types::ai::Model> = registry.get_available().into_iter().cloned().collect();
     assert_eq!(catalog.len(), 1, "the models.json model resolves available");
     assert_eq!(
@@ -1715,8 +1748,7 @@ async fn tui_effort_applies_on_a_map_addressable_model_without_the_reasoning_fla
         &pa_core::auth::AuthStorageData::default(),
         std::sync::Arc::new(pa_core::auth::NoOAuth),
     );
-    let mut registry = pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
-    registry.load_private_authorization_from_cache();
+    let registry = pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
     let catalog: Vec<pa_types::ai::Model> = registry.get_available().into_iter().cloned().collect();
     assert_eq!(catalog.len(), 1, "the models.json model resolves available");
     assert_eq!(catalog[0].id, "chat-plus");
@@ -2379,6 +2411,53 @@ async fn tui_big_streamed_turns_render_at_the_producer_rate() {
     drop(supervisor);
 }
 
+/// A `WaitIdle` barrier held by a running turn parks the loop. The plan's input sender closes
+/// once its last step is queued; a loop that kept polling the closed channel never parked,
+/// starving the daemon reader on this current-thread runtime, so under CPU load the turn end
+/// reached the barrier minutes late. The spin shows as the loop thread's CPU time.
+#[tokio::test]
+async fn tui_wait_idle_barrier_parks_while_the_turn_runs() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let session_dir = dir.path().join("agent").join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    let script = serde_json::json!({ "responses": [{ "text": "held reply", "delayMs": 4_000 }] });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+    let options = base_options(&supervisor, dir.path(), &session_dir);
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            pa_tui::interactive::HeadlessStep::Submit("hold".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 45_000 },
+        ],
+        width: 100,
+        height: 30,
+    };
+    let thread_cpu = || {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &raw mut now) },
+            0
+        );
+        Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+    };
+    let cpu_before = thread_cpu();
+    let started = Instant::now();
+    let outcome = run_headless_bounded(options, plan)
+        .await
+        .expect("interactive run");
+    let cpu = thread_cpu().saturating_sub(cpu_before);
+    let wall = started.elapsed();
+    assert_eq!(outcome.last_assistant_text.as_deref(), Some("held reply"));
+    assert!(
+        cpu < wall / 5,
+        "the loop thread burned {cpu:?} of CPU over a {wall:?} run: the barrier spun instead of parking"
+    );
+    drop(supervisor);
+}
+
 /// A settings fixture rebinding `app.tools.expand` to `ctrl+alt+x` drives the surface.
 #[tokio::test]
 async fn tui_renders_and_fires_user_keybindings_from_settings() {
@@ -2484,18 +2563,20 @@ async fn tui_renders_and_fires_user_keybindings_from_settings() {
         .await
         .expect("interactive run");
     let rendered = outcome.frames.join("\n");
+    // The host label: macOS renders alt as Option.
+    let override_key = pa_tui::keybindings::format_key_text("ctrl+alt+x");
 
     // The hint renders the user's binding, not the default (operator directive 2026-09-28).
     assert!(
-        rendered.contains("Collapsed mode (Ctrl+Alt+X to expand)"),
+        rendered.contains(&format!("Collapsed mode ({override_key} to expand)")),
         "the prompt-context hint renders the override:\n{rendered}"
     );
     assert!(
-        rendered.contains("Details mode (Ctrl+Alt+X to expand)"),
+        rendered.contains(&format!("Details mode ({override_key} to expand)")),
         "the override key cycled conversation detail:\n{rendered}"
     );
     assert!(
-        !rendered.contains("Expanded mode (Ctrl+Alt+X to collapse)"),
+        !rendered.contains(&format!("Expanded mode ({override_key} to collapse)")),
         "the default ctrl+o must not cycle after the override:\n{rendered}"
     );
     assert!(
@@ -2512,8 +2593,11 @@ async fn tui_renders_and_fires_user_keybindings_from_settings() {
         "the End key jumped the panel to the guide's bottom:\n{rendered}"
     );
     // The removed default key is gone (no other default binding uses ctrl+o).
+    // A whole key label only: macOS's `Ctrl+Option+X` starts with `Ctrl+O`.
     assert!(
-        !rendered.contains("Ctrl+O"),
+        !rendered
+            .match_indices("Ctrl+O")
+            .any(|(at, label)| !rendered[at + label.len()..].starts_with(char::is_alphanumeric)),
         "the hotkeys guide must not show the removed default:\n{rendered}"
     );
     // The guide stayed out of the transcript (the operator's no-flooding
@@ -2524,7 +2608,7 @@ async fn tui_renders_and_fires_user_keybindings_from_settings() {
         "the hotkeys guide never lands in the transcript:\n{last}"
     );
     assert!(
-        last.contains("Details mode (Ctrl+Alt+X to expand)"),
+        last.contains(&format!("Details mode ({override_key} to expand)")),
         "the dock returned after the panel closed:\n{last}"
     );
     drop(supervisor);
@@ -2782,8 +2866,7 @@ async fn tui_model_pick_refreshes_the_label_and_the_next_turn_resolves() {
         &pa_core::auth::AuthStorageData::default(),
         std::sync::Arc::new(pa_core::auth::NoOAuth),
     );
-    let mut registry = pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
-    registry.load_private_authorization_from_cache();
+    let registry = pa_core::models::ModelRegistry::create(auth, agent_dir.join("models.json"));
     let catalog: Vec<pa_types::ai::Model> = registry.get_available().into_iter().cloned().collect();
     assert_eq!(
         catalog.len(),
@@ -3067,6 +3150,164 @@ async fn tui_renames_session_through_slash_command() {
         .await
         .expect("get_state");
     assert_eq!(state["sessionName"], "my session");
+}
+
+// `/new` with arguments (TS `parseNewSessionCommand`): the `--name` value renames
+// the new session through the `/name` path, the verbatim suffix submits as the
+// initial prompt, and a parse error keeps the draft without creating a session.
+#[tokio::test]
+async fn tui_new_command_honors_name_and_prompt() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let agent_dir = dir.path().join("agent");
+    let session_dir = agent_dir.join("sessions");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let supervisor = spawn_supervisor(dir.path());
+    // Each created session replays the script from its first response, so one
+    // shared reply serves both prompt-bearing runs.
+    let script = serde_json::json!({ "engine": "faux", "responses": [
+        { "text": "scripted reply" },
+    ] });
+    std::fs::write(dir.path().join("script.json"), script.to_string()).expect("write script");
+    let options = base_options(&supervisor, dir.path(), &session_dir);
+    let plan = pa_tui::interactive::HeadlessPlan {
+        steps: vec![
+            // A parse error must not create a session.
+            pa_tui::interactive::HeadlessStep::Submit(
+                r#"/new --name "one" --name "two""#.to_string(),
+            ),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            // `--name` plus the `--`-separated initial prompt.
+            pa_tui::interactive::HeadlessStep::Submit(
+                r#"/new --name "my session" -- do something"#.to_string(),
+            ),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            // A bare suffix is the initial prompt; the session stays unnamed.
+            pa_tui::interactive::HeadlessStep::Submit("/new plain prompt".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+            // A name without a prompt names the new session and submits nothing.
+            pa_tui::interactive::HeadlessStep::Submit("/new --name solo".to_string()),
+            pa_tui::interactive::HeadlessStep::WaitIdle { timeout_ms: 30_000 },
+        ],
+        width: 120,
+        height: 36,
+    };
+    let outcome = run_headless_bounded(options, plan)
+        .await
+        .expect("interactive run");
+    let rendered = outcome.frames.join("\n");
+    assert!(
+        rendered.contains(r#"Duplicate /new option: "--name""#),
+        "the duplicate --name error row rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("do something"),
+        "the initial prompt's user message rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("plain prompt"),
+        "the bare-suffix prompt's user message rendered:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("scripted reply"),
+        "the scripted replies rendered:\n{rendered}"
+    );
+    // The create arm persists each session's file eagerly, so one file per
+    // created session: the startup session plus the three /new runs; the
+    // parse error added none.
+    let mut files: Vec<(String, String)> = Vec::new();
+    for entry in std::fs::read_dir(&session_dir)
+        .expect("read session dir")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let id = content
+            .lines()
+            .next()
+            .and_then(|header| serde_json::from_str::<serde_json::Value>(header).ok())
+            .and_then(|header| header["id"].as_str().map(str::to_string))
+            .unwrap_or_default();
+        files.push((id, content));
+    }
+    assert_eq!(files.len(), 4, "the parse error created no session");
+    // The name-and-prompt run: its file carries the initial prompt, the
+    // scripted reply, and the session_info rename.
+    let (named_id, named) = files
+        .iter()
+        .find(|(_, content)| content.contains("do something"))
+        .map(|(id, content)| (id.clone(), content.as_str()))
+        .expect("the named run persisted the initial prompt");
+    assert!(
+        named.contains("scripted reply"),
+        "the scripted reply persisted alongside the prompt"
+    );
+    assert!(
+        named.lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .is_ok_and(|value| value["type"] == "session_info" && value["name"] == "my session")
+        }),
+        "the session_info row named the new session"
+    );
+    // The bare-suffix run: the prompt submitted, the session left unnamed.
+    let (_, bare) = files
+        .iter()
+        .find(|(_, content)| content.contains("plain prompt"))
+        .map(|(id, content)| (id.clone(), content.as_str()))
+        .expect("the bare-suffix run persisted the initial prompt");
+    assert!(
+        bare.contains("scripted reply"),
+        "the bare-suffix scripted reply persisted"
+    );
+    assert!(
+        bare.lines().all(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .map_or(true, |value| value["type"] != "session_info")
+        }),
+        "the bare-suffix session stayed unnamed"
+    );
+    // The name-only run: named, and no prompt ever submitted.
+    let (_, solo) = files
+        .iter()
+        .find(|(_, content)| {
+            content.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .is_ok_and(|value| value["type"] == "session_info" && value["name"] == "solo")
+            })
+        })
+        .map(|(id, content)| (id.clone(), content.as_str()))
+        .expect("the name-only run persisted the rename");
+    assert!(
+        solo.lines().all(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .map_or(true, |value| value["type"] != "message")
+        }),
+        "the name-only run submitted no prompt"
+    );
+    // The daemon state reports the names (the roster summary's field).
+    let (client, _client_events) = pa_tui::daemon_client::DaemonClient::connect(&supervisor.socket)
+        .await
+        .expect("connect");
+    let state = client
+        .request_ok(DaemonCommand::GetState {
+            id: None,
+            active_session_id: named_id,
+            rest: serde_json::Map::default(),
+        })
+        .await
+        .expect("get_state");
+    assert_eq!(state["sessionName"], "my session");
+    let state = client
+        .request_ok(DaemonCommand::GetState {
+            id: None,
+            active_session_id: outcome.active_session_id.clone(),
+            rest: serde_json::Map::default(),
+        })
+        .await
+        .expect("get_state");
+    assert_eq!(state["sessionName"], "solo");
 }
 
 #[tokio::test]
@@ -5644,18 +5885,22 @@ async fn assert_close_reason_survives_late_turn_status(reason: &str, explanation
         !rendered.contains("reply must not arrive"),
         "held response leaked:\n{rendered}"
     );
-    let last = outcome.frames.last().expect("final frame");
     assert!(
-        last.contains("turn failed: prompt cancelled"),
-        "the post-close cancellation must reach the frame:\n{last}"
+        !rendered.contains("timed out waiting for the headless render condition"),
+        "the close/cancellation render barrier must complete:\n{rendered}"
     );
+    // Verify coexistence after the cancellation status in one observed frame.
+    // A later successful reconnect may resync the transcript again.
+    let checkpoint = outcome
+        .frames
+        .iter()
+        .find(|frame| frame.contains("turn failed: prompt cancelled") && frame.contains(&error_row))
+        .unwrap_or_else(|| {
+            panic!("the close error and cancellation must share a frame:\n{rendered}")
+        });
     assert!(
-        last.contains(&error_row),
-        "close error row must persist after cancellation:\n{last}"
-    );
-    assert!(
-        !last.contains(&format!("session closed ({reason})")),
-        "info downgrade remains:\n{last}"
+        !checkpoint.contains(&format!("session closed ({reason})")),
+        "info downgrade remains:\n{checkpoint}"
     );
     drop(supervisor);
 }

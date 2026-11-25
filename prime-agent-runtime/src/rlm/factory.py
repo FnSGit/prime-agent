@@ -1,8 +1,8 @@
 """Validation and compilation for factory specifications.
 
 A continual-harness ``factory`` entry stores a declarative state machine of
-subagent states in ``arguments["machine"]``: entry states (which declare
-no inputs), guarded transitions between states, and bounded re-entry
+subagent states in ``arguments["machine"]``: entry states (whose inputs
+are all optional), guarded transitions between states, and bounded re-entry
 (``max_entries``). The original DAG form in ``arguments["dag"]`` stays as
 sugar: it compiles to machine form (each node becomes a state entered
 once; a node's full effective dependency set compiles to ONE join
@@ -47,10 +47,11 @@ import json
 import math
 import os
 import re
+import signal
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import IO, Any, Callable
 from uuid import uuid4
 
 FAILURE_POLICIES: tuple[str, ...] = ("fail_fast", "continue", "escalate")
@@ -284,7 +285,22 @@ def _validate_state_fields(
         )
 
     subagent = state.get("subagent")
-    if _is_nonempty_str(subagent):
+    if "python" in state:
+        # A pure-Python state runs a callable instead of spawning a child.
+        python = state.get("python")
+        if "subagent" in state:
+            errors.append(f"{noun} {ref} declares both subagent and python; use exactly one")
+        if not (
+            isinstance(python, dict)
+            and _is_nonempty_str(python.get("import"))
+            and _is_nonempty_str(python.get("callable"))
+        ):
+            errors.append(f"{noun} {ref} python requires non-empty 'import' and 'callable' strings")
+        if is_resident:
+            errors.append(f"python {noun} {ref} cannot be resident")
+        if "foreach" in state:
+            errors.append(f"python {noun} {ref} cannot use foreach")
+    elif _is_nonempty_str(subagent):
         pass  # Harness subagent entry id or title; resolved at run time.
     elif isinstance(subagent, dict):
         # Runtime resolution strips these fields (_resolve_subagents /
@@ -305,7 +321,8 @@ def _validate_state_fields(
     else:
         errors.append(
             f"{noun} {ref} requires a subagent: a harness subagent id/title string "
-            "or an inline object with a prompt"
+            "or an inline object with a prompt (or a python state: "
+            '{"python": {"import": "<module>", "callable": "<function>"}})'
         )
 
     if "budget_ms" in state:
@@ -317,6 +334,8 @@ def _validate_state_fields(
 
     if "retries" in state and not (_is_int(state.get("retries")) and 0 <= state.get("retries") <= MAX_RETRIES):
         errors.append(f"{noun} {ref} retries must be an integer between 0 and {MAX_RETRIES}")
+    elif is_resident and state.get("retries", NODE_RETRIES_DEFAULT) > 0:
+        errors.append(f"resident {noun} {ref} cannot declare retries")
 
     if "failure_policy" in state and state.get("failure_policy") not in FAILURE_POLICIES:
         errors.append(
@@ -489,10 +508,11 @@ def validate_factory_machine(machine: Any) -> list[str]:
 
     Returns a list of human-readable error sentences; an empty list means
     the machine is valid. Rules: states are 1..1024 with unique slug ids and
-    at least one entry state; every state requires a subagent and entry
-    states declare no inputs; resident states declare no outputs, foreach,
-    or outgoing transitions; wait blocks are rejected (the watch host
-    handlers arrive with the communication series); transitions reference
+    at least one entry state; every state requires a subagent or a python
+    callable (not both) and entry states declare only optional inputs;
+    resident states declare no outputs, foreach, retries, or outgoing
+    transitions; wait blocks are rejected (the watch host handlers arrive
+    with the communication series); transitions reference
     existing states (self-loops are legal re-entry) and may carry one guard
     over the from-state's latest settle output; a transition with a LIST of
     from-states is a join that fires once every source settled (guards are
@@ -533,10 +553,13 @@ def validate_factory_machine(machine: Any) -> list[str]:
             seen_ids.add(state_id)
             states_by_id[state_id] = state
 
-    # Configured inline subagent names label the spawned children verbatim,
-    # so two states sharing one name would collide on the supervisor's
-    # unique sibling-name requirement at spawn time; reject the duplicate at
-    # write time instead (the same reason duplicate state ids are rejected).
+    # Configured inline subagent names label the spawned children
+    # run-scoped (the spawn label prefixes the configured name with the run
+    # id), so two states sharing one name would still collide within a run
+    # on the supervisor's unique sibling-name requirement at spawn time
+    # (one common per-run prefix preserves the relative collision shape);
+    # reject the duplicate at write time instead (the same reason
+    # duplicate state ids are rejected).
     seen_subagent_names: dict[str, str] = {}
     for state_id, state in states_by_id.items():
         _validate_state_fields(
@@ -592,16 +615,21 @@ def validate_factory_machine(machine: Any) -> list[str]:
             _is_int(state.get("max_entries")) and state.get("max_entries") >= STATE_MAX_ENTRIES_DEFAULT
         ):
             errors.append(f"state {state_id} max_entries must be an integer >= {STATE_MAX_ENTRIES_DEFAULT}")
-        if state.get("entry") is True and _port_list(state, "inputs"):
-            errors.append(f"entry state {state_id} cannot declare inputs")
-        # A REQUIRED self-input can never bind: the state's first entry needs
-        # its own prior settle, and no settle exists before an entry settles.
-        # Optional self-inputs are the loop form (the first entry binds the
-        # null sentinel, re-entries re-bind the previous settle), so only the
-        # required variant is rejected -- the machine-form mirror of the dag
-        # compiler's "node b cannot depend on itself" rule.
+        # A REQUIRED input can never bind on an entry state's first entry
+        # (admission has no upstream settle) nor on a self-input's first
+        # entry (no settle exists before an entry settles). Optional inputs
+        # are the loop form (the first entry binds the null sentinel, a
+        # later entry binds the real settle), so only the required variants
+        # are rejected -- the self-input check is the machine-form mirror of
+        # the dag compiler's "node b cannot depend on itself" rule.
         for inp in _port_list(state, "inputs"):
             if not isinstance(inp, dict) or inp.get("optional"):
+                continue
+            if state.get("entry") is True:
+                errors.append(
+                    f"entry state {state_id} input {inp.get('name')!r} must be optional: "
+                    "an entry state's first entry has no upstream settle to bind"
+                )
                 continue
             source = inp.get("from")
             if isinstance(source, str) and "." in source and source.partition(".")[0] == state_id:
@@ -777,7 +805,9 @@ def compile_factory_dag(dag: Any) -> "tuple[dict[str, Any] | None, list[str]]":
     for node in nodes:
         edges = _effective_dag_edges(node)
         state: dict[str, Any] = {"id": node["id"], "entry": not edges, "max_entries": STATE_MAX_ENTRIES_DEFAULT}
-        for key in ("subagent", "lifecycle", "budget_ms", "retries", "failure_policy", "inputs", "outputs", "foreach"):
+        for key in (
+            "subagent", "python", "lifecycle", "budget_ms", "retries", "failure_policy", "inputs", "outputs", "foreach"
+        ):
             if key in node:
                 state[key] = copy.deepcopy(node[key])
         machine["states"].append(state)
@@ -853,9 +883,8 @@ def _canonicalize_machine(machine: dict[str, Any]) -> dict[str, Any]:
             "lifecycle": state.get("lifecycle", NODE_LIFECYCLE_DEFAULT),
             "retries": state.get("retries", NODE_RETRIES_DEFAULT),
             "failure_policy": state.get("failure_policy", run_policy),
-            "subagent": copy.deepcopy(state["subagent"]),
         }
-        for key in ("budget_ms", "inputs", "outputs", "foreach"):
+        for key in ("subagent", "python", "budget_ms", "inputs", "outputs", "foreach"):
             if key in state:
                 state_out[key] = copy.deepcopy(state[key])
         states_out.append(state_out)
@@ -1005,12 +1034,33 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 ANSWER_CAPTURE_CAP = 200
-"""Local safety cap for captured answers.
+"""Local cap for captured-answer PREVIEWS: the ``answer_captured`` ledger
+event and the status node's ``answer_preview`` stay compact (the host's
+own roster previews cap at 160 characters, ``compactRlmText``).
+"""
 
-``rlm.collect`` already returns previews: the host caps them at 160
-characters (``compactRlmText``). Input binding and every rendered prompt
-therefore work on capped preview text; full child outputs stay in the
-child's own session and are never seen by the executor.
+ANSWER_BINDING_CAP = 65_536
+"""Local cap for the settle-capture binding lane, at parity with the
+host's collect bound (the daemon's ANSWER_TEXT_MAX_CHARS: 65,536
+characters).
+
+``rlm.collect`` carries the child's full final answer (``answer_text``,
+host-bounded at that size): input binding and output capture work on
+that text, not the roster preview — a fenced JSON output longer than the
+old 200-character preview cap was truncated before the executor ever saw
+it, and the downstream bind failed with "no JSON object containing
+output" although the child settled with exactly the fenced JSON (the M2
+class). The old 8192-character cap failed the same class one lane later:
+a valid fenced JSON longer than it (a design node's 26–29 KiB output,
+observed three times) was cut mid-object before the parse, so the capture
+failed deterministically although the envelope still carried the whole
+answer. At parity the slice is a no-op on what the host delivers (it
+bounds answer_text at this same size), so a fenced JSON the child kept
+within this size binds whole; the cap still bounds each captured answer
+the factory stores, and a bind failure names the stored answer's length
+when it reaches this cap (a joined multi-instance answer can cross it
+with nothing cut). Full child transcripts stay in the child's own
+session regardless.
 """
 
 EVENT_WINDOW = 200
@@ -1069,6 +1119,42 @@ _RATE_LIMIT_MARKERS = (
     "usage limit",
 )
 
+INFRA_VERIFY_QUIET_SECONDS = POLL_TIMEOUT_MS / 1000
+"""Quiet period before the executor re-reads a worker that settled with an
+infra error (one collect-poll slice): the re-check must not race the very
+probe streak that reported the death. The sleep is injected, so tests see
+no wall-clock wait."""
+
+_INFRA_ERROR_MARKERS = (
+    "child worker unreachable",
+    "supervisor link",
+)
+
+PYTHON_STATE_TIMEOUT_MS_DEFAULT = 60_000
+"""A python call's time limit when neither the state nor the run sets
+``budget_ms``."""
+
+PYTHON_STDERR_TAIL_CAP = 2000
+"""How much of a failed python call's stderr its error text carries."""
+
+PYTHON_RUNNER = r"""
+import asyncio, importlib, inspect, json, os, sys
+sys.path.insert(0, os.getcwd())
+inputs = json.load(sys.stdin.buffer)
+result_stream = os.fdopen(os.dup(1), "w")
+os.dup2(2, 1)
+sys.stdout = sys.stderr
+result = getattr(importlib.import_module(sys.argv[1]), sys.argv[2])(inputs)
+if inspect.iscoroutine(result):
+    result = asyncio.run(result)
+json.dump(result, result_stream)
+result_stream.close()
+"""
+"""The ``python -I -c`` program that runs one python state call: inputs
+arrive as JSON on stdin, everything the call prints (its own subprocesses
+included) goes to stderr, and the returned dict is the only thing written
+to stdout."""
+
 _FENCED_JSON_RE = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
 TERMINAL_ENTRY_STATUSES = ("done", "error", "cancelled")
 
@@ -1077,6 +1163,15 @@ def _is_rate_limit_error(message: str) -> bool:
     """Heuristic: the host reports admission failures as error strings."""
     lowered = message.lower()
     return any(marker in lowered for marker in _RATE_LIMIT_MARKERS)
+
+
+def _is_infra_error(message: str) -> bool:
+    """Heuristic: the supervisor reports worker deaths and lost supervisor
+    links as one-shot error settles (``Child worker unreachable`` after the
+    daemon's unreachable-probe streak, or a ``supervisor link ...`` error
+    from a failed kickoff). Infra, not the task's failure."""
+    lowered = message.lower()
+    return any(marker in lowered for marker in _INFRA_ERROR_MARKERS)
 
 
 def _child_name(run_id: str, state_id: str, instance_index: int, attempt: int) -> str:
@@ -1103,20 +1198,34 @@ def _child_name(run_id: str, state_id: str, instance_index: int, attempt: int) -
     return "-".join(parts)
 
 
+def _run_prefix(run_id: str) -> str:
+    """The run-scoped label prefix (the generated label's third part)."""
+    return run_id[:6]
+
+
 def _spawn_label(
     configured: str | None, run_id: str, state_id: str, instance_index: int, attempt: int
 ) -> str:
     """Sibling label for one spawned instance: the state's configured inline
-    subagent ``name`` when it has one, else the generated label.
+    subagent ``name`` prefixed with the run id, else the generated label.
 
-    The configured name is used verbatim for the state's first instance on
-    its first attempt (agents message the child by exactly this label); the
-    SAME disambiguation suffixes as the generated label -- ``i<n>`` for
-    later instances (re-entry, foreach fan-out), ``a<n>`` for retries --
-    keep every admission unique: the supervisor rejects duplicate sibling
-    names, and one state's settled children stay registered for the
-    run's life, so a re-entering state (``max_entries`` > 1) would collide
-    with its own earlier child on a verbatim name.
+    Every machine child label is run-scoped: the supervisor's sibling
+    names are per-parent-session, and a parent session outlives its runs,
+    so a verbatim configured name would collide with a prior run's
+    settled children (they stay registered for the run's life) or with a
+    live agent of the same name -- the M1 unresolvable-pause class.
+    The ``<run6>-`` prefix (the same run slug the generated label
+    carries) keeps cross-run admissions unique; agents message the child
+    by the label the run reports (the ``spawned`` event's ``name`` and
+    the status node's instance rows), not by the configured name alone.
+
+    The SAME disambiguation suffixes as the generated label -- ``i<n>``
+    for later instances (re-entry, foreach fan-out), ``a<n>`` for retries
+    -- keep every admission within a run unique: the supervisor rejects
+    duplicate sibling names, and one state's settled children stay
+    registered for the run's life, so a re-entering state
+    (``max_entries`` > 1) would collide with its own earlier child on an
+    unprefixed repeat.
 
     A suffixed label never exceeds the host's 64-character spawn-name cap:
     an overflowing base shrinks to a digest-suffixed token of the full
@@ -1128,7 +1237,7 @@ def _spawn_label(
     if attempt > 1:
         suffix_parts.append(f"a{attempt}")
     suffix = "".join(f"-{part}" for part in suffix_parts)
-    base = configured
+    base = f"{_run_prefix(run_id)}-{configured}"
     if len(base) + len(suffix) > SUBAGENT_NAME_MAX_LENGTH:
         # The host caps spawn names at 64 characters, so a suffixed label
         # that would exceed it shrinks its base first -- and a bare
@@ -1163,16 +1272,96 @@ def _suffixed_spawn_form(base: str, candidate: str) -> bool:
     return True
 
 
-def _parse_json_output(answer: str, output_name: str) -> tuple[Any, str | None]:
+def _terminal_json_object(answer: str) -> str | None:
+    """The bare JSON object that terminates the answer, if one does.
+
+    A string-aware balanced-brace scan walks the answer's top-level object
+    spans (braces inside string literals never count); the terminal object
+    is the last balanced span that only benign residue -- whitespace or
+    punctuation such as fence fragments, dashes, or dots, never letters,
+    digits, quotes, or more brackets -- follows. That is the settle shape
+    the strict fence contract rejected: a JSON tail emitted as plain text
+    after prose, an unclosed fence, or a dirty tail. Prose is never JSON
+    syntax: quotes outside an object do not open strings, and a brace in
+    prose only opens a candidate where it starts a string key -- so a
+    settle that mentions a block or leaves a quote open still finds its
+    terminal object. An object followed by prose or by a later incomplete
+    emit stays non-terminal -- the whole-answer fallback and the
+    truncation error own those cases -- an unterminated candidate owns the
+    tail (a truncated emit never binds), and the output-name check applies
+    to this candidate exactly as to a fence.
+    """
+    length = len(answer)
+    last: tuple[int, int] | None = None
+    index = 0
+    while index < length:
+        if answer[index] != "{":
+            index += 1
+            continue
+        # a candidate opens only where its brace starts a string key; a
+        # stray brace in prose is not syntax and hides nothing
+        cursor = index + 1
+        while cursor < length and answer[cursor].isspace():
+            cursor += 1
+        if cursor == length or answer[cursor] != '"':
+            index += 1
+            continue
+        depth = 1
+        in_string = False
+        escaped = False
+        while cursor < length:
+            char = answer[cursor]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    last = (index, cursor + 1)
+                    cursor += 1
+                    break
+            cursor += 1
+        if depth:
+            # an unterminated candidate is a truncated emit: it owns the
+            # tail, so nothing later binds
+            return None
+        index = cursor
+    if last is None:
+        return None
+    if any(char.isalnum() or char in "\"'{}[]\\" for char in answer[last[1] :]):
+        return None
+    return answer[last[0] : last[1]]
+
+
+def _parse_json_output(
+    answer: str, output_name: str, *, truncated_at: int | None = None
+) -> tuple[Any, str | None]:
     """Extract one named JSON output from an upstream answer.
 
     Prefers the fenced `````json`` block whose object contains the output
     name, scanning trailing blocks first (an answer with several fences,
     e.g. a verdict block followed by a summary block, binds from whichever
-    block carries the port), then falls back to parsing the whole answer.
-    Returns ``(value, None)`` or ``(None, error_sentence)``.
+    block carries the port), then the answer's terminal bare JSON object
+    (``_terminal_json_object``), then falls back to parsing the whole
+    answer. The output-name requirement is the same for every shape: only
+    an object that contains the port binds, so widening the accepted
+    shapes never widens the contract. Returns ``(value, None)`` or
+    ``(None, error_sentence)``. A capture cut at the binding cap
+    (``truncated_at``) names the size and the cap in the error, so a
+    too-large fenced JSON reads as a size problem, not a missing output.
     """
     candidates: list[str] = list(reversed(_FENCED_JSON_RE.findall(answer)))
+    terminal = _terminal_json_object(answer)
+    if terminal is not None:
+        candidates.append(terminal)
     candidates.append(answer.strip())
     for candidate in candidates:
         try:
@@ -1181,7 +1370,13 @@ def _parse_json_output(answer: str, output_name: str) -> tuple[Any, str | None]:
             continue
         if isinstance(parsed, dict) and output_name in parsed:
             return parsed[output_name], None
-    return None, f"no JSON object containing output {output_name!r} in the upstream answer"
+    error = f"no JSON object containing output {output_name!r} in the upstream answer"
+    if truncated_at is not None:
+        error += (
+            f"; the captured answer is truncated at {truncated_at} characters"
+            " - keep the fenced JSON block compact"
+        )
+    return None, error
 
 
 def _render_prompt(template: str, values: dict[str, str]) -> str:
@@ -1285,6 +1480,94 @@ def _guard_passes(when: dict[str, Any], outputs: dict[str, Any]) -> bool:
     return False
 
 
+class _PythonProcess:
+    """One python state call: a short-lived isolated subprocess.
+
+    stdout and stderr go to temp files, so a large output never blocks the
+    child on a full pipe and the kernel needs no reader task.
+    """
+
+    def __init__(self, proc: Any, stdout: IO[bytes], stderr: IO[bytes]) -> None:
+        self.proc = proc
+        self._stdout = stdout
+        self._stderr = stderr
+
+    @classmethod
+    async def start(cls, target: dict[str, str], inputs: dict[str, Any]) -> "_PythonProcess":
+        import asyncio
+        import sys
+        import tempfile
+
+        from .bash import _child_env
+
+        env = {key: value for key, value in _child_env().items() if not key.startswith("RLM_")}
+        stdout, stderr = tempfile.TemporaryFile(), tempfile.TemporaryFile()
+        try:
+            with tempfile.TemporaryFile() as stdin:
+                stdin.write(json.dumps(inputs).encode("utf-8"))
+                stdin.seek(0)
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, "-I", "-c", PYTHON_RUNNER, target["import"], target["callable"],
+                    stdin=stdin, stdout=stdout, stderr=stderr,
+                    cwd=os.getcwd(), env=env, start_new_session=True,
+                )
+        except BaseException:
+            stdout.close()
+            stderr.close()
+            raise
+        return cls(proc, stdout, stderr)
+
+    def _kill(self) -> None:
+        """Kill the call's whole process group (the process alone on Windows)."""
+        if os.name == "posix":
+            from .bash import _signal_group
+
+            _signal_group(self.proc.pid, signal.SIGKILL)
+        else:
+            try:
+                self.proc.kill()
+            except ProcessLookupError:
+                pass  # already exited
+
+    async def stop(self) -> None:
+        """Kill a running call, wait for it to exit, and release its files."""
+        self._kill()
+        await self.proc.wait()
+        self.finish()
+
+    def finish(self) -> tuple[str, str]:
+        """Read stdout and the stderr tail of an exited call, then close both.
+        A call lives no longer than its exit: anything it left running in its
+        process group is killed."""
+        self._kill()
+        self._stdout.seek(0)
+        stdout = self._stdout.read().decode("utf-8", "replace")
+        self._stderr.seek(0, os.SEEK_END)
+        self._stderr.seek(max(self._stderr.tell() - PYTHON_STDERR_TAIL_CAP, 0))
+        stderr = self._stderr.read().decode("utf-8", "replace").strip()
+        self._stdout.close()
+        self._stderr.close()
+        return stdout, stderr
+
+
+def _python_outputs(state_spec: dict[str, Any], stdout: str) -> "dict[str, Any] | str":
+    """A python call's outputs from its stdout, or the error sentence when
+    stdout is not one object whose keys are exactly the declared outputs."""
+    try:
+        outputs = json.loads(stdout)
+    except ValueError:
+        return "python state did not write one JSON object to stdout"
+    if not isinstance(outputs, dict):
+        return f"python state returned {type(outputs).__name__}, not a dict"
+    declared = _declared_port_types(state_spec, "outputs")
+    if set(outputs) != set(declared):
+        return f"python state returned keys {sorted(outputs)} but declares outputs {sorted(declared)}"
+    for name, port_type in declared.items():
+        if port_type == "text" and not isinstance(outputs[name], str):
+            return f"python state output {name!r} is text but the call returned {type(outputs[name]).__name__}"
+    return outputs
+
+
 def _validate_spawn_settings(model: Any, thinking: Any) -> str | None:
     for key, value in (("model", model), ("thinking", thinking)):
         if value is not None and (not isinstance(value, str) or not value.strip()):
@@ -1300,8 +1583,18 @@ class _NodeInstance:
     prompt: str  # fully rendered; re-spawns reuse it verbatim
     status: str = "pending"  # pending | running | done | error | cancelled
     attempt: int = 0  # spawn admissions tried for this instance; a rate-limit
-    # deferral counts here too, and ``retries`` compares against this same
-    # counter, so one transient 429 admission consumes one declared retry.
+    # deferral counts here too, and charged retries compare against
+    # ``attempt - retry_base``, so one transient 429 admission consumes one
+    # declared retry.
+    retry_base: int = 0  # the attempt count at the last retry-budget reset:
+    # an infra respawn or a resume's re-admission grants fresh ``retries``
+    # by moving this base instead of zeroing ``attempt`` (spawn labels
+    # count on it staying monotonic).
+    infra_respawned: bool = False  # the instance's one free worker-death
+    # respawn is spent; a resume's re-admission grants a fresh one.
+    capture_failed: bool = False  # this settle completed its entry but a
+    # declared output never bound; the preserved answer stays provisional
+    # until the capture is redone or the entry fails permanently.
     rate_limit_streak: int = 0  # consecutive rate-limited admissions in the
     # control loop's backoff path; a successful spawn resets it, and
     # BACKOFF_MAX_ATTEMPTS in a row fails the node. An admission-phase
@@ -1310,9 +1603,15 @@ class _NodeInstance:
     child_id: str | None = None
     spawned_at: float | None = None
     duration_ms: int | None = None
-    answer: str | None = None  # capped collect preview (ANSWER_CAPTURE_CAP)
+    answer: str | None = None  # the binding lane's captured answer (ANSWER_BINDING_CAP)
+    provisional: bool = False  # the answer came from a child EXIT, not a
+    # settle: the state reads needs-verify instead of silently counting the
+    # exit's last assistant text as delivered work (the M4 class).
     error: str | None = None
     tool_uses: int = 0
+    inputs: dict[str, Any] | None = None  # a python state's bound inputs; re-runs reuse them
+    process: "_PythonProcess | None" = None  # a python state's running call
+    deadline: float | None = None  # a python call's time limit (seconds on the injected clock)
 
 
 @dataclass
@@ -1334,6 +1633,10 @@ class _StateEntry:
     output_errors: dict[str, str] | None = None  # ports whose json capture failed
     is_settle: bool = False  # True once the entry settled (done or error)
     consumed: bool = False  # True once the settle's transitions were evaluated
+    needs_verify: bool = False  # a child exit carried a provisional answer
+    # (the M4 oversight mark): the entry failed, but the child's last
+    # assistant text is preserved as a provisional answer and the run
+    # surfaces the state in status()["needs_verify"].
 
 
 @dataclass
@@ -1396,6 +1699,10 @@ class FactoryRun:
     run_budget_ms: int | None = None
     budget_reported: bool = False
     pause_reason: str | None = None
+    # The last entry-failure reason (admission or binding): a paused run's
+    # status payload carries it with a one-line remedy (the M6 class), so
+    # an operator reads WHAT failed from status() instead of archaeology.
+    last_error: str | None = None
     states: dict[str, _StateRun] = field(default_factory=dict)
     order: list[str] = field(default_factory=list)
     transitions_from: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
@@ -1572,7 +1879,7 @@ class FactoryExecutor:
         for event in run.events:
             if event["stage"] in ("recorded", "arrived"):
                 event["stage"] = "delivered"
-        return {
+        payload: dict[str, Any] = {
             "run_id": run.run_id,
             "spec_id": run.spec_id,
             "name": run.name,
@@ -1582,6 +1889,31 @@ class FactoryExecutor:
             "elapsed_ms": int((self._now_fn() - run.started_at) * 1000),
             "usage": self._usage_report(run),
         }
+        # The M4 oversight signal: every state whose latest terminal entry
+        # carried a provisional answer (a child exit, or a settle whose
+        # declared output never bound) needs verification — root-visible
+        # without ledger archaeology.
+        needs_verify = [
+            state_id
+            for state_id in run.order
+            if any(entry.needs_verify for entry in run.states[state_id].entries)
+        ]
+        if needs_verify:
+            payload["needs_verify"] = needs_verify
+        # A paused run carries the LAST failed admission/bind error and a
+        # one-line remedy (the M6 class), so the operator reads WHAT failed
+        # and what to do next from status() alone.
+        if run.state == "paused":
+            payload["pause_reason"] = run.pause_reason
+            if run.last_error is not None:
+                payload["last_error"] = run.last_error
+                payload["remedy"] = (
+                    f"resume with await rlm.factory.resume('{run.run_id}') to re-admit the "
+                    "failed state's entry as a fresh attempt (same rendered prompt, no extra "
+                    "max_entries); author the state with failure_policy 'continue' to run its "
+                    "dependents past a failure instead"
+                )
+        return payload
 
     async def stop(self, run_id: str) -> dict[str, Any]:
         """Cancel every running child of the run and mark it stopped.
@@ -1609,9 +1941,14 @@ class FactoryExecutor:
     async def resume(self, run_id: str) -> dict[str, Any]:
         """Resume a paused run (escalate, budget, or max_transitions pause).
 
-        A budget or max_transitions pause is reported once per run:
-        resuming after it is an explicit operator decision and no further
-        budget pauses fire. Raises ``ValueError`` when the run is not paused.
+        An escalate pause holds its failed entry unsettled, so resume
+        re-admits that entry first: a fresh attempt of the same rendered
+        prompt in the same entry slot -- no extra ``max_entries`` spend,
+        fresh ``retries``. The failure only ever propagates to dependents
+        under ``failure_policy: "continue"``. A budget or max_transitions
+        pause is reported once per run: resuming after it is an explicit
+        operator decision and no further budget pauses fire. Raises
+        ``ValueError`` when the run is not paused.
         """
         run = self._require_run(run_id)
         if run.state != "paused":
@@ -1624,10 +1961,18 @@ class FactoryExecutor:
         run.loop_generation += 1
         run.state = "running"
         run.pause_reason = None
+        # Re-arm the pause notice: the escalate -> resume -> fail-again
+        # retry flow must tell the parent about every pause, not only the
+        # first. The budget and max_* notices stay one per run.
+        run.milestones.discard("paused")
         self._touch(run)
         self._event(run, "resumed", detail="resumed by caller")
-        # Evaluate settles first: paused runs may still carry transitions to
-        # fire (escalate) before anything can be admitted.
+        # An escalate pause holds its failed entry unsettled: re-admit it
+        # BEFORE anything evaluates or admits, so the retry -- not the
+        # failure's propagation -- is what resume runs.
+        self._readmit_held_entries(run)
+        # Evaluate settles next: a max_transitions pause left transitions
+        # mid-settle, and resume continues after the ones that fired.
         await self._evaluate_settles(run)
         # allow_backoff=False: like run(), resume() must never sleep inside
         # the calling model turn; rate-limited admissions defer to the loop.
@@ -1642,6 +1987,49 @@ class FactoryExecutor:
             "started": started,
             "pending": self._pending_state_ids(run),
         }
+
+    def _readmit_held_entries(self, run: FactoryRun) -> None:
+        """Re-admit every entry an escalate pause holds unsettled.
+
+        An escalate failure never queues its settle (the pause lands before
+        the failure propagates), so a held entry is exactly ``error`` with
+        ``is_settle`` unset -- that predicate is the one held-entry
+        definition. Resume turns each held entry back into a fresh attempt
+        of the SAME entry slot: the errored and cancelled instances re-run
+        their rendered prompt (``attempt`` keeps counting, so spawn labels
+        stay unique), ``max_entries`` is not spent again, and the
+        ``retries`` budget restarts (``retry_base`` moves to the current
+        attempt count). A binding-failure entry has no instances: it
+        re-binds through the readiness pass, and a still-broken upstream
+        settles it into the same pause again.
+        """
+        for state_id in run.order:
+            state = run.states[state_id]
+            for entry in state.entries:
+                if entry.status != "error" or entry.is_settle:
+                    continue
+                entry.status = "running" if entry.instances else "pending"
+                entry.error = None
+                entry.needs_verify = False
+                state.error = None
+                for instance in entry.instances:
+                    if instance.status not in ("error", "cancelled"):
+                        continue  # running and done siblings keep their state
+                    instance.status = "pending"
+                    instance.error = None
+                    instance.answer = None
+                    instance.provisional = False
+                    instance.capture_failed = False
+                    instance.rate_limit_streak = 0
+                    instance.retry_base = instance.attempt
+                    instance.infra_respawned = False
+                self._event(
+                    run,
+                    "readmitted",
+                    node=state_id,
+                    entry=entry.index,
+                    detail="resume re-admits the failed entry (same rendered prompt)",
+                )
 
     # -- graph, watch, host activity ------------------------------------------
 
@@ -1671,8 +2059,7 @@ class FactoryExecutor:
             "entries_used": state.entries_used,
             "max_entries": state.max_entries,
             "entries": [
-                {"index": entry.index, "status": entry.status, "error": entry.error}
-                for entry in state.entries
+                self._entry_report(entry) for entry in state.entries
             ],
             "instances": [
                 {
@@ -1703,10 +2090,32 @@ class FactoryExecutor:
         if include_answer:
             latest = state.latest_settle()
             if latest is not None and latest.answer:
-                report["answer_preview"] = latest.answer
+                # The report previews the settle answer compactly; the
+                # full binding text stays on the entry.
+                report["answer_preview"] = latest.answer[:ANSWER_CAPTURE_CAP]
         if state.error is not None:
             report["error"] = state.error
+        if any(entry.needs_verify for entry in state.entries):
+            report["needs_verify"] = True
         return report
+
+    def _entry_report(self, entry: _StateEntry) -> dict[str, Any]:
+        """One entry's report row: its status/error plus, for a needs-verify
+        entry, the provisional answer the child exit captured (compacted)."""
+        row: dict[str, Any] = {"index": entry.index, "status": entry.status, "error": entry.error}
+        if entry.needs_verify:
+            row["needs_verify"] = True
+            provisional = next(
+                (
+                    instance.answer
+                    for instance in reversed(entry.instances)
+                    if instance.provisional and instance.answer
+                ),
+                None,
+            )
+            if provisional is not None:
+                row["provisional_answer"] = provisional[:ANSWER_CAPTURE_CAP]
+        return row
 
     def _usage_report(self, run: FactoryRun) -> dict[str, Any]:
         """The usage block ``status()`` returns; the graph snapshot reuses it."""
@@ -2061,6 +2470,8 @@ class FactoryExecutor:
         errors: list[str] = []
         for state_spec in canonical["states"]:
             state_id = state_spec["id"]
+            if "python" in state_spec:
+                continue  # python states spawn no child
             reference = state_spec["subagent"]
             if isinstance(reference, dict):
                 prompt = reference.get("prompt")
@@ -2153,7 +2564,8 @@ class FactoryExecutor:
 
         Stages follow the spec: ``arrived`` (a child answer settled and was
         captured), ``recorded`` (everything else), ``shown`` (a milestone
-        notice was injected into the parent conversation), and ``delivered``
+        notice was handed to the parent, as a direct row or an inbox
+        message), and ``delivered``
         (the parent read the ledger via ``status()``).
         """
         event: dict[str, Any] = {"seq": len(run.events) + 1, "kind": kind, "stage": stage}
@@ -2186,9 +2598,9 @@ class FactoryExecutor:
     async def _milestone(self, run: FactoryRun, kind: str, detail: str, *, node: str | None = None) -> None:
         """Record a run milestone and inject one quiet notice (one per kind).
 
-        Every milestone lands in the ledger, repeats included: a run that
-        pauses twice must still show the second pause to the parent reading
-        ``status()``. Only the parent-visible notice is deduped per kind.
+        Every milestone lands in the ledger, repeats included. Only the
+        parent-visible notice is deduped per kind; ``resume()`` re-arms the
+        ``paused`` notice, so each pause after a resume notifies again.
         """
         event = self._event(run, "milestone", milestone=kind, detail=detail, node=node)
         if kind in run.milestones:
@@ -2363,11 +2775,15 @@ class FactoryExecutor:
             pair = self._next_pending_instance(run)
             if pair is None:
                 break
-            if self._children_budget_exceeded(run):
+            state, entry, instance = pair
+            python = "python" in state.spec
+            if not python and self._children_budget_exceeded(run):
                 await self._pause_for_children(run)
                 break
-            state, entry, instance = pair
-            outcome = await self._admit(run, state, entry, instance, allow_backoff=allow_backoff)
+            if python:
+                outcome = await self._start_python(run, state, entry, instance)
+            else:
+                outcome = await self._admit(run, state, entry, instance, allow_backoff=allow_backoff)
             if outcome == "admitted" and state.state_id not in started:
                 started.append(state.state_id)
             if outcome == "stopped":
@@ -2466,7 +2882,8 @@ class FactoryExecutor:
     def _prepare_entry(
         self, run: FactoryRun, state: _StateRun, entry: _StateEntry
     ) -> "tuple[list[_NodeInstance] | None, str | None]":
-        """Bind inputs, expand foreach, and render one prompt per instance.
+        """Bind inputs, expand foreach, and render one prompt per instance
+        (a python state gets one instance carrying the bound values instead).
 
         Returns ``(instances, None)`` on success, ``(None, None)`` while an
         input source has not settled yet (the entry stays pending), or
@@ -2474,7 +2891,9 @@ class FactoryExecutor:
         retry: a deterministic binding error would recur on every re-render,
         so the entry fails and its failure_policy applies directly.
         """
-        values: dict[str, str] = {}
+        # Raw bound values first: a python state receives them as-is, and an
+        # agent state renders them into its prompt below.
+        bound: dict[str, Any] = {}
         foreach = state.spec.get("foreach")
         items: list[Any] | None = None
         for inp in state.spec.get("inputs") or []:
@@ -2504,6 +2923,21 @@ class FactoryExecutor:
                         value = outputs[src_output]
             if latest is None or failure is not None:
                 if inp.get("optional"):
+                    # An optional input over a DIFFERENT state that has a
+                    # live entry (pending or running) waits: the source is
+                    # about to settle, and a sentinel here would spawn the
+                    # dependent while its upstream is still running (the
+                    # M3 premature-spawn class -- the children exited
+                    # "waiting" and the bookkeeping counted them). The
+                    # sentinel still binds for the self-input loop form and
+                    # for a source with no live entry, so loop states keep
+                    # re-entering before their upstream partner has RUN.
+                    if latest is None and src_id != state.state_id:
+                        source_state_live = source_state is not None and any(
+                            other.status in ("pending", "running") for other in source_state.entries
+                        )
+                        if source_state_live:
+                            return None, None  # wait for the in-flight source's settle
                     # Optional inputs bind a null sentinel whenever their
                     # source offers no value -- never settled, errored
                     # settle, or a settled source that captured nothing
@@ -2527,20 +2961,32 @@ class FactoryExecutor:
                     if foreach is not None and foreach.get("over") == name:
                         items = []
                         continue
-                    values[name] = "null" if port_type == "json" else "None"
+                    bound[name] = None
                     continue
                 if latest is None:
                     return None, None  # wait for the source's first settle
                 return None, failure
             if port_type == "text":
-                values[name] = value if isinstance(value, str) else json.dumps(value)
+                bound[name] = value if isinstance(value, str) else json.dumps(value)
                 continue
             if foreach is not None and foreach.get("over") == name:
                 if not isinstance(value, list):
                     return None, f"foreach.over input {name!r} is not a JSON list"
                 items = value
                 continue
-            values[name] = json.dumps(value)
+            bound[name] = value
+        if "python" in state.spec:
+            instance = _NodeInstance(index=state.instance_counter, prompt="", inputs=bound)
+            state.instance_counter += 1
+            return [instance], None
+        # The prompt form of a bound value: json inputs as JSON text (a
+        # missing optional one reads "null"), text inputs verbatim (a
+        # missing optional one reads "None").
+        port_types = {inp["name"]: inp["type"] for inp in state.spec.get("inputs") or []}
+        values = {
+            name: json.dumps(value) if port_types[name] == "json" else ("None" if value is None else value)
+            for name, value in bound.items()
+        }
         if foreach is None:
             assert state.prompt_template is not None
             instance = _NodeInstance(index=state.instance_counter, prompt=_render_prompt(state.prompt_template, values))
@@ -2599,13 +3045,17 @@ class FactoryExecutor:
         ``stop()`` is retracted (deleted and cancelled) instead of
         registered running.
         """
-        from . import spawn
+        from . import _spawn
 
         instance.attempt += 1
         child_name = _spawn_label(state.name, run.run_id, state.state_id, instance.index, instance.attempt)
         try:
-            handle = await spawn(
-                instance.prompt, name=child_name, model=state.model, thinking=state.thinking
+            handle = await _spawn(
+                instance.prompt,
+                name=child_name,
+                model=state.model,
+                thinking=state.thinking,
+                factory={"runId": run.run_id, "specId": run.spec_id, "stateId": state.state_id},
             )
         except RuntimeError as exc:
             last_error = str(exc)
@@ -2670,6 +3120,117 @@ class FactoryExecutor:
         )
         return "admitted"
 
+    async def _start_python(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance
+    ) -> str:
+        """Start one python state call. Returns "admitted", "failed", or
+        "stopped" like ``_admit``. The call holds a max_parallel slot but is
+        no child: it never counts toward ``max_children``."""
+        instance.attempt += 1
+        try:
+            process = await _PythonProcess.start(state.spec["python"], instance.inputs)
+        except OSError as exc:
+            await self._apply_instance_failure(
+                run, state, entry, instance, f"python state could not start: {exc}", retry=False
+            )
+            return "failed"
+        if run.state != "running":
+            # stop() ran while the process was starting; its pass could not see it.
+            await process.stop()
+            instance.status = "cancelled"
+            self._event(run, "cancelled", node=state.state_id, entry=entry.index, instance=instance.index)
+            return "stopped"
+        instance.process = process
+        instance.spawned_at = self._now_fn()
+        instance.deadline = instance.spawned_at + self._python_limit_ms(run, state) / 1000
+        instance.status = "running"
+        self._event(
+            run,
+            "started",
+            node=state.state_id,
+            entry=entry.index,
+            instance=instance.index,
+            attempt=instance.attempt,
+        )
+        return "admitted"
+
+    def _python_limit_ms(self, run: FactoryRun, state: _StateRun) -> int:
+        """A python call's time limit: the state's budget_ms, else the run's,
+        else the default."""
+        return state.spec.get("budget_ms") or run.run_budget_ms or PYTHON_STATE_TIMEOUT_MS_DEFAULT
+
+    async def _wait_python(self, calls: list[_NodeInstance]) -> None:
+        """Wait for the first python call to exit, bounded by the nearest
+        time limit and the collect poll timeout."""
+        import asyncio
+
+        nearest = min(instance.deadline for instance in calls)
+        timeout = min(max(nearest - self._now_fn(), 0.0), POLL_TIMEOUT_MS / 1000)
+        waits = [asyncio.ensure_future(instance.process.proc.wait()) for instance in calls]
+        _, pending = await asyncio.wait(waits, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        for wait in pending:
+            wait.cancel()
+
+    async def _apply_python_exit(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance
+    ) -> None:
+        """Settle one python call that exited or ran past its time limit."""
+        process = instance.process
+        assert process is not None and instance.spawned_at is not None
+        # Claimed before any await, like _cancel_running claims a child.
+        instance.process = None
+        instance.duration_ms = int((self._now_fn() - instance.spawned_at) * 1000)
+        if process.proc.returncode is None:
+            # Past its time limit: the limit is spent, so no retry.
+            await process.stop()
+            await self._apply_instance_failure(
+                run,
+                state,
+                entry,
+                instance,
+                f"python state time limit {self._python_limit_ms(run, state)}ms exceeded",
+                retry=False,
+            )
+            return
+        stdout, stderr = process.finish()
+        run.settle_count += 1
+        returncode = process.proc.returncode
+        if returncode != 0:
+            detail = f": {stderr}" if stderr else ""
+            await self._apply_instance_failure(
+                run, state, entry, instance, f"python state exited with code {returncode}{detail}", retry=True
+            )
+            return
+        outputs = _python_outputs(state.spec, stdout)
+        if isinstance(outputs, str):
+            await self._apply_instance_failure(run, state, entry, instance, outputs, retry=True)
+            return
+        instance.status = "done"
+        instance.answer = json.dumps(outputs, separators=(",", ":"))[:ANSWER_BINDING_CAP]
+        self._event(
+            run,
+            "settled",
+            node=state.state_id,
+            entry=entry.index,
+            instance=instance.index,
+            status="done",
+            duration_ms=instance.duration_ms,
+        )
+        self._event(
+            run,
+            "answer_captured",
+            node=state.state_id,
+            entry=entry.index,
+            instance=instance.index,
+            answer=instance.answer[:ANSWER_CAPTURE_CAP],
+            stage="arrived",
+        )
+        entry.answer = instance.answer
+        entry.outputs = outputs
+        entry.output_errors = {}
+        entry.status = "done"
+        self._queue_settle(run, state, entry)
+
     # -- settlement, retries, policies ---------------------------------------
 
     async def _apply_settlement(
@@ -2677,6 +3238,26 @@ class FactoryExecutor:
     ) -> None:
         if instance.status != "running":
             return  # cancelled (stop/fail_fast) while the collect was in flight
+        if result.status == "error" and _is_infra_error(result.error or ""):
+            # A worker death or a lost supervisor link is infra, not the
+            # task's failure: the executor verifies it itself (a short
+            # quiet period, then one re-read through the supervisor)
+            # instead of failing the entry on the first error row and
+            # flagging the parent to do the verifying.
+            fresh = await self._recheck_infra_death(instance, result)
+            if fresh is None:
+                return  # a stop/fail_fast pass claimed it, or the worker answered
+            result = fresh
+            if (
+                entry.status == "running"
+                and not instance.infra_respawned
+                and result.status == "error"
+                and _is_infra_error(result.error or "")
+            ):
+                await self._respawn_infra_dead(run, state, entry, instance, result)
+                return
+            # otherwise: a second verified death (or an entry a sibling
+            # failed first) takes the normal retries/policy path below
         instance.duration_ms = result.duration_ms
         instance.tool_uses = result.tool_use_count or 0
         run.settle_count += 1
@@ -2689,6 +3270,19 @@ class FactoryExecutor:
         elif result.status != "done":
             child_reason = f"child settled with unexpected status {result.status!r}"
         if child_reason is not None:
+            # The exit capture (the M4 class): an exited child's last
+            # assistant text — whatever the exit envelope carried — is a
+            # PROVISIONAL answer. The child may have finished its work and
+            # died without reporting; the answer is preserved on the
+            # instance and the state reads needs-verify instead of silently
+            # counting the exit as settled work.
+            exit_answer = (
+                (result.answer_text or result.answer_preview or "")[:ANSWER_BINDING_CAP] or None
+            )
+            if exit_answer:
+                instance.answer = exit_answer
+                instance.provisional = True
+                instance.capture_failed = False  # the preserved text is an exit now
             # Child failures retry (same rendered prompt, attempts+1) while
             # attempts remain; then the entry failure_policy applies.
             await self._apply_instance_failure(run, state, entry, instance, child_reason, retry=True)
@@ -2709,7 +3303,15 @@ class FactoryExecutor:
                 )
                 return
         instance.status = "done"
-        instance.answer = (result.answer_preview or "")[:ANSWER_CAPTURE_CAP] or None
+        # The binding lane first: the collect envelope's full final answer
+        # keeps the whole fenced JSON; the 160-character roster preview is
+        # the fallback (older hosts, a capture that raced a worker
+        # teardown). Both are capped locally at ANSWER_BINDING_CAP.
+        instance.answer = (
+            (result.answer_text or result.answer_preview or "")[:ANSWER_BINDING_CAP] or None
+        )
+        instance.provisional = False  # a real settle supersedes any exit capture
+        instance.capture_failed = False
         self._event(
             run,
             "settled",
@@ -2726,14 +3328,125 @@ class FactoryExecutor:
                 node=state.state_id,
                 entry=entry.index,
                 instance=instance.index,
-                answer=instance.answer,
+                answer=instance.answer[:ANSWER_CAPTURE_CAP],
                 stage="arrived",
             )
         if entry.status == "running" and entry.instances and all(i.status == "done" for i in entry.instances):
-            entry.status = "done"
             entry.answer = self._entry_answer(entry)
-            self._capture_outputs(state, entry)
+            capture_failure = await self._capture_outputs(run, state, entry)
+            if entry.status != "running":
+                return  # a stop()/fail_fast pass claimed the entry mid-capture
+            if capture_failure is not None:
+                # A declared output that never bound after the capture
+                # retry is the producing entry's task failure, not a silent
+                # valueless settle: no settle is queued (a dependent never
+                # enters on an unbound required input), retries then
+                # failure_policy apply, and the answer stays provisional
+                # for needs_verify if the entry fails permanently.
+                instance.provisional = True
+                instance.capture_failed = True
+                await self._apply_instance_failure(
+                    run, state, entry, instance, capture_failure, retry=True
+                )
+                return
+            entry.status = "done"
             self._queue_settle(run, state, entry)
+
+    async def _recheck_infra_death(self, instance: _NodeInstance, result: Any) -> Any:
+        """Liveness-verify one infra-flavoured error settle before it is
+        applied.
+
+        The supervisor reports a dead worker as a one-shot error settle, so
+        the executor re-reads the worker after a short quiet period instead
+        of trusting the first row. Returns the fresh result to apply -- a
+        settle that landed meanwhile supersedes the error, and the same
+        error read back means the death is verified -- or ``None`` when a
+        concurrent pass (stop(), fail_fast) claimed the instance or the
+        worker answered alive (the loop keeps collecting it).
+        """
+        from . import collect
+
+        child_id = instance.child_id
+        await self._sleep_fn(INFRA_VERIFY_QUIET_SECONDS)
+        if instance.status != "running" or instance.child_id != child_id:
+            return None  # a stop, fail_fast, or resumed lane claimed the instance
+        results = await collect([child_id], timeout_ms=0)
+        if instance.status != "running" or instance.child_id != child_id:
+            return None
+        row = next((r for r in results if r.rlm_child_id == child_id), None)
+        if row is not None and not row.settled:
+            return None  # the worker answered: alive, keep collecting it
+        # No fresh row at all means the child vanished from the supervisor
+        # (a hand delete): as dead as the error said, so the original
+        # settle applies through the normal failure path.
+        return row or result
+
+    async def _respawn_infra_dead(
+        self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance, result: Any
+    ) -> None:
+        """Re-spawn one worker the executor verified dead, free of charge.
+
+        Infra is not the task's failure: the dead attempt counts as a
+        settle (its ledger row keeps the error), but the instance is
+        re-queued with the same rendered prompt -- spending neither a
+        ``retries`` slot nor a fresh ``max_entries`` entry -- and the dead
+        attempt's exit text is dropped, so no needs-verify mark is raised
+        for work the respawn redoes. ``infra_respawned`` keeps this to ONE
+        free respawn; a second verified death falls through to the normal
+        retries/failure_policy path.
+        """
+        from . import delete_subagent
+
+        old_child = instance.child_id or ""
+        # The worker may be alive-but-unreachable rather than dead: retire
+        # it so the respawn cannot run beside its zombie in the same
+        # worktree. Best-effort and bounded — the host's delete kills under
+        # the daemon's own timeout, the rest is registry bookkeeping — so
+        # an already-gone child or a dead bridge must not wedge the
+        # respawn; the supervisor-side zombie sweep this pairs with lands
+        # in PR 2 of the [factory] group.
+        try:
+            await delete_subagent(old_child)
+        except Exception:
+            pass
+        if instance.status != "running" or run.state not in ("running", "paused"):
+            return  # a stop()/fail_fast pass claimed the instance mid-delete
+        # A sibling may have paused the run in this same collect batch.
+        # Preserve the verified death as pending; resume admits it for free
+        # instead of collecting the deleted child again.
+        instance.duration_ms = result.duration_ms
+        instance.tool_uses = result.tool_use_count or 0
+        run.settle_count += 1
+        run.tool_use_total += instance.tool_uses
+        instance.infra_respawned = True
+        instance.retry_base += 1
+        instance.status = "pending"
+        instance.error = None
+        instance.answer = None
+        instance.provisional = False
+        instance.capture_failed = False
+        reason = result.error or "child worker unreachable"
+        self._event(
+            run,
+            "settled",
+            node=state.state_id,
+            entry=entry.index,
+            instance=instance.index,
+            status="error",
+            error=reason,
+            duration_ms=instance.duration_ms,
+        )
+        self._event(
+            run,
+            "infra_respawn",
+            node=state.state_id,
+            entry=entry.index,
+            instance=instance.index,
+            detail=(
+                f"worker verified dead ({reason}); re-spawning the same rendered prompt "
+                "once (no retry, no max_entries)"
+            ),
+        )
 
     def _entry_answer(self, entry: _StateEntry) -> str | None:
         """Captured answer for binding: one preview, or all instances joined."""
@@ -2742,16 +3455,20 @@ class FactoryExecutor:
             return None
         return "\n\n".join(answers)
 
-    def _capture_outputs(self, state: _StateRun, entry: _StateEntry) -> None:
+    def _capture_ports(self, state: _StateRun, entry: _StateEntry) -> None:
         """Capture the state's declared output ports from the entry's answer.
 
         Text ports keep the captured string; json ports parse as in V1
         binding, with the parse error recorded on the settle so a reader
         (guard or input binding) fails deterministically instead of
-        re-parsing.
+        re-parsing. A capture cut at the binding cap names the size and the
+        cap in the parse error.
         """
         outputs: dict[str, Any] = {}
         errors: dict[str, str] = {}
+        truncated_at = (
+            len(entry.answer) if entry.answer is not None and len(entry.answer) >= ANSWER_BINDING_CAP else None
+        )
         for out in state.spec.get("outputs") or []:
             name, port_type = out.get("name"), out.get("type")
             if port_type == "text":
@@ -2760,13 +3477,114 @@ class FactoryExecutor:
                 continue
             if entry.answer is None:
                 continue
-            parsed, error = _parse_json_output(entry.answer, name)
+            parsed, error = _parse_json_output(entry.answer, name, truncated_at=truncated_at)
             if error is None:
                 outputs[name] = parsed
             else:
                 errors[name] = error
         entry.outputs = outputs
         entry.output_errors = errors
+
+    async def _capture_outputs(self, run: FactoryRun, state: _StateRun, entry: _StateEntry) -> str | None:
+        """Capture the settle's outputs, retrying the capture once.
+
+        A settle can race the child's answer capture on the host side (a
+        ``None`` answer recovers on a later refresh), and a declared port
+        that binds no value from the first capture is exactly the M2
+        silent-failure class: the downstream would run on nothing. When a
+        declared output binds no value, the settled children are
+        refreshed in one bounded capture window (a settled child keeps its
+        result until deleted; missing text waits for the worker hand-off),
+        and the capture re-runs over the refreshed answers; a port that
+        still binds nothing records a deterministic capture failure in the
+        ledger (``output_capture_failed``) and fails the entry -- its
+        joined port errors return as the task-failure reason, ``None``
+        when every declared port bound a value.
+        """
+        self._capture_ports(state, entry)
+        declared = state.spec.get("outputs") or []
+        # Presence, not truthiness: a port that parsed as JSON null is a
+        # captured value (a downstream binding reads null from it), so the
+        # retry condition and the failure report check the KEY, never the
+        # value — a null output never reads as unbound.
+        if not declared or not any(
+            out.get("name") not in (entry.outputs or {}) for out in declared
+        ):
+            return None  # every declared port bound a value
+        refreshed = await self._refresh_entry_answers(run, state, entry)
+        if refreshed:
+            self._capture_ports(state, entry)
+        failures = []
+        for out in declared:
+            name = out.get("name")
+            error = (entry.output_errors or {}).get(name)
+            if error is None and name not in (entry.outputs or {}):
+                error = f"output {name!r} captured no value from the upstream answer"
+            if error is not None:
+                self._event(
+                    run,
+                    "output_capture_failed",
+                    node=state.state_id,
+                    entry=entry.index,
+                    port=name,
+                    error=error,
+                    detail=f"output {name!r} did not bind after one capture retry",
+                )
+                failures.append(error)
+        return "; ".join(failures) or None
+
+    async def _refresh_entry_answers(self, run: FactoryRun, state: _StateRun, entry: _StateEntry) -> bool:
+        """Refresh settled answers, waiting one bounded poll window for a
+        missing hand-off. Returns whether any answer changed."""
+        from . import collect
+
+        child_ids = [
+            instance.child_id
+            for instance in entry.instances
+            if instance.child_id is not None and instance.status == "done"
+        ]
+        if not child_ids:
+            return False
+        # An idle worker may expose its settle before handing off its final
+        # assistant text. Give that missing capture one bounded poll window;
+        # existing nonempty (but invalid) output still gets only one refresh.
+        deadline = self._now_fn() + POLL_TIMEOUT_MS / 1000
+        changed = False
+        while entry.status == "running":
+            try:
+                results = await collect(child_ids, timeout_ms=0)
+            except Exception as exc:
+                self._event(
+                    run,
+                    "output_capture_failed",
+                    node=state.state_id,
+                    entry=entry.index,
+                    error=f"capture retry could not re-collect the settled children: {exc}",
+                    detail="the first capture stands",
+                )
+                return changed
+            if entry.status != "running":
+                return changed  # stop/fail_fast claimed the entry during collect
+            by_child = {result.rlm_child_id: result for result in results}
+            for instance in entry.instances:
+                result = by_child.get(instance.child_id or "")
+                if result is None:
+                    continue
+                answer = (result.answer_text or result.answer_preview or "")[:ANSWER_BINDING_CAP] or None
+                if answer and (instance.answer is None or len(answer) > len(instance.answer)):
+                    instance.answer = answer
+                    changed = True
+            if changed:
+                entry.answer = self._entry_answer(entry)
+            missing = any(
+                instance.status == "done" and instance.child_id is not None and not instance.answer
+                for instance in entry.instances
+            )
+            remaining = deadline - self._now_fn()
+            if not missing or remaining <= 0:
+                return changed
+            await self._sleep_fn(min(0.05, remaining))
+        return changed
 
     async def _apply_instance_failure(
         self, run: FactoryRun, state: _StateRun, entry: _StateEntry, instance: _NodeInstance, reason: str, *, retry: bool
@@ -2792,8 +3610,15 @@ class FactoryExecutor:
         # count the pending instance as in-flight, so the control loop
         # would never finish the run. The failed instance settles as an
         # error instead; the policy call below is a no-op on a terminal
-        # entry.
-        if retry and instance.attempt <= retries and entry.status == "running":
+        # entry. ``attempt - retry_base`` charges only the admissions
+        # since the last budget reset: an infra respawn and a resume's
+        # re-admission restart the declared retries without zeroing the
+        # spawn counter the labels count on.
+        if (
+            retry
+            and instance.attempt - instance.retry_base <= retries
+            and entry.status == "running"
+        ):
             instance.status = "pending"
             instance.error = None
             self._event(
@@ -2816,12 +3641,50 @@ class FactoryExecutor:
     async def _apply_entry_failure_policy(
         self, run: FactoryRun, state: _StateRun, entry: _StateEntry, reason: str
     ) -> None:
+        # The verify mark is oversight, not failure-policy bookkeeping: a
+        # later foreach sibling can exit with a provisional answer AFTER
+        # the entry already went terminal (a sibling failed it first), so
+        # the check runs BEFORE the terminal guard -- the guard would
+        # otherwise swallow the late exit's signal, leaving the captured
+        # answer invisible in every needs_verify surface.
+        # entry.needs_verify keeps the mark and its event one-shot per entry.
+        if not entry.needs_verify and any(
+            instance.provisional and instance.answer for instance in entry.instances
+        ):
+            # An exit with a provisional answer is distinguishable from
+            # completed work only through the verify mark: the entry keeps
+            # its error verdict, but the preserved answer and the
+            # status-level needs_verify signal hand the operator the
+            # revival-race decision instead of a silent drop.
+            entry.needs_verify = True
+            # The detail names what the mark preserves: a settle whose
+            # declared output never bound, a respawned worker's last words
+            # after its own death, or a plain child exit. The capture mark
+            # is checked first: ``infra_respawned`` outlives its respawn,
+            # so a respawned attempt that later settles and fails capture
+            # preserves the capture's provenance, not the old death's.
+            respawned = any(instance.infra_respawned for instance in entry.instances)
+            capture_failed = any(instance.capture_failed for instance in entry.instances)
+            if capture_failed:
+                detail = (
+                    "output capture failed; the settled answer is preserved as a "
+                    "provisional answer - fix the declared output or verify by hand"
+                )
+            elif respawned:
+                detail = (
+                    "worker verified dead by the executor after its automatic respawn; "
+                    "last assistant text preserved as a provisional answer"
+                )
+            else:
+                detail = "child exit captured a provisional answer - verify the remote state"
+            self._event(run, "needs_verify", node=state.state_id, entry=entry.index, detail=detail)
         if entry.status in TERMINAL_ENTRY_STATUSES:
             return  # the policy already ran for this entry
         policy = state.spec.get("failure_policy", RUN_FAILURE_POLICY_DEFAULT)
         entry.status = "error"
         entry.error = reason
         state.error = reason
+        run.last_error = f"state {state.state_id!r} failed: {reason}"
         self._event(run, "node_error", node=state.state_id, entry=entry.index, error=reason, detail=f"failure_policy {policy}")
         # The entry is terminal: its prepared-but-never-admitted instances
         # (a foreach queue behind max_parallel, or a rate-limit deferral)
@@ -2838,9 +3701,14 @@ class FactoryExecutor:
                     instance=instance.index,
                     detail="entry failed before admission",
                 )
-        # The failed entry settles too: guard-less transitions (the compiled
-        # dag's depends_on edges) fire from error settles so dependents run.
-        self._queue_settle(run, state, entry)
+        if policy != "escalate":
+            # The failed entry settles: guard-less transitions (the compiled
+            # dag's depends_on edges) fire from error settles so dependents
+            # run. Escalate instead HOLDS the failed entry unsettled -- the
+            # pause lands before the failure propagates, no downstream entry
+            # budget is spent on it, and resume() re-admits the entry as a
+            # fresh attempt.
+            self._queue_settle(run, state, entry)
         if run.state != "running":
             # stop() (or another transition) owns the run state now; keep the
             # entry's error but do not overwrite the final state.
@@ -2871,7 +3739,8 @@ class FactoryExecutor:
             await self._milestone(
                 run,
                 "paused",
-                f"state {state.state_id} failed: {reason}; resume with await rlm.factory.resume('{run.run_id}')",
+                f"state {state.state_id} failed: {reason}; resume with await rlm.factory.resume('{run.run_id}') "
+                "to re-admit the failed entry as a fresh attempt",
                 node=state.state_id,
             )
 
@@ -2944,9 +3813,24 @@ class FactoryExecutor:
         # there, but the executor treats its slot as released.
         instance.status = "cancelled"
 
+    async def _cancel_python(self, run: FactoryRun) -> None:
+        """Stop executor-owned calls when the run stops or its control lane fails."""
+        for state_id in run.order:
+            state = run.states[state_id]
+            for entry in state.entries:
+                for instance in entry.instances:
+                    if instance.status == "running" and instance.process is not None:
+                        process, instance.process = instance.process, None
+                        instance.status = "cancelled"
+                        if entry.status == "running":
+                            entry.status = "cancelled"
+                        await process.stop()
+                        self._event(run, "cancelled", node=state_id, entry=entry.index, instance=instance.index)
+
     async def _cancel_running(self, run: FactoryRun) -> None:
         from . import delete_subagent
 
+        await self._cancel_python(run)
         for state_id in run.order:
             state = run.states[state_id]
             for entry in state.entries:
@@ -3061,6 +3945,9 @@ class FactoryExecutor:
             self._event(run, "executor_error", error=f"{type(exc).__name__}: {exc}")
             if run.state == "running":
                 run.state = "failed"
+                # Child agents remain supervisor-owned; these subprocesses
+                # have no owner or deadline enforcer after this lane exits.
+                await self._cancel_python(run)
                 try:
                     await self._milestone(run, "failed", f"executor error: {exc}")
                 except Exception:
@@ -3082,14 +3969,21 @@ class FactoryExecutor:
                 for state_id in run.order
                 for entry in run.states[state_id].entries
                 for instance in entry.instances
-                if instance.status == "running" and instance.child_id is not None
+                if instance.status == "running"
             ]
-            if in_flight:
+            children = [item for item in in_flight if item[2].child_id is not None]
+            python_calls = [item for item in in_flight if item[2].process is not None]
+            if children:
+                # A child poll must not postpone a concurrent Python call's deadline.
+                timeout_ms = POLL_TIMEOUT_MS
+                if python_calls:
+                    nearest = min(instance.deadline for _, _, instance in python_calls)
+                    timeout_ms = min(timeout_ms, max(0, math.ceil((nearest - self._now_fn()) * 1000)))
                 results = await collect(
-                    [instance.child_id for _, _, instance in in_flight], timeout_ms=POLL_TIMEOUT_MS
+                    [instance.child_id for _, _, instance in children], timeout_ms=timeout_ms
                 )
                 settled = {entry.rlm_child_id: entry for entry in results if entry.settled}
-                for state, entry, instance in in_flight:
+                for state, entry, instance in children:
                     # A GENERATION bump mid-batch drops this collect's
                     # results: the resumed loop re-collects the children
                     # (they stay running supervisor-side), so no settle is
@@ -3103,6 +3997,16 @@ class FactoryExecutor:
                     result = settled.get(instance.child_id or "")
                     if result is not None:
                         await self._apply_settlement(run, state, entry, instance, result)
+            elif python_calls:
+                await self._wait_python([instance for _, _, instance in python_calls])
+            for state, entry, instance in python_calls:
+                if run.loop_generation != generation:
+                    return
+                process = instance.process
+                if instance.status != "running" or process is None:
+                    continue  # stop()/fail_fast claimed it during the wait
+                if process.proc.returncode is not None or self._now_fn() >= instance.deadline:
+                    await self._apply_python_exit(run, state, entry, instance)
             # Re-check state before completion: stop() (or a policy transition)
             # can land while the collect above was in flight, and a run that
             # was stopped must never finalize as done.
@@ -3358,7 +4262,11 @@ async def stop_factory(run_id: str) -> dict[str, Any]:
 
 
 async def resume_factory(run_id: str) -> dict[str, Any]:
-    """Resume a paused run (escalate, budget, or max_transitions pause)."""
+    """Resume a paused run (escalate, budget, or max_transitions pause).
+
+    An escalate pause re-admits the failed entry as a fresh attempt of the
+    same rendered prompt first; see ``FactoryExecutor.resume``.
+    """
     require_factory_enabled()
     return await default_factory_executor().resume(run_id)
 
@@ -3413,7 +4321,9 @@ def _machine_structure(
         }
         model, thinking = (resolved or {}).get(state["id"], (None, None))
         subagent = state.get("subagent")
-        if isinstance(subagent, dict):
+        if "python" in state:
+            row["python"] = f"{state['python']['import']}.{state['python']['callable']}"
+        elif isinstance(subagent, dict):
             # A resolved live run carries the executor's spawn settings for
             # both subagent forms; a spec graph surfaces the inline-declared
             # ones only (a reference form's settings resolve at run time).
@@ -3885,7 +4795,10 @@ def _machine_contract_lines(spec: "dict[str, Any]") -> list[str]:
             label += f" ({', '.join(flags)})"
         lines.append(label)
         subagent = state.get("subagent")
-        if isinstance(subagent, dict):
+        python = state.get("python")
+        if isinstance(python, dict):
+            lines.append(f"  python: {python.get('import')}.{python.get('callable')}")
+        elif isinstance(subagent, dict):
             settings = subagent.get("name") or subagent.get("prompt", "")[:60]
             lines.append(f"  subagent: inline ({settings})")
         elif isinstance(subagent, str):
@@ -4446,9 +5359,10 @@ rlm.harness.create_factory(
             {
                 "id": "fixing",
                 "subagent": {"prompt": (
-                    "Address the review findings in the verdict below. Make the "
-                    "smallest targeted fixes, run the relevant tests, and return a "
-                    "fenced json block of the form "
+                    "Address the review findings in the verdict below. First "
+                    "reconcile any changes an earlier attempt left in the working "
+                    "tree. Make the smallest targeted fixes, run the relevant "
+                    "tests, and return a fenced json block of the form "
                     '{"fix_report": {"fixed": ["finding that was addressed"], '
                     '"skipped": ["finding left alone and why"]}}. '
                     "Output only the json block.\n\n{verdict}")},
@@ -4484,37 +5398,51 @@ fixer ever runs and its re-entry re-binds the real report; `max_entries`
 bounds the loop; `monitoring` is a `resident` that stays alive under the
 parent session after the run ends. Both worked examples bound their
 emitted payloads in the prompt — a capped findings list here, a capped
-file list in the review-sweep example — because captured answers are
-capped previews: an unbounded payload truncates at the cap and fails to
-bind.
+file list in the review-sweep example — because the executor's capture
+cap still bounds very large payloads: an unbounded payload truncates at
+the cap, fails to capture, and fails the producing state through its
+`retries` and `failure_policy` instead of settling valueless.
 
 ## Authoring reference
 
 - **States**: 1 to 1024, unique ids matching `^[a-z0-9][a-z0-9-]{0,63}$`; at
-  least one state carries `"entry": true`, and entry states declare no
-  inputs. A state's `subagent` is a harness subagent entry id or title (its
+  least one state carries `"entry": true`. An entry state's inputs must all
+  be optional: its first entry binds the null sentinel, and a later entry
+  through a transition (a verify loop back into it) binds the real
+  settle. A state runs either a `python` callable (see Python states) or
+  a subagent. A state's `subagent` is a harness subagent entry id or title (its
   content is the prompt template; `metadata.model`/`metadata.thinking` are
   spawn settings) or an inline `{"prompt": ...}` object with optional
   `name`/`model`/`thinking`. The optional `name` labels the spawned
-  children (at most 64 characters, unique across the machine's states —
-  a name another state's name can suffix onto, `foo` vs `foo-i1`, is
-  rejected at write time): the first instance is named exactly `name` —
-  the label to message the child by — and re-entries, foreach fan-out,
-  and retries disambiguate with the same `-i<n>`/`-a<n>` suffixes the
-  generated labels use; a suffixed label that would pass the host's
-  64-character cap shrinks its base with a digest of the full name, like
-  the generated labels do.
+  children run-scoped (at most 64 characters, unique across the
+  machine's states — a name another state's name can suffix onto, `foo`
+  vs `foo-i1`, is rejected at write time): the spawn label is
+  `<run6>-name` — the supervisor's sibling names are per-parent-session,
+  and a parent session outlives its runs, so the run prefix keeps two
+  runs of one machine from colliding; read the exact label from the
+  `spawned` event's `name` or the status node's instance rows — and
+  re-entries, foreach fan-out, and retries disambiguate with the same
+  `-i<n>`/`-a<n>` suffixes the generated labels use; a suffixed label
+  that would pass the host's 64-character cap shrinks its base with a
+  digest of the full name, like the generated labels do.
 - **Ports**: inputs and outputs of type `text` or `json`. An input binds
   `"from": "<state_id>.<output_name>"`; types must match, duplicates are
   rejected, and nothing can read from a resident. Bound values render into
   `{input_name}` placeholders (one pass; inputs without a placeholder are
   appended in a trailing `## Inputs` section). A required input whose source
   has not settled yet keeps the entry pending; over a settled source that
-  offers no value (an errored settle, a port the settle captured no value
-  for, or a JSON capture failure) it fails the dependent entry, while
+  offers no value (an errored settle, or a settle that captured nothing for
+  the port) it fails the dependent entry, while
   `"optional": true` binds a null sentinel in every no-value case (a
   source that offers no value is not a value, so the dependent that
-  declared the input optional proceeds). A required self-input is
+  declared the input optional proceeds). A state's own declared outputs
+  capture from its settle's full answer: a declared port that binds no
+  value — no parseable JSON for it (a fenced ```json block, or a bare
+  JSON object ending the answer), or a payload past the executor's
+  capture cap — is retried once and then FAILS the producing
+  entry as a task failure (`retries`, then `failure_policy`, apply, and
+  the answer stays preserved under `needs_verify`), so a valueless
+  settle never reaches a dependent's bind. A required self-input is
   rejected at validation —
   `state X input 'name' cannot require itself: mark the self-input optional
   - a required one can never bind on the state's first entry` — while an
@@ -4531,11 +5459,12 @@ bind.
   dotted path into a `json` output; `eq`/`ne` compare JSON-strictly (a
   boolean never equals a number), comparison ops need a numeric value,
   `contains` a non-empty list, `exists` no value, and a missing or
-  unparseable port fails every op except `exists`. A failed settle still
-  fires guard-less transitions, so dependents under `continue` run; their
-  required input over the failed source then fails the dependent entry,
-  while an optional input over the failed source binds the null sentinel
-  and the dependent proceeds.
+  unparseable port fails every op except `exists`. Under `continue` a
+  failed settle still fires guard-less transitions, so dependents run;
+  their required input over the failed source then fails the dependent
+  entry, while an optional input over the failed source binds the null
+  sentinel and the dependent proceeds. Under the default `escalate` the
+  failure never propagates that far (see bounds and policies).
 - **Cycles are legal**: there is no acyclicity requirement — self-loops and
   back edges validate. The one rule is an entry state somewhere; a dag
   whose every node depends on another compiles to no entry states and is
@@ -4545,9 +5474,9 @@ bind.
   child rendered with its item bound as that input; an empty list settles
   the entry with no children.
 - **Residents**: `"lifecycle": "resident"` states declare no outputs, no
-  foreach, and no outgoing transitions, nothing reads from them, and their
-  instance stays alive under the parent session after the run completes
-  (stop the run to retire it).
+  foreach, no retries, and no outgoing transitions, nothing reads from
+  them, and their instance stays alive under the parent session after the
+  run completes (stop the run to retire it).
 - **Bounds and policies**: `run.max_parallel` (1..64, default 8) is the
   run's global budget of simultaneously running instances — not a
   per-node limit. `run.max_children` (default 10,000, capped at
@@ -4563,9 +5492,28 @@ bind.
   (0..10, same rendered prompt), `budget_ms` (admission to settlement;
   exceeding it fails the attempt without a retry), and `failure_policy` —
   `fail_fast` (cancel every child, run failed), `continue` (entry stays
-  errored; the run finishes and reports failed if any state errored), or
-  `escalate` (the default: pause the run; resuming is the operator's
-  decision).
+  errored; the run finishes and reports failed if any state errored; its
+  failed settle fires guard-less transitions so dependents run), or
+  `escalate` (the default: pause the run BEFORE the failed settle
+  propagates — no transition fires and no downstream entry is spent — and
+  `resume` re-admits the failed entry as a fresh attempt: same rendered
+  prompt, same entry slot, fresh `retries`; a binding failure over a
+  broken upstream re-binds and pauses again, so stop and fix the upstream
+  or author the dependent's state with `continue`). A child whose worker
+  died or whose supervisor link was lost is infra, not the task's
+  failure: the executor re-checks it after a short quiet period, then
+  re-spawns the same prompt once without spending `retries` or
+  `max_entries`; a second death fails through `retries`/`failure_policy`
+  like any task failure.
+- **Retry re-renders the same prompt into a changed world**: a retry runs
+  the same prompt after an earlier attempt already changed the external
+  state it works on, so a prompt that mutates external state — a fixing
+  state's worktree, a tracker, a remote API — states its recovery posture:
+  reconcile (start from what the earlier attempt left with `git status`
+  and `git diff`, keep the changes that already serve the task, revert
+  half-finished edits) or reset to a clean baseline, never fail on the
+  old state or duplicate finished work. Retries with no recovery note
+  still validate: validation cannot judge prose.
 - **Dead configurations fail loudly, never wedge**: a pending entry whose
   input source never settled, a `max_parallel` cap held entirely by
   never-settling residents with work queued, or nothing in flight and
@@ -4623,6 +5571,72 @@ rlm.harness.create_factory(
 )
 ```
 
+## Python states
+
+A state can run a Python function instead of spawning a child: it carries
+`"python": {"import": "<module>", "callable": "<function>"}` in place of
+`subagent` (exactly one of the two). Use it for deterministic routing and
+data shaping — listing work items, filtering, reshaping one state's output
+for the next — where a child agent would only spend budget.
+
+- **Contract**: the executor calls `fn(inputs)` with a dict of the state's
+  declared inputs bound to raw values (a `text` input as a string, a `json`
+  input as the parsed value, an optional input with no value as `None`;
+  entry states with no declared inputs get `{}`). The function returns a
+  dict whose keys are exactly the declared output names (a `text` output must be a string);
+  that dict is the settle's outputs, so guards and downstream inputs read
+  it like any other state's. An `async def` function is awaited.
+- **Isolation**: every call runs in a fresh, short-lived Python subprocess
+  (the kernel's interpreter, isolated mode) in the session's working
+  directory, which is on the import path, so a module next to your work
+  imports. It has no `rlm`, no harness, no kernel globals, and cannot spawn
+  agents. Prints go to stderr; only the returned dict goes to stdout.
+- **Failures**: an exception (its stderr tail is the error), output that is
+  not a dict, or keys that do not match the declared outputs fail the
+  attempt: `retries` re-runs the call with the same inputs, then
+  `failure_policy` applies. A bad import fails at run time the same way.
+- **Time limit**: the state's `budget_ms`, else the run's `budget_ms`, else
+  60 seconds. A call past its limit is killed and fails without a retry.
+  `stop` and `fail_fast` kill running calls.
+- **Pure functions**: calls are re-run on retry and on resume after an
+  escalate pause, so a python state should depend only on its inputs.
+  A running call belongs to its run and is lost with it on a kernel
+  restart.
+- Python states cannot be `resident` and cannot use `foreach`. A call holds
+  a `max_parallel` slot but is no child: it does not count toward
+  `max_children`.
+
+A python state lists the work, then an agent state fans out over it:
+
+```python
+# my_tools.py in the session's working directory
+def changed_files(inputs):
+    import subprocess
+    out = subprocess.run(["git", "diff", "--name-only", "main"],
+                         capture_output=True, text=True, check=True).stdout
+    return {"files": out.split()[:8]}
+```
+
+```python
+rlm.harness.create_factory(
+    "file-review",
+    "Review each changed file.",
+    id="file-review",
+    machine={
+        "states": [
+            {"id": "files", "entry": True,
+             "python": {"import": "my_tools", "callable": "changed_files"},
+             "outputs": [{"name": "files", "type": "json"}]},
+            {"id": "review",
+             "subagent": {"prompt": "Review {file}; reply one line: `<path>: <problem or clean>`."},
+             "inputs": [{"name": "file", "type": "json", "from": "files.files"}],
+             "foreach": {"over": "file", "max": 8}},
+        ],
+        "transitions": [{"from": "files", "to": "review"}],
+    },
+)
+```
+
 ## Run and steer
 
 ```python
@@ -4638,6 +5652,14 @@ status["events"]   # trailing ledger: spawned, settled, answer_captured,
                    # transition_fired, node_error, milestone, ...
 status["usage"]    # spawns, settled, tool_uses, max_parallel, max_children, running,
                     # transitions_fired
+status["needs_verify"]  # (when set) states whose entry keeps a
+                        # provisional answer: a child exit with text, or a
+                        # settled answer whose declared output failed to
+                        # capture (worker deaths are liveness-checked and
+                        # re-spawned by the executor first) - the entry row
+                        # carries the provisional_answer preview
+status["pause_reason"]  # (paused) why the run paused; with "last_error" (the
+status["last_error"]    # last admission/bind failure) and a one-line "remedy"
 ```
 
 `graph()` and `watch()` are the live monitoring views this namespace
@@ -4675,10 +5697,13 @@ watched = await rlm.factory.watch(result["run_id"], 30)
   failure; `name=` labels the run in status and the TUI.
 - Pause and failure notices (escalate, budget, max_transitions,
   max_children, failed, finished) arrive as quiet notices in the
-  conversation once per kind per run, the pause notices with the resume
-  call spelled out — a paused run does not need polling to be noticed.
+  conversation, or as `factory-progress` inbox messages in sessions with
+  the agent inbox, once per kind per run (an escalate pause notifies again
+  after each resume), the pause notices with the resume call spelled
+  out — a paused run does not need polling to be noticed.
 - `stop(run_id)` cancels every running child of the run (idempotent);
-  `resume(run_id)` continues a paused run and raises on a non-paused one.
+  `resume(run_id)` continues a paused run and raises on a non-paused one;
+  after an escalate pause it first re-admits the failed entry.
 - The activity lane the daemon and TUI speak is camelCase on the wire
   (`runId`, `specId`, `timeoutMs`); the kernel API here
   (`rlm.factory.*`) is snake_case.
@@ -4703,21 +5728,26 @@ watched = await rlm.factory.watch(result["run_id"], 30)
   derive from their shapes.
 - The TUI factory page: the activity dock's `⚙ N factory` group (Enter or
   click) opens one live diagram per run, newest run first. The up/down
-  arrows move the run selection, Enter opens the selected run's action
-  rows (stop, or resume first while the run is paused — the arrows walk
-  the rows, Enter runs the tracked action), and Esc backs out of the rows
-  before it closes the page.
+  arrows walk the run headers and the states that spawned a child;
+  Enter or Right opens the selected state's latest child session, and
+  Left or Esc closes the page. Ctrl+X (the agents view's stop key) twice
+  stops the selected row: the whole run on its header, or the state's
+  running child (that attempt fails under the state's `retries` and
+  `failure_policy`). `r` resumes a paused run.
 
 ## Safety
 
-- Every state spawns real children that spend budget. Bound loops with
+- Every subagent state spawns real children that spend budget. Bound loops with
   `max_entries`, `max_transitions`, and `run.max_children` (total
   admissions); the default `escalate` policy pauses
   instead of failing, so read `status` (or the notice) before resuming.
-- Captured answers are capped previews (about 160 characters) and outputs
-  bind from them: keep declared outputs compact — a small fenced json
-  block or one short line — and let the full answer live in the child's
-  session.
+- Outputs bind from the child's full final answer (the collect envelope
+  carries it; the executor caps its own capture at 65,536 characters,
+  the same bound the daemon puts on the envelope's answer text): a
+  fenced json output block binds whole as long as it fits that cap (a
+  bare JSON object that ends the answer binds too), so keep declared
+  outputs compact — the rosters and ledger previews stay ~160 characters
+  — and let the full answer live in the child's session.
 - Run registries live in kernel memory: a kernel restart loses `status`
   for old runs, but the children keep running under the supervisor
   (`rlm.list_subagents` sees them). Stop runs before restarting, or

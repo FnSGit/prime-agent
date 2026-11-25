@@ -1,11 +1,12 @@
 //! The session engine's goal boundary arms, shared by the headless drivers:
-//! the natural-turn-end mint, the budget-limit wrap-up steer, the usage
+//! the continuation consult, the budget-limit wrap-up steer, the usage
 //! accounting, and the terminal-error finish — each transport drives the
 //! same state machine.
 
 use pa_types::session::CustomMessage;
 
 use super::engine::SessionEngine;
+use super::goal_continuation::{ContinuationTrigger, GoalContinuationDecision};
 use super::goal_driver::UsageOutcome;
 use crate::goals::{create_goal_context_message, GoalContextKind, GoalStatus};
 
@@ -45,7 +46,7 @@ impl SessionEngine {
         let state = driver.start(&mut session, objective, token_budget)?;
         drop(session);
         drop(driver);
-        let context = create_goal_context_message(&state, GoalContextKind::Continuation)?;
+        let context = create_goal_context_message(&state, GoalContextKind::Continuation, &[])?;
         self.session.queue_next_turn_row(context);
         Ok(true)
     }
@@ -79,17 +80,15 @@ impl SessionEngine {
         create_goal_context_message(
             &driver.state_with_creation_elapsed(),
             GoalContextKind::BudgetLimit,
+            &[],
         )
         .ok()
     }
 
-    /// Mint one goal continuation: an active goal consumes one slot and returns
-    /// its context row; a failed persist fails the goal and mints nothing.
-    pub async fn mint_goal_continuation(&self) -> Option<CustomMessage> {
-        // The just-settled turn gates the mint (read before the driver lock),
-        // and a trailing failed continuation pair stops riding the context.
-        let last_turn: Option<pa_agent::types::AssistantMessage> = self
-            .session
+    /// The latest settled assistant turn in its loop form: the natural mint
+    /// gates on it and the RLM settle site's delivery decides from it.
+    pub async fn latest_settled_assistant(&self) -> Option<pa_agent::types::AssistantMessage> {
+        self.session
             .last_assistant_message()
             .await
             .and_then(|wire| match wire {
@@ -97,39 +96,38 @@ impl SessionEngine {
                     super::provider_adapter::json_round_trip(&assistant)
                 }
                 _ => None,
-            });
-        if last_turn
-            .as_ref()
-            .is_some_and(|turn: &pa_agent::types::AssistantMessage| {
-                turn.stop_reason == pa_agent::types::StopReason::Error
-                    || super::goal_driver::turn_produced_no_output(turn)
             })
-        {
+    }
+
+    /// Consult the goal continuation over the just-settled turn (see
+    /// [`super::goal_continuation`]), dropping the failed pair when told to.
+    pub async fn consult_goal_continuation(
+        &self,
+        trigger: ContinuationTrigger,
+        work_unsettled: bool,
+    ) -> GoalContinuationDecision {
+        let last_turn = self.latest_settled_assistant().await;
+        let decision = super::goal_continuation::consult_goal_continuation(
+            &self.goal_driver,
+            &self.session.shared_persistence(),
+            last_turn.as_ref(),
+            trigger,
+            work_unsettled,
+        )
+        .await;
+        let drop_failed_pair = match &decision {
+            GoalContinuationDecision::NotMinted { drop_failed_pair }
+            | GoalContinuationDecision::Minted {
+                drop_failed_pair, ..
+            } => *drop_failed_pair,
+            GoalContinuationDecision::NotOwned
+            | GoalContinuationDecision::NothingOwed
+            | GoalContinuationDecision::Owed => false,
+        };
+        if drop_failed_pair {
             self.session.drop_failed_goal_continuation().await;
         }
-        let persistence = self.session.shared_persistence();
-        let mut driver = self.goal_driver.lock().await;
-        if !driver.owns_continuation_wakeup() {
-            return None;
-        }
-        let mut session = persistence.lock().await;
-        match driver.next_continuation_message(&mut session, last_turn.as_ref()) {
-            Ok(message) => message,
-            Err(error) => {
-                let message = format!("{error:#}");
-                tracing::warn!("goal continuation mint failed the persist: {message}");
-                // Best-effort: its own persist failure must not reject
-                // the boundary hook either.
-                if let Err(fail_error) = driver.finish_for_terminal_message(
-                    &mut session,
-                    pa_types::ai::StopReason::Error,
-                    Some(&message),
-                ) {
-                    tracing::warn!("goal error finish also failed: {fail_error:#}");
-                }
-                None
-            }
-        }
+        decision
     }
 
     /// A failed terminal assistant message fails an active goal: the error
@@ -159,9 +157,22 @@ impl SessionEngine {
         self.goal_driver.lock().await.state_with_creation_elapsed()
     }
 
+    /// Take the armed no-progress backoff window's deadline while the goal
+    /// is Active: the settled boundary may outlast the window, so an overdue
+    /// deadline still yields, and the take consumes it — one wake per strike.
+    pub async fn take_goal_backoff_wake_at(&self) -> Option<u64> {
+        self.goal_driver.lock().await.take_backoff_wake_at()
+    }
+
     /// Release the pending-continuation guard: the surface admitted (or
     /// withdrew) the minted continuation, so the next boundary mints again.
     pub async fn clear_pending_goal_continuation(&self) {
         self.goal_driver.lock().await.continuation_consumed();
+    }
+
+    /// Whether an active goal owns the wake-up discipline (an autonomous
+    /// hold defers behind it and drops its own continuation).
+    pub async fn goal_owns_continuation_wakeup(&self) -> bool {
+        self.goal_driver.lock().await.owns_continuation_wakeup()
     }
 }

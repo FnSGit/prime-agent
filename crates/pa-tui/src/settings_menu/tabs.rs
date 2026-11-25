@@ -23,6 +23,7 @@ const TAB_LAYOUT: &[TabLayout] = &[
             "follow-up-mode",
             "quiet-startup",
             "warnings",
+            "autocompact-threshold",
         ],
     },
     TabLayout {
@@ -47,6 +48,7 @@ const TAB_LAYOUT: &[TabLayout] = &[
             "editor-padding",
             "autocomplete-max-visible",
             "show-hardware-cursor",
+            "emoji-shortcodes",
         ],
     },
     TabLayout {
@@ -56,6 +58,8 @@ const TAB_LAYOUT: &[TabLayout] = &[
             "builtin-skills",
             "idle-eviction-minutes",
             "tree-filter-mode",
+            "harness-refinements",
+            "web-search-provider",
         ],
     },
 ];

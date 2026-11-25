@@ -153,7 +153,7 @@ async fn turn_boundary_host_requests_round_trip_through_a_real_kernel() {
         Some("running the harness cell"),
         vec![(
             "call-1",
-            "ipython",
+            "python_repl",
             json!({ "code": harness_cell(&receipt_path) }),
         )],
     );
@@ -175,10 +175,13 @@ async fn turn_boundary_host_requests_round_trip_through_a_real_kernel() {
     provider.push_text_turn("boundary reached");
 
     let engine = create_session(SessionEngineConfig {
+        cell_wake: None,
+        on_background_cell: None,
         on_late_sent_agent_message: None,
         semantic_edges: None,
         cron_store: None,
         queued_steering_probe: None,
+        should_stop_after_turn: None,
         image_model_router: None,
         steering_mode: None,
         follow_up_mode: None,
@@ -190,8 +193,6 @@ async fn turn_boundary_host_requests_round_trip_through_a_real_kernel() {
         tools: Vec::new(),
         custom_system_prompt: None,
         prompt_guidelines: Vec::new(),
-        generic_mcp_servers: Vec::new(),
-        allow_recursion: None,
         session_manager: Some(session),
         extra_host_handlers: None,
         conversation_log_path: None,
@@ -199,12 +200,20 @@ async fn turn_boundary_host_requests_round_trip_through_a_real_kernel() {
         additional_prompt_paths: Vec::new(),
         extra_builtin_skill_overrides: Vec::new(),
         rlm_subagent_host: None,
+        rlm_usage_store: None,
+
+        inbox: None,
+        progress_note_emit: None,
         rlm_depth: None,
+        factory_child: false,
+        daemonless: true,
         telemetry: None,
         model_info: Some(registry_model()),
         mcp_manager: None,
+        kernel_ready_gate: None,
         prewarm_ipython_kernel: None,
         on_background_work_settled: None,
+        bash_notice_wake: None,
         queued_goal_context_purge: None,
     })
     .await

@@ -14,18 +14,18 @@ use pa_agent::types::{
     UserPart,
 };
 
+use super::model_usage::ModelUsage;
 use super::provider_retry::{
-    is_agent_lifecycle_failure, is_faux_provider_queue_exhausted,
-    is_permanent_provider_failure_kind, provider_retry_delay, provider_stream_failure_kind,
-    provider_stream_failure_retry_after_ms, provider_stream_failure_status, ProviderRetryDelay,
-    ProviderRetryPolicy,
+    is_agent_lifecycle_failure, is_permanent_provider_failure_kind, provider_retry_delay,
+    provider_stream_failure_kind, provider_stream_failure_retry_after_ms,
+    provider_stream_failure_status, ProviderRetryDelay, ProviderRetryPolicy,
 };
 
 /// Sink receiving partial side-question answers while the run streams.
 /// Returning `false` requests the run to abort.
 pub type SideQuestionSink = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
-const SIDE_QUESTION_INSTRUCTION: &str = "The user asked this via `/btw` — a temporary side thread cloned from the main conversation to answer a question without interrupting the main work. Tools (including `ipython`) are deactivated in this side thread and return an error if called; answer using only the conversation context above. The user may send follow-up side questions. Nothing here is added to the main session, so don't start or plan main-session work from this thread.";
+const SIDE_QUESTION_INSTRUCTION: &str = "The user asked this via `/btw` — a temporary side thread cloned from the main conversation to answer a question without interrupting the main work. Tools (including `python_repl`) are deactivated in this side thread and return an error if called; answer using only the conversation context above. The user may send follow-up side questions. Nothing here is added to the main session, so don't start or plan main-session work from this thread.";
 
 const SIDE_QUESTION_TOOL_BLOCKED: &str =
     "Tools are deactivated in this side thread. Answer from the conversation context.";
@@ -64,6 +64,8 @@ pub struct SideQuestionResult {
     pub status: SideQuestionStatus,
     pub answer: String,
     pub error_message: Option<String>,
+    /// The run's model calls summed (every turn and retry, whatever the outcome).
+    pub usage: Option<ModelUsage>,
 }
 
 impl SideQuestionResult {
@@ -72,6 +74,7 @@ impl SideQuestionResult {
             status: SideQuestionStatus::Cancelled,
             answer,
             error_message: None,
+            usage: None,
         }
     }
 
@@ -80,6 +83,7 @@ impl SideQuestionResult {
             status: SideQuestionStatus::Error,
             answer,
             error_message: Some(error_message),
+            usage: None,
         }
     }
 }
@@ -104,6 +108,10 @@ fn assistant_text(message: &AssistantMessage) -> String {
 /// (returning `false` aborts the run), honors `signal` for external
 /// aborts, and retries provider failures per `retry_policy`. It never
 /// mutates the parent agent or its history.
+///
+/// # Panics
+///
+/// Panics if the usage tally mutex is poisoned.
 pub async fn run_side_question(
     parent: &Arc<Agent>,
     stream_fn: pa_agent::stream::StreamFn,
@@ -193,6 +201,11 @@ pub async fn run_side_question(
         stream_fn: Some(stream_fn),
         before_tool_call: Some(before_tool_call),
         should_stop_after_turn: Some(should_stop_after_turn),
+        // TS `side-question.ts`: the side call keeps the parent's identity so it reads the main
+        // conversation's prompt cache, and rides SSE so it never takes the session's Codex
+        // socket or its continuation.
+        session_id: parent.session_id().map(str::to_string),
+        transport: Some(pa_agent::types::Transport::Sse),
         ..Default::default()
     }));
 
@@ -200,10 +213,25 @@ pub async fn run_side_question(
     // text as it arrives; the answer of the whole run is derived at the end.
     let (update_tx, update_rx) = std::sync::mpsc::channel::<String>();
     let update_tx = Arc::new(update_tx);
+    let billed = Arc::new(std::sync::Mutex::new(pa_types::ai::Usage::default()));
+    let billed_sink = Arc::clone(&billed);
     let subscription = side_agent
         .subscribe(move |event, _signal| {
             let update_tx = Arc::clone(&update_tx);
+            let billed = Arc::clone(&billed_sink);
             Box::pin(async move {
+                if let pa_agent::types::AgentEvent::MessageEnd {
+                    message: pa_agent::types::AgentMessage::Standard(Message::Assistant(assistant)),
+                } = &event
+                {
+                    // The session-file usage shape: both types serialize the TS `Usage`.
+                    if let Ok(usage) = serde_json::to_value(&assistant.usage)
+                        .and_then(serde_json::from_value::<pa_types::ai::Usage>)
+                    {
+                        let mut billed = billed.lock().expect("side question usage lock");
+                        super::rlm_usage::add_assistant_usage(&mut billed, &usage);
+                    }
+                }
                 let message = match &event {
                     pa_agent::types::AgentEvent::MessageUpdate { message, .. } => Some(&**message),
                     pa_agent::types::AgentEvent::MessageEnd { message } => Some(message),
@@ -223,7 +251,7 @@ pub async fn run_side_question(
         })
         .await;
 
-    let result = run_attempts(
+    let mut result = run_attempts(
         &side_agent,
         question,
         previous_turns,
@@ -235,6 +263,13 @@ pub async fn run_side_question(
     )
     .await;
     let () = subscription.unsubscribe().await;
+    let billed = *billed.lock().expect("side question usage lock");
+    result.usage = ModelUsage::new(
+        "side_question",
+        &parent_state.model.provider,
+        &parent_state.model.id,
+        billed,
+    );
     result
 }
 
@@ -292,10 +327,7 @@ async fn run_attempts(
         if message.stop_reason != StopReason::Error {
             break Ok(Some(message));
         }
-        if retries_performed >= max_retries
-            || is_agent_lifecycle_failure(&message)
-            || is_faux_provider_queue_exhausted(&message)
-        {
+        if retries_performed >= max_retries || is_agent_lifecycle_failure(&message) {
             break Ok(Some(message));
         }
         let kind = provider_stream_failure_kind(&message);
@@ -357,6 +389,7 @@ async fn run_attempts(
         status: SideQuestionStatus::Complete,
         answer: final_answer,
         error_message: None,
+        usage: None,
     }
 }
 
@@ -604,6 +637,49 @@ mod tests {
 
         // Side results never touch the parent history.
         assert_eq!(parent.state().await.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn side_calls_keep_the_parent_identity_on_sse() {
+        let provider = Arc::new(ScriptedProvider::new(test_model()));
+        provider.push_text_turn("the side answer");
+        let parent = Arc::new(Agent::new(AgentOptions {
+            initial_state: AgentInitialState {
+                model: Some(test_model()),
+                ..Default::default()
+            },
+            session_id: Some("parent-session".to_string()),
+            ..Default::default()
+        }));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = Arc::clone(&observed);
+        let inner = provider.stream_fn();
+        let stream_fn: pa_agent::stream::StreamFn = Arc::new(move |model, context, options| {
+            capture
+                .lock()
+                .unwrap()
+                .push((options.session_id.clone(), options.transport));
+            inner(model, context, options)
+        });
+        let sink: SideQuestionSink = Arc::new(|_| true);
+        let result = run_side_question(
+            &parent,
+            stream_fn,
+            "what is the answer?",
+            &[],
+            &fast_retry_policy(),
+            &AbortSignal::never(),
+            &sink,
+        )
+        .await;
+        assert_eq!(result.status, SideQuestionStatus::Complete);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![(
+                Some("parent-session".to_string()),
+                Some(pa_agent::types::Transport::Sse)
+            )]
+        );
     }
 
     #[tokio::test]

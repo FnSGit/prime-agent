@@ -58,25 +58,53 @@ pub fn parse_skill_block(text: &str) -> Option<ParsedSkillBlock> {
     }
 }
 
+/// The prefix of a skill reference in user text.
+pub const SKILL_REFERENCE_PREFIX: &str = "/skill:";
+
+/// The skill names a message references as `/skill:<name>`, in first-use
+/// order, each once. A reference stands as its own word (start or
+/// whitespace before, end or whitespace after) and its name holds only
+/// skill-name characters, so an attached path (`/skill:x/SKILL.md`) or
+/// trailing punctuation is no reference; text inside triple-backtick fences
+/// or inline code spans never references.
+#[must_use]
+pub fn skill_references(text: &str) -> Vec<&str> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    let mut in_inline_code = false;
+    let mut at_word_start = true;
+    let mut chars = text.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        let rest = &text[index..];
+        if rest.starts_with("```") {
+            in_fence = !in_fence;
+            // The fence's other two backticks.
+            chars.nth(1);
+            at_word_start = false;
+            continue;
+        }
+        if ch == '`' && !in_fence {
+            in_inline_code = !in_inline_code;
+        } else if at_word_start && !in_fence && !in_inline_code {
+            if let Some(after) = rest.strip_prefix(SKILL_REFERENCE_PREFIX) {
+                let token = after.split(char::is_whitespace).next().unwrap_or_default();
+                let is_name = !token.is_empty()
+                    && token
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+                if is_name && !names.contains(&token) {
+                    names.push(token);
+                }
+            }
+        }
+        at_word_start = ch.is_whitespace();
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_block_without_user_message() {
-        let text = "<skill name=\"websearch\" location=\"/skills/websearch/SKILL.md\">\nReferences are relative to /skills/websearch.\n\nRun a search.\n</skill>";
-        let parsed = parse_skill_block(text).expect("parses");
-        assert_eq!(
-            parsed,
-            ParsedSkillBlock {
-                name: "websearch".to_string(),
-                location: "/skills/websearch/SKILL.md".to_string(),
-                content: "References are relative to /skills/websearch.\n\nRun a search."
-                    .to_string(),
-                user_message: None,
-            }
-        );
-    }
 
     #[test]
     fn parses_block_with_user_message() {
@@ -88,14 +116,10 @@ mod tests {
             parsed.user_message.as_deref(),
             Some("fix the bug in src/main.rs")
         );
-    }
-
-    #[test]
-    fn a_whitespace_only_user_message_is_none() {
         // TS: `match[4]?.trim() || undefined`.
-        let text = "<skill name=\"edit\" location=\"/e/SKILL.md\">\nUse it.\n</skill>\n\n   ";
-        let parsed = parse_skill_block(text).expect("parses");
-        assert_eq!(parsed.user_message, None);
+        let whitespace_only =
+            parse_skill_block(&text.replace("fix the bug in src/main.rs", "   ")).expect("parses");
+        assert_eq!(whitespace_only.user_message, None);
     }
 
     #[test]

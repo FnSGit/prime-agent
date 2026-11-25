@@ -1,12 +1,12 @@
 //! One agent turn: the runner that admits queued input, drives the
 //! engine, and settles the result.
 use super::{
-    checkpoint_queue_recovery, compact_action_label, create_daemon_event_meta,
-    emit_refinement_event_for_session, emit_refinement_row, gather_delivery_batch, json, oneshot,
-    session_snapshot, AssistantSnapshot, DaemonOutbound, EngineEvent, EventPump, Lane, Map, Notify,
-    OutboundFrame, PromptRequest, QueueCheckpoint, QueuedItem, Result, SessionActionSnapshot,
-    SessionCore, SessionEngine, TurnSettle, Value, WorkerRecoveryJournal,
-    ABORTED_TURN_SETTLE_ERROR,
+    checkpoint_queue_recovery, compact_action_label, consume_shown_inbox_items_locked,
+    create_daemon_event_meta, deliver_inbox_arrival_row_locked, emit_refinement_event_for_session,
+    emit_refinement_row, gather_delivery_batch, json, oneshot, session_snapshot, AssistantSnapshot,
+    DaemonOutbound, EngineEvent, EventPump, Lane, Map, Notify, OutboundFrame, PromptRequest,
+    QueueCheckpoint, QueuedItem, Result, SessionActionSnapshot, SessionCore, SessionEngine,
+    TurnSettle, Value, WorkerRecoveryJournal, ABORTED_TURN_SETTLE_ERROR, INBOX_ARRIVAL_QUEUE_KEY,
 };
 
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ pub(super) struct TurnRunner {
     /// The prompt-admission registry: an admitted prompt clears when its
     /// turn settles.
     pub(super) prompt_admissions: crate::prompt_admission::WorkerAdmissions,
-    pub(super) work_notify: Arc<Notify>,
+    pub(super) work_notify: Arc<super::WorkNotify>,
     pub(super) idle_notify: Arc<Notify>,
     pub(crate) events: Arc<EventPump>,
     pub(super) engine: std::sync::Arc<dyn SessionEngine>,
@@ -31,6 +31,10 @@ pub(super) struct TurnRunner {
     /// runner reads it at every boundary so a create-time rebind is always
     /// current.
     pub(super) herdr: std::sync::Arc<std::sync::Mutex<crate::herdr::HerdrReporter>>,
+    /// The batch the queued inbox arrival row covers (the worker's
+    /// `inbox_arrivals`) and the engine whose live inbox it consumes from.
+    pub(super) inbox_arrivals: pa_core::session_engine::inbox::InboxArrivals,
+    pub(super) inbox_engine: Option<std::sync::Weak<crate::agent_engine::AgentSessionEngine>>,
 }
 
 /// The idle-passivation context on the turn runner: the worker token
@@ -45,7 +49,15 @@ impl TurnRunner {
     pub(super) async fn run(self) {
         loop {
             let engine = self.engine.clone();
-            let item: Option<Vec<QueuedItem>> = {
+            // The live inbox store, fetched before the core lock (its slot
+            // has its own mutex): a picked arrival row consumes from it.
+            let inbox = self
+                .inbox_engine
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .and_then(|engine| engine.inbox());
+            let mut inbox_hold = None;
+            let item: Option<(Lane, Vec<QueuedItem>)> = {
                 let mut core = self.core.lock().unwrap();
                 if core.shutdown_requested {
                     drop(core);
@@ -56,37 +68,29 @@ impl TurnRunner {
                 }
                 // A cleared suspension alone must not admit: a manual
                 // compaction is a busy state the resume sites do NOT clear.
-                if self.input_pauses.paused() || core.queued_input_suspended || core.compacting {
+                if core.queued_input_parked(&self.input_pauses) {
                     core.busy = false;
                     None
+                } else if let Some(due) = core.inbox_wake_hold(tokio::time::Instant::now()) {
+                    core.busy = false;
+                    inbox_hold = Some(due);
+                    None
                 } else if core.steering.front().is_some() {
-                    let items = gather_delivery_batch(&mut core, Lane::Steering);
-                    core.running_admission_ids = items
-                        .iter()
-                        .filter_map(|item| item.admission_id.clone())
-                        .collect();
-                    core.busy = true;
-                    core.abort_requested = false;
-                    core.retry_abort_requested = false;
-                    core.running_tool_calls.clear();
-                    Some(items)
+                    Some((
+                        Lane::Steering,
+                        self.pick(&mut core, Lane::Steering, inbox.as_ref()),
+                    ))
                 } else if core.follow_up.front().is_some() {
-                    let items = gather_delivery_batch(&mut core, Lane::FollowUp);
-                    core.running_admission_ids = items
-                        .iter()
-                        .filter_map(|item| item.admission_id.clone())
-                        .collect();
-                    core.busy = true;
-                    core.abort_requested = false;
-                    core.retry_abort_requested = false;
-                    core.running_tool_calls.clear();
-                    Some(items)
+                    Some((
+                        Lane::FollowUp,
+                        self.pick(&mut core, Lane::FollowUp, inbox.as_ref()),
+                    ))
                 } else {
                     core.busy = false;
                     None
                 }
             };
-            if let Some(items) = item {
+            if let Some((lane, items)) = item {
                 // No pickup checkpoint: admission recorded its busy evidence; the
                 // settle's `turn_end` verdict parks the session later. The item leaves
                 // the queue projection BEFORE its turn starts (a stale row would
@@ -109,9 +113,19 @@ impl TurnRunner {
                     let _ = self.emit_action_update(&snapshot);
                 }
                 self.push_roster_delta();
-                self.run_turn(engine, items).await;
+                self.run_turn(engine, lane, items).await;
             } else {
                 self.idle_notify.notify_waiters();
+                // A held inbox row (`SessionCore::inbox_wake_hold`) is not
+                // idle: no activity stamp, no kernel release. It wakes the
+                // runner at its due time; any queued work wakes it sooner.
+                if let Some(due) = inbox_hold {
+                    tokio::select! {
+                        () = self.work_notify.notified() => {}
+                        () = tokio::time::sleep_until(due) => {}
+                    }
+                    continue;
+                }
                 // Every park re-stamps the activity end: the idle-eviction
                 // window measures from the TRUE last activity.
                 {
@@ -142,6 +156,37 @@ impl TurnRunner {
                 }
             }
         }
+    }
+
+    /// Take the next delivery from `lane` and mark the session busy with
+    /// it. An inbox arrival row delivers through
+    /// [`deliver_inbox_arrival_row_locked`]; its accepted row consumes what
+    /// it shows.
+    fn pick(
+        &self,
+        core: &mut SessionCore,
+        lane: Lane,
+        inbox: Option<&std::sync::Arc<pa_core::session_engine::inbox::SessionInbox>>,
+    ) -> Vec<QueuedItem> {
+        let mut items = gather_delivery_batch(core, lane);
+        if let Some(inbox) = inbox {
+            for item in items
+                .iter_mut()
+                .filter(|item| item.queue_key.as_deref() == Some(INBOX_ARRIVAL_QUEUE_KEY))
+            {
+                deliver_inbox_arrival_row_locked(core, item, &self.inbox_arrivals, inbox);
+            }
+        }
+        core.running_admission_ids = items
+            .iter()
+            .filter_map(|item| item.admission_id.clone())
+            .collect();
+        core.busy = true;
+        core.abort_requested = false;
+        core.retry_abort_requested = false;
+        core.run_cut_at_tool_boundary = false;
+        core.running_tool_calls.clear();
+        items
     }
 
     /// Release a parked parent-owned child's kernel; the engine owns the
@@ -312,7 +357,8 @@ impl TurnRunner {
     pub(super) async fn run_turn(
         &self,
         engine: std::sync::Arc<dyn SessionEngine>,
-        items: Vec<QueuedItem>,
+        lane: Lane,
+        mut items: Vec<QueuedItem>,
     ) {
         let Some((first, batched)) = items.split_first() else {
             return;
@@ -321,6 +367,7 @@ impl TurnRunner {
         self.emit_turn_event(json!({ "type": "turn_start" }));
         // The pane reporter's run boundary (TS `agent_start`): working.
         self.herdr.lock().unwrap().run_started();
+        engine.on_turn_start();
 
         let prompt_index = {
             let core = self.core.lock().unwrap();
@@ -374,6 +421,7 @@ impl TurnRunner {
         // Own engine clone, fenced on the session identity it serviced:
         // a branch move or replacement swaps the store mid-review.
         let review_engine = std::sync::Arc::clone(&engine);
+        let settle_engine = std::sync::Arc::clone(&engine);
         let review_session_id = {
             let core = self.core.lock().unwrap();
             core.store
@@ -388,14 +436,19 @@ impl TurnRunner {
             .iter()
             .filter_map(|item| item.admission_id.clone())
             .collect();
-        let items_done: Vec<oneshot::Sender<TurnSettle>> =
-            items.into_iter().filter_map(|item| item.done).collect();
+        // The done senders leave the items behind (done = None): on
+        // shutdown, the batch's unaccepted tail returns to its lane below.
+        let items_done: Vec<oneshot::Sender<TurnSettle>> = items
+            .iter_mut()
+            .filter_map(|item| item.done.take())
+            .collect();
         let turn_outcome = Arc::new(std::sync::Mutex::new(None::<TurnSettle>));
         let turn_outcome_slot = Arc::clone(&turn_outcome);
-        // Whether the engine surfaced any `agent_end` this run (the
-        // trailing synthesized frame is only a fallback).
-        let engine_agent_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let engine_agent_end_seen = Arc::clone(&engine_agent_end);
+        // Whether the last `agent_start` on the wire is still unclosed: the
+        // delivery's own opens it, an engine `agent_start` that passes the
+        // abort gate re-opens it, an engine `agent_end` that passes closes it.
+        let run_open = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let run_open_seen = Arc::clone(&run_open);
         // The pane reporter's settle hold: a run that FAILED without the
         // engine's `agent_end` (a provider error before any terminal
         // assistant row) still parks its error here, so the settle's
@@ -404,26 +457,31 @@ impl TurnRunner {
         let herdr_settle_error = Arc::new(std::sync::Mutex::new(None::<String>));
         let herdr_settle_error_seen = Arc::clone(&herdr_settle_error);
         // Whether the PANE REPORTER already received this run's end —
-        // set only where `run_ended` is actually called (the engine
-        // `agent_end` flag above is set on SIGHT, before the abort gate
-        // can drop the event, so a swallowed `agent_end` must not make
-        // the settle's pane fallback skip and strand the pane working).
+        // set only where `run_ended` is actually called (a later run of the
+        // same turn re-opens it, so it is not the wire flag above).
         let herdr_run_end = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let herdr_run_end_seen = Arc::clone(&herdr_run_end);
-        // Whether the abort gate ever observed the delivery's cancel flag
-        // DURING this turn (the per-event read below): the fallback
-        // `agent_end` keys its silence on THIS association — an abort
-        // landing after the turn's last emitted event (a late abort
-        // racing the settle) never armed the gate and must not suppress
-        // the completed run's fallback (the macroscope finding: the
-        // post-join flag read raced `handle_abort`).
-        let abort_gate_armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let abort_gate_armed_seen = Arc::clone(&abort_gate_armed);
+        let batch_len = items.len();
+        // The arrival row's accepted transcript row consumes what it shows.
+        let arrival_row = items
+            .iter()
+            .position(|item| item.queue_key.as_deref() == Some(INBOX_ARRIVAL_QUEUE_KEY));
+        let inbox_arrivals = self.inbox_arrivals.clone();
+        let inbox = self
+            .inbox_engine
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .and_then(|engine| engine.inbox());
+        // The accepted prefix must survive an engine panic after persistence.
+        let accepted_prefix = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_prefix_seen = Arc::clone(&accepted_prefix);
         let turn = tokio::task::spawn_blocking(move || {
             // The engine's own terminal `turn_end` frame keeps the
             // trailing `Done` fallback silent.
             let mut engine_turn_ended = false;
-            let mut active_committed = false;
+            // The picked batch's accepted rows (primary, then one per
+            // batched item) that passed the abort gate and persisted.
+            let mut accepted_rows = 0usize;
             let mut active_running = false;
             // Restored next-turn rows are PREFIX rows: the "Starting" row
             // drops at the accepted row. The flip closure reads the flag
@@ -433,6 +491,10 @@ impl TurnRunner {
             // success too: one row replaces TS's per-attempt error rows
             // (operator ruling 2026-09-23).
             let mut last_retry_error: Option<String> = None;
+            // A failed run's `agent_end` frame, held for the frame after it.
+            let mut held_run_end: Option<Value> = None;
+            // Whether the run's latest `turn_end` ran tools.
+            let mut last_turn_ran_tools = false;
             let mut emit = |mut event: EngineEvent| -> bool {
                 // A cancelled turn stops consuming its own events, except the frames
                 // TS still broadcasts for an interrupted turn: aborted row/tool settle
@@ -440,9 +502,6 @@ impl TurnRunner {
                 // forever).
                 if matches!(event, EngineEvent::TurnEnd { .. }) {
                     engine_turn_ended = true;
-                }
-                if matches!(event, EngineEvent::AgentEnd { .. }) {
-                    engine_agent_end_seen.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 let aborted_row = matches!(
                     &event,
@@ -461,14 +520,18 @@ impl TurnRunner {
                         )
                 ) || matches!(
                     &event,
-                    EngineEvent::AgentEnd { messages }
+                    EngineEvent::AgentEnd { messages, .. }
                         if messages.iter().any(|message| {
                             message.get("stopReason").and_then(Value::as_str) == Some("aborted")
                         })
+                ) || matches!(
+                    &event,
+                    EngineEvent::AutoRetryEnd { aborted: true, .. }
                 );
                 let abort_settle = matches!(
                     &event,
-                    EngineEvent::ToolExecutionEnd { .. }
+                    EngineEvent::ModelChange(_)
+                        | EngineEvent::ToolExecutionEnd { .. }
                         | EngineEvent::ToolResultMessage(_)
                         | EngineEvent::TurnEnd { .. }
                         | EngineEvent::AgentEnd { .. }
@@ -476,17 +539,49 @@ impl TurnRunner {
                         | EngineEvent::DoneAborted
                 );
                 let mut core = core.lock().unwrap();
-                if core.abort_requested {
-                    // The sighting arms the fallback's silence only when
-                    // load-bearing: a sighting on a run that completed on its own
-                    // cancels nothing.
-                    if core.suppress_aborted_row || !(abort_settle || aborted_row) {
-                        abort_gate_armed_seen.store(true, std::sync::atomic::Ordering::SeqCst);
-                        return false;
+                // The run's TRUE end — an `agent_end` with no queued work
+                // taking the next turn — keys both the note clear here and
+                // the pane's idle debounce below. An internal boundary that
+                // hands the next turn to queued work (the async bash
+                // completion that cut this run) keeps the note for the work
+                // continuing in the next delivery. Clear before the frame:
+                // its roster flush must not publish the stale note.
+                if let EngineEvent::TurnEnd { tool_results, .. } = &event {
+                    last_turn_ran_tools = !tool_results.is_empty();
+                }
+                let agent_end = matches!(event, EngineEvent::AgentEnd { .. });
+                // A queued steer cuts a run only at a tool boundary, and the
+                // row that cut it stays queued until the runner takes it.
+                if agent_end {
+                    core.run_cut_at_tool_boundary =
+                        last_turn_ran_tools && !core.steering.is_empty();
+                }
+                let more_queued =
+                    agent_end && (!core.steering.is_empty() || !core.follow_up.is_empty());
+                if agent_end && !more_queued {
+                    engine.clear_progress_note();
+                }
+                // The turn boundary releases RLM child prompt tasks waiting on
+                // it, also when the abort gate below swallows the frame.
+                if matches!(event, EngineEvent::Done(_) | EngineEvent::DoneAborted) {
+                    engine.on_turn_done();
+                }
+                // Durable model cleanup is independent of visual abort-row
+                // suppression and emits no client-facing frame.
+                if core.abort_requested
+                    && !matches!(&event, EngineEvent::ModelChange(_))
+                    && (core.suppress_aborted_row || !(abort_settle || aborted_row))
+                {
+                    return false;
+                }
+                match &event {
+                    EngineEvent::AgentStart => {
+                        run_open_seen.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
-                    if aborted_row || matches!(&event, EngineEvent::DoneAborted) {
-                        abort_gate_armed_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    EngineEvent::AgentEnd { .. } => {
+                        run_open_seen.store(false, std::sync::atomic::Ordering::SeqCst);
                     }
+                    _ => {}
                 }
                 // The pane reporter's engine boundaries (the TS
                 // `agent_start` / `agent_end` hooks and the auto-retry
@@ -508,8 +603,7 @@ impl TurnRunner {
                         // pane working.
                         herdr_run_end_seen.store(false, std::sync::atomic::Ordering::SeqCst);
                     }
-                    EngineEvent::AgentEnd { messages } => {
-                        let more_queued = !core.steering.is_empty() || !core.follow_up.is_empty();
+                    EngineEvent::AgentEnd { messages, .. } => {
                         herdr
                             .lock()
                             .unwrap()
@@ -565,6 +659,19 @@ impl TurnRunner {
                     }
                 }
                 match &event {
+                    EngineEvent::ModelChange(change) => {
+                        if let Some(Err(error)) = core.store.as_mut().map(|store| {
+                            store.persist_entry(
+                                "model_change",
+                                json!({
+                                    "provider": change.provider, "modelId": change.model_id,
+                                }),
+                            )
+                        }) {
+                            eprintln!("pa-daemon: model-change persistence failed: {error:#}");
+                            return false;
+                        }
+                    }
                     // A `message` entry per row (TS's appendMessage path).
                     EngineEvent::UserMessage(message)
                     | EngineEvent::AssistantMessage(message)
@@ -575,9 +682,12 @@ impl TurnRunner {
                     }
                     // The in-flight tool-call set, updated under the same core lock
                     // the frames sequence under: the roster feed never reads a
-                    // half-applied transition.
+                    // half-applied transition. The session's tool counter bumps
+                    // with the same set, so the summary a roster push composes
+                    // from this event already carries it.
                     EngineEvent::ToolExecutionStart { tool_call_id, .. } => {
                         core.running_tool_calls.insert(tool_call_id.clone());
+                        core.tool_use_count += 1;
                     }
                     EngineEvent::ToolExecutionEnd { tool_call_id, .. } => {
                         core.running_tool_calls.remove(tool_call_id);
@@ -626,17 +736,26 @@ impl TurnRunner {
                 // The `committing`/`running` transitions ride the events that mark the moments.
                 let mut action_frame: Option<SessionActionSnapshot> = None;
                 if !emitting_prefix_rows.get()
-                    && !active_committed
+                    && accepted_rows < batch_len
                     && matches!(
                         event,
                         EngineEvent::UserMessage(_) | EngineEvent::CustomMessage(_)
                     )
                 {
-                    active_committed = true;
-                    if let Some(active) = core.active_action.as_mut() {
-                        active.phase = "committing".to_string();
+                    accepted_rows += 1;
+                    accepted_prefix_seen.store(accepted_rows, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(inbox) = inbox
+                        .as_ref()
+                        .filter(|_| arrival_row == Some(accepted_rows - 1))
+                    {
+                        consume_shown_inbox_items_locked(&mut core, &inbox_arrivals, inbox);
                     }
-                    action_frame = Some(session_snapshot(&core));
+                    if accepted_rows == 1 {
+                        if let Some(active) = core.active_action.as_mut() {
+                            active.phase = "committing".to_string();
+                        }
+                        action_frame = Some(session_snapshot(&core));
+                    }
                 } else if !active_running
                     && matches!(
                         event,
@@ -651,9 +770,9 @@ impl TurnRunner {
                 }
                 let done_result = match &event {
                     EngineEvent::Done(result) => {
-                        // The turn boundary releases RLM child prompt
-                        // tasks waiting on it.
-                        engine.on_turn_done();
+                        if result.is_ok() {
+                            core.turn_completed = true;
+                        }
                         pa_core::session_engine::compaction_trace::trace(
                             "turn.done_emitted",
                             &serde_json::json!({
@@ -667,12 +786,19 @@ impl TurnRunner {
                     }
                     // The aborted settle carries its classification
                     // structurally, not through the error text.
-                    EngineEvent::DoneAborted => {
-                        engine.on_turn_done();
-                        Some(TurnSettle::Aborted)
-                    }
+                    EngineEvent::DoneAborted => Some(TurnSettle::Aborted),
                     _ => None,
                 };
+                // The retry loop decides only after a failed run ended, so
+                // that run's `agent_end` goes out after the next event's
+                // frames (or at the join): a client sees the pending retry
+                // (`auto_retry_start`) before the end of the attempt it
+                // retries.
+                let failed_run_end = matches!(
+                    &event,
+                    EngineEvent::AgentEnd { messages, aborted: false }
+                        if crate::herdr::error_hold_message(messages).is_some()
+                );
                 // One event may map to several wire frames (a custom row
                 // is a message_start + message_end pair).
                 let mut frames: Vec<Value> = match event {
@@ -808,12 +934,22 @@ impl TurnRunner {
                     // `agent_end` (one frame per agent run — retried and
                     // continued runs included); the rows themselves
                     // already went out through their own events, so no
-                    // persist here.
+                    // persist here. A run ending under an abort carries the
+                    // marker: between steps and tools the abort keeps the
+                    // original `toolUse` turn_end, so the marker is the one
+                    // wire fact that separates the aborted settle from a
+                    // normal one.
                     EngineEvent::AgentStart => vec![json!({ "type": "agent_start" })],
-                    EngineEvent::AgentEnd { messages } => vec![json!({
-                        "type": "agent_end",
-                        "messages": messages,
-                    })],
+                    EngineEvent::AgentEnd { messages, aborted } => {
+                        let mut frame = json!({
+                            "type": "agent_end",
+                            "messages": messages,
+                        });
+                        if aborted {
+                            frame["aborted"] = json!(true);
+                        }
+                        vec![frame]
+                    }
                     // Turn-boundary frames: the terminal message and tool
                     // results ride `turn_end`; no persist here.
                     EngineEvent::TurnStart => vec![json!({ "type": "turn_start" })],
@@ -840,8 +976,11 @@ impl TurnRunner {
                     EngineEvent::DoneAborted if !engine_turn_ended => vec![json!({
                         "type": "turn_end",
                         "error": ABORTED_TURN_SETTLE_ERROR,
+                        "aborted": true,
                     })],
-                    EngineEvent::Done(Ok(()) | Err(_)) | EngineEvent::DoneAborted => Vec::new(),
+                    EngineEvent::ModelChange(_)
+                    | EngineEvent::Done(Ok(()) | Err(_))
+                    | EngineEvent::DoneAborted => Vec::new(),
                     EngineEvent::AutoRetryStart {
                         attempt,
                         max_attempts,
@@ -869,6 +1008,7 @@ impl TurnRunner {
                         vec![event]
                     }
                     EngineEvent::AutoRetryEnd {
+                        aborted,
                         success,
                         attempt,
                         final_error,
@@ -879,6 +1019,9 @@ impl TurnRunner {
                             "success": success,
                             "attempt": attempt,
                         });
+                        if aborted {
+                            event["aborted"] = json!(true);
+                        }
                         if let Some(final_error) = &final_error {
                             event["finalError"] = json!(final_error);
                         }
@@ -926,6 +1069,15 @@ impl TurnRunner {
                         }));
                     }
                 }
+                if !frames.is_empty() {
+                    frames.extend(held_run_end.take());
+                }
+                if failed_run_end {
+                    held_run_end = frames
+                        .iter()
+                        .position(|frame| frame["type"] == "agent_end")
+                        .map(|index| frames.remove(index));
+                }
                 // Verification seam: dump the emitted session events for
                 // harness debugging (PA_DAEMON_EVENT_LOG=<path>).
                 if let Ok(path) = std::env::var("PA_DAEMON_EVENT_LOG") {
@@ -959,13 +1111,13 @@ impl TurnRunner {
                     let payload = serde_json::to_vec(&outbound).unwrap_or_default();
                     direct_payloads.push(payload);
                 }
-                drop(core);
-                // Direct frames go out immediately (flushing the parked update
-                // first, preserving event-sequence order); a pure-update batch
-                // stays parked for the flusher.
+                // Direct frames go out while their sequence still owns the
+                // store lock, so another row cannot overtake them.
+                // Flush the parked update first; pure updates stay parked.
                 if !direct_payloads.is_empty() {
                     turn_coalescer.send_direct(&direct_payloads, &events);
                 }
+                drop(core);
                 // The waiting response must observe the frames'
                 // sequences and resolves only after the idle flip.
                 if let Some(result) = done_result {
@@ -993,41 +1145,77 @@ impl TurnRunner {
                 }
             }
             emitting_prefix_rows.set(false);
+            // Sample the worker-owned leaf in memory before accepted rows
+            // persist. The engine stays lazy and the accepted event stays first.
+            let (file_backed, prompt_context_leaf) = {
+                let core = core.lock().unwrap();
+                core.store.as_ref().map_or((false, None), |store| {
+                    (
+                        !store.path.as_os_str().is_empty(),
+                        store.leaf_id().map(str::to_string),
+                    )
+                })
+            };
+            // noSession's in-memory prefix IDs do not identify any durable
+            // context the engine can restore. Only file-backed stores supply
+            // this boundary; their missing-ID validation remains strict.
+            if file_backed {
+                engine.set_prompt_context_boundary(prompt_context_leaf);
+            }
             engine.run_prompt(prompt_index, request, &aborted_probe, &mut emit);
+            held_run_end
         });
-        let _ = turn.await;
+        let held_run_end = turn.await.ok().flatten();
+        let accepted_rows = accepted_prefix.load(std::sync::atomic::Ordering::SeqCst);
         // The emit path is joined: a stale parked partial must not
         // surface after the settle events.
         coalescer.close();
         flusher.abort();
+        if let Some(frame) = held_run_end {
+            self.emit_turn_event(frame);
+        }
 
-        {
+        let more_queued = {
             let mut core = self.core.lock().unwrap();
+            // A shutdown never loses admitted input: the batch items whose
+            // transcript row never persisted exist nowhere else, so they
+            // return to the front of their lane, in order.
+            if core.shutdown_requested && !core.turn_cancelled {
+                let lane_items = match lane {
+                    Lane::Steering => &mut core.steering,
+                    Lane::FollowUp => &mut core.follow_up,
+                };
+                for item in items.into_iter().skip(accepted_rows).rev() {
+                    lane_items.push_front(item);
+                }
+            }
+            // An arrival row the turn never accepted leaves its shown items waiting.
+            core.inbox_shown_unaccepted.clear();
+            let more_queued = !core.steering.is_empty() || !core.follow_up.is_empty();
+            // Publish the note clear and idle transition atomically to
+            // roster readers, which capture core then the engine note.
+            // An abort-gated run may emit no later event to repair a
+            // roster push that observes idle with its old note.
+            // AgentEnd may have retained the note for work withdrawn before
+            // this settle. Recheck the lanes even when that frame was observed.
+            if !more_queued {
+                settle_engine.clear_progress_note();
+            }
             core.busy = false;
             core.active_action = None;
             core.running_admission_ids.clear();
-        }
+            more_queued
+        };
         self.push_roster_delta();
-        // The fallback `agent_end` for runs that ended without a model
-        // turn (session commands, pre-model failures): the engine's own
-        // per-run frames (one per agent run, retried and continued runs
-        // included — the TS `agent_end` `messages` payload) are the real
-        // frames, and a run whose `agent_end` the abort gate swallowed
-        // stays silent exactly like TS (the compact path's detached run).
-        // An ABORTED settle keeps the same silence: the admission
-        // consult's pre-run abort ends the turn with NO engine
-        // `agent_end` at all (no run registered — the
-        // compact-interrupt probe's suppressed-run wire shape, which the
-        // fallback would otherwise break with a synthesized frame). The
-        // association is the abort GATE's own observation during the
-        // turn (the per-event flag read), never a post-join re-read of
-        // the flag: an abort landing after the turn's last emitted event
-        // cancels nothing of this run and must not suppress its fallback
-        // (the flag stays armed until the next pickup — a settle-time
-        // re-read would race `handle_abort` and silence a completed
-        // session-command or pre-model-failure run).
-        let engine_reported_run_end = engine_agent_end.load(std::sync::atomic::Ordering::SeqCst);
-        if !engine_reported_run_end && !abort_gate_armed.load(std::sync::atomic::Ordering::SeqCst) {
+        // The fallback `agent_end` closes the last `agent_start` on the wire
+        // when no engine `agent_end` did: session commands, pre-model
+        // failures, the admission consult's pre-run abort (no run
+        // registered), and a run a compaction or tree move detached (its
+        // frames were swallowed above) — also a later retried or continued
+        // run of the same delivery. The engine's per-run frames (one per
+        // agent run — the TS `agent_end` `messages` payload) are the real
+        // frames.
+        if run_open.load(std::sync::atomic::Ordering::SeqCst) {
             self.emit_turn_event(json!({ "type": "agent_end" }));
         }
         {
@@ -1046,13 +1234,7 @@ impl TurnRunner {
             // `core.busy` flipped to false above; queued lanes still
             // holding items keep the settle debounced so the next pickup
             // cancels the idle flip.
-            let (error_hold, more_queued) = {
-                let core = self.core.lock().unwrap();
-                (
-                    herdr_settle_error.lock().unwrap().take(),
-                    !core.steering.is_empty() || !core.follow_up.is_empty(),
-                )
-            };
+            let error_hold = herdr_settle_error.lock().unwrap().take();
             if !herdr_run_end.load(std::sync::atomic::Ordering::SeqCst) {
                 self.herdr
                     .lock()

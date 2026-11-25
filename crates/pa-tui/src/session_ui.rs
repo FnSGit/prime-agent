@@ -20,8 +20,11 @@ mod sessions_fork;
 mod settings;
 mod share;
 mod stream;
+mod window;
+pub(crate) use window::TranscriptPageNote;
 
 pub(crate) use apply::CompactionAbortNote;
+pub(crate) use apply::InterruptOrigin;
 use auth::{McpAuthIntent, PendingModelSignIn, SetModelOutcome};
 pub(crate) use bash::BashActivityUpdate;
 use bash::{ResyncBash, SideBashRun};
@@ -41,7 +44,7 @@ use prompt::PromptOrder;
 pub(crate) use prompt::PromptSubmitNote;
 pub(crate) use prompt::SubmitBehavior;
 use sessions_fork::{create_session, terminal_columns};
-use settings::PendingConfirm;
+pub(crate) use settings::PendingConfirm;
 pub(crate) use settings::ReloadNote;
 pub(crate) use share::{ShareNote, TracesUploadNote, UpdateNote};
 use share::{ShareRun, TraceUploadAllRun, TracesLoginIntent};
@@ -64,10 +67,11 @@ use crate::chat::{
     ChatEntry, CompactionReason, CompactionState, MessageBlock, RetryState, StatusKind,
     ToolResultView, WorkingState,
 };
+use crate::choice_picker::{ChoicePickerAction, ChoicePurpose};
 use crate::click_dispatch::PressedClick;
 use crate::daemon_client::{DaemonClient, DaemonClientEvent};
 use crate::daemon_reconnect::RecoveryKind;
-use crate::effort_picker::{self, EffortPickerAction};
+use crate::effort_picker;
 use crate::export_share::{self, GhAuthStatus, GistOutcome};
 use crate::goal_surface::{format_goal_status, tray_goal_label, GoalPanel, GoalView};
 use crate::heartbeats_picker::{
@@ -93,7 +97,7 @@ use crate::snapshot::{
 };
 use crate::tree_selector::{TreeSelector, TreeSelectorAction};
 use crate::user_message_selector::{UserMessageSelector, UserMessageSelectorAction};
-use crate::view::{AgentView, ShareLoader};
+use crate::view::{AgentView, Overlay, ShareLoader};
 
 use crossterm::event::KeyEvent;
 use std::time::{Duration, Instant};
@@ -119,6 +123,28 @@ const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING: &str = "Anthropic subscription auth i
 pub(crate) struct CommandCatalogUpdate {
     pub epoch: u64,
     pub skill_commands: Vec<crate::autocomplete::SlashCommandEntry>,
+}
+
+pub(crate) fn attach_capabilities() -> Vec<pa_types::daemon::DaemonClientCapability> {
+    vec![
+        "attach_snapshot".to_string(),
+        "event_sequence".to_string(),
+        "slim_attach".to_string(),
+        "elide_snapshot_images".to_string(),
+        "windowed_snapshot".to_string(),
+    ]
+}
+
+pub(crate) fn last_assistant_text_of(chat: &[ChatEntry]) -> Option<String> {
+    chat.iter().rev().find_map(|entry| match entry {
+        ChatEntry::Assistant(message) => {
+            message.blocks.iter().rev().find_map(|block| match block {
+                MessageBlock::Text(text) => Some(text.clone()),
+                MessageBlock::Thinking(_) => None,
+            })
+        }
+        _ => None,
+    })
 }
 
 pub(crate) struct SessionUi {
@@ -170,6 +196,7 @@ pub(crate) struct SessionUi {
     /// `None` until the first sample, a rebind restarts it.
     speed_stats: Option<SpeedStats>,
     service_tier: Option<String>,
+    pending_model_fallback_message: Option<String>,
     client_settings: Option<std::sync::Arc<dyn crate::client_settings::ClientSettings>>,
     /// The ban-risk warning's view-local dedup (TS
     /// `anthropicSubscriptionWarningShown`): this VIEW's own
@@ -216,6 +243,20 @@ pub(crate) struct SessionUi {
     context: Option<crate::chrome::ContextUsage>,
     list_rows: Vec<Value>,
     pub(crate) turn_active: bool,
+    /// An agent run is in flight (`agent_start` .. `agent_end`): the OSC
+    /// 7501 report stays working across the run's per-step turn
+    /// boundaries.
+    pub(crate) run_open: bool,
+    /// The open run's outcome so far: done, error after a failed step,
+    /// idle after a cancellation.
+    run_outcome: crate::program_status::Status,
+    /// A failed run's outcome, held while its overflow recovery compaction
+    /// runs: that compaction's end decides it.
+    outcome_after_compaction: Option<crate::program_status::Status>,
+    /// The outcome the chat surface reports at rest (the OSC 7501
+    /// done/error input), set at the run's end and cleared at the next
+    /// turn's start, at attach, and when the session closes.
+    pub(crate) settled: Option<crate::program_status::Status>,
     /// Completed turns observed on this connection. A prompt ACK may arrive
     /// after its entire streamed turn; it must not restart the loader then.
     turn_ends_seen: u64,
@@ -237,7 +278,6 @@ pub(crate) struct SessionUi {
     aborted_tools: std::collections::HashSet<String>,
     pub(crate) last_assistant_text: Option<String>,
     pub(crate) osc_sink: crate::clipboard::OscSink,
-    pending_confirm: Option<PendingConfirm>,
     traces: Option<crate::traces::TracesCommandsHandle>,
     provider_auth: Option<crate::provider_auth::ProviderAuthCommandsHandle>,
     /// A model selection parked on the provider's sign-in: the picker applied a model whose
@@ -292,7 +332,7 @@ pub(crate) struct SessionUi {
     factory_updates: mpsc::UnboundedSender<FactoryUpdate>,
     /// The open view's selected run id: the refresh's watch target.
     factory_selected_run: Option<String>,
-    /// The subagent summary line holds keyboard focus.
+    /// The activity dock holds keyboard focus (and renders expanded).
     subagents_focused: bool,
     activity_group: crate::chrome::ActivityGroup,
     subagent_counts: crate::subagents::SubagentCounts,
@@ -300,9 +340,14 @@ pub(crate) struct SessionUi {
     /// subagent linkage; `None` for unpersisted sessions).
     session_file: Option<String>,
     pub(crate) pending_selection: Option<SessionSelection>,
+    pub(crate) pending_selection_rlm_depth: Option<u32>,
+    pub(crate) pending_selection_origin: Option<crate::interactive::SelectionOrigin>,
     /// Whether this run may hand the terminal back to the agents view:
     /// false only for `--no-session` runs.
     pub(crate) return_to_agents_view: bool,
+    /// The open panel was mounted by an agents-view activity line: its close hands the pane back
+    /// to the agents view instead of the dock.
+    panel_returns_to_agents_view: bool,
     client_auth: Option<crate::client_auth::ClientAuthCommandsHandle>,
     keybindings: crate::keybindings::KeybindingsManager,
     prompt_stash: std::sync::Arc<std::sync::Mutex<crate::prompt_stash::PromptStashStore>>,
@@ -324,23 +369,18 @@ pub(crate) struct SessionUi {
     /// Armed prompt round trips (one per spawned request): the headless
     /// idle and exit gates treat an in-flight submit as busy.
     prompt_in_flight: usize,
-    pub(crate) transcript_stale: bool,
+    /// A compaction settled: the tray's context usage refreshes.
+    pub(crate) compaction_settled: bool,
+    pub(crate) window: window::TranscriptWindow,
+    page_notes: mpsc::UnboundedSender<window::TranscriptPageNote>,
     /// Adoption telemetry (counted into `tui exit`); `None` drops events.
     pub(crate) telemetry: Option<std::sync::Arc<dyn crate::interactive::InteractionTelemetry>>,
     scroll_adoption_emitted: bool,
     pub(crate) exit_reason: &'static str,
-    /// The §10 reattach contract: set when a `daemon_closing` update frame
-    /// arrived; the interactive loop drives the reconnect from it.
-    pub(crate) reconnect: Option<crate::daemon_client::DaemonClosingUpdate>,
-    /// The reason the daemon last announced itself closing; cleared once a fresh attach
-    /// (re)establishes the connection. An announced `shutdown` arms the bounded shutdown recovery,
-    /// so a bare session stop never routes into a reconnect.
-    pub(crate) daemon_closing_notice: Option<String>,
-    pub(crate) transport_lost: Option<String>,
+    /// The daemon connection's recovery state, written only through its transition
+    /// ([`crate::interactive::reconnect::Connection::on`]).
+    pub(crate) connection: crate::interactive::reconnect::Connection,
     pub(crate) pending_rebind: Option<String>,
-    /// The re-attach window expired: dispatch is blocked and submits
-    /// surface the error instead of leaving the UI on a silent spinner.
-    pub(crate) reconnection_failed: Option<String>,
     pub(crate) exit_guard: crate::exit_guard::ExitGuard,
     /// The armed double-Escape action: "tree" or "clear", taken by the
     /// second press inside the 500ms window.
@@ -358,6 +398,9 @@ pub(crate) struct SessionUi {
     /// The attached snapshot's bash slot state, consumed by the next
     /// transcript rebuild: a same-session resync runs the `bashFinished` edge off it.
     resync_bash: Option<ResyncBash>,
+    /// The attached snapshot's `isCompacting`, consumed by the next
+    /// transcript rebuild: a compaction in flight keeps its loader.
+    attach_compacting: Option<bool>,
     /// The LAST HUMAN PROMPT's wall-clock time (unix ms) from the attach snapshot's newest user
     /// message: the rebuilt loader anchors its elapsed clock here (operator ruling 2026-09-28: the
     /// waiting/executing timer never resets on a view transition).
@@ -445,7 +488,18 @@ impl SessionUi {
         std::mem::take(&mut self.trim_after_frame)
     }
 
-    /// Hand the keyboard focus to the compact dock on its selected group (operator ruling
+    /// The chat surface's OSC 7501 report: working while a turn or the
+    /// run it belongs to is in flight, including a pending provider retry,
+    /// or while a compaction runs; else the remembered outcome or idle.
+    pub(crate) fn program_status(&self, view: &AgentView) -> crate::program_status::Status {
+        if self.turn_active || self.run_open || view.retry.is_some() || view.compaction.is_some() {
+            crate::program_status::Status::Working
+        } else {
+            self.settled.unwrap_or(crate::program_status::Status::Idle)
+        }
+    }
+
+    /// Hand the keyboard focus to the dock on its selected group (operator ruling
     /// 2026-09-26: leaving a panel lands on the panel's own dock item, never the prompt bar).
     fn focus_activity_dock(&mut self, view: &mut AgentView) {
         self.subagents_focused = true;

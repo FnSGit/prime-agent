@@ -1,6 +1,7 @@
 //! RLM child admission vs worker replacement: concurrent spawns stay
-//! admitted, a child replaced between admission and its task prompt still
-//! receives the prompt exactly once, and no admitted child is torn down.
+//! admitted, a child whose worker is replaced after admission still
+//! receives its task prompt exactly once and keeps its answer, and no
+//! admitted child is torn down.
 // Stack-resident futures by design on the daemon's hot paths.
 #![allow(clippy::large_futures)]
 // Narrowing casts sit at OS boundaries (pid/fd/time/size) where the kernel
@@ -29,7 +30,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use pa_core::session_engine::rlm_host::{RlmSpawnRequest, RlmSubagentHost};
+use pa_core::session_engine::rlm_host::{RlmSpawnKind, RlmSpawnRequest, RlmSubagentHost};
 use pa_daemon::rlm_children::{ParentIdentity, SupervisorChildSessions};
 use pa_daemon::supervisor_link::SupervisorLink;
 use serde_json::{json, Value};
@@ -209,6 +210,7 @@ fn children(socket: &Path, agent_dir: &Path, script: &Path) -> SupervisorChildSe
             agent_dir.to_path_buf(),
             /*telemetry_disabled*/ true,
         )),
+        String::new(),
     );
     sessions.set_identity(ParentIdentity {
         rlm_depth: 0,
@@ -230,8 +232,10 @@ fn spawn_request(name: &str, prompt: &str) -> RlmSpawnRequest {
         name: Some(name.to_string()),
         model: None,
         thinking: None,
-        cell_source_code: None,
+        cwd: None,
+        kind: RlmSpawnKind::Subagent,
         spawned_by_request_id: None,
+        factory: None,
     }
 }
 
@@ -327,8 +331,10 @@ async fn concurrent_spawns_prompt_exactly_once_across_a_worker_replacement() {
         );
     }
 
-    // The replacement: kill kid-a's worker between its admission and its
-    // task prompt (the detached prompt fires at the turn boundary, below).
+    // The replacement: kill kid-a's worker after its admission. No parent
+    // turn is running, so the detached task prompt fires at spawn and the
+    // kill can land before the prompt, during the turn, or after the answer;
+    // every order must keep the prompt and the answer.
     let kid_a_worker_id = {
         let row = wait_until(Duration::from_mins(1), "kid-a roster row", || {
             roster_summaries(&mut client, "l1")

@@ -61,7 +61,9 @@ impl Worker {
                         return response_failure(
                             None,
                             "create",
-                            &format!("Invalid thinking level \"{level}\". Valid values: off, minimal, low, medium, high, xhigh, max"),
+                            &format!(
+                                "Invalid thinking level \"{level}\". Valid values: off, minimal, low, medium, high, xhigh, max"
+                            ),
                             None,
                         );
                     }
@@ -177,6 +179,9 @@ impl Worker {
                 }
                 _ => (None, None, None, None),
             };
+        let factory_child = payload
+            .get("runtimeMetadata")
+            .is_some_and(|metadata| metadata.get("factory").is_some());
         let thinking = payload
             .get("thinking")
             .and_then(Value::as_str)
@@ -194,9 +199,22 @@ impl Worker {
         // Set by the continuing arm when it OPENED an existing session file:
         // `is_continuing` reads this arm fact, never an existence check.
         let mut opened_existing_session = false;
+        let mut restored_tier: Option<Option<pa_types::ai::ServiceTier>> = None;
         // The fresh arms defer their creation prefix to after the startup scope
         // registers, so a fresh `--models` session persists the scoped startup pick.
         let mut fresh_prefix = FreshPrefixPlan::None;
+        let (settings, trace_consent) = pa_core::agent_traces::ContinuousTraceUpload::load_settings(
+            std::path::Path::new(&cwd),
+            &self.config.agent_dir,
+        );
+        let traces = |path: &std::path::Path| {
+            pa_core::agent_traces::ContinuousTraceUpload::install(
+                std::path::Path::new(&cwd),
+                &self.config.agent_dir,
+                Some(path),
+                trace_consent.clone(),
+            )
+        };
         let mut store = match (&session_path, no_session) {
             (Some(path), false) if path.exists() => {
                 let loaded = {
@@ -215,14 +233,29 @@ impl Worker {
                 };
                 match loaded {
                     Ok(mut opened) => {
+                        opened.trace_upload = traces(&opened.path);
                         opened_existing_session = true;
+                        if opened.skipped_lines > 0 {
+                            // The rows stay on disk (the append-only
+                            // reopen): the skip count is the damage
+                            // report the torn-tail repair can act on — a
+                            // silent skip is how a torn session degraded
+                            // unnoticed (the operator's 2026-10-08
+                            // report).
+                            eprintln!(
+                                "pa-daemon: session {} skipped {} unparsable row(s) on open; they stay on disk",
+                                path.display(),
+                                opened.skipped_lines
+                            );
+                        }
                         // The session-model restore records its decision only for a path
                         // this worker opened — a failed open never leaks the binding into a
                         // later create.
                         self.engine.set_session_file(path.clone());
-                        // One fold serves both consumers: the model restore takes its saved
+                        // One fold serves all consumers: the model restore takes its saved
                         // context off the store this create just opened.
                         let restored = opened.restored_settings();
+                        restored_tier = opened.has_service_tier().then_some(restored.service_tier);
                         let has_thinking_level = opened.has_thinking_level();
                         let saved = crate::agent_engine::saved_session_context_from_parts(
                             &restored,
@@ -251,17 +284,23 @@ impl Worker {
                             false,
                         );
                         let _ = opened.append_session_state("active");
-                        let persisted = if opened.window.is_some() {
-                            opened.persist_appended(append_start)
-                        } else {
-                            opened.rewrite()
-                        };
+                        // A reopen is APPEND-ONLY (the operator's 2026-10-08
+                        // report: a reopened session showed none of the old
+                        // messages): the full reader skips malformed rows in
+                        // memory, and the legacy full-file rewrite this
+                        // arm carried DELETED them from disk — a gap early
+                        // in the parent chain took the whole transcript
+                        // with it. Only the rows this open appended
+                        // persist; the file keeps every original byte for
+                        // the torn-tail repair to see.
+                        let persisted = opened.persist_appended(append_start);
                         if let Err(error) = persisted {
                             return response_failure(None, "create", &error.to_string(), None);
                         }
-                        // Prime the usage fold on the file's final identity (the full-reader
-                        // fallback's rewrite replaces the inode), off the runtime and before
-                        // the core lock: summaries under the lock fold only the appended tail.
+                        // Prime the usage fold on the file's final identity,
+                        // off the runtime and before the core lock:
+                        // summaries under the lock fold only the appended
+                        // tail.
                         let primed = path.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             crate::session_store::read_session_info(&primed)
@@ -279,6 +318,7 @@ impl Worker {
                     rlm_depth.unwrap_or(0),
                 );
                 created.set_path(path.clone());
+                created.trace_upload = traces(&created.path);
                 let acquired = {
                     let path = path.clone();
                     let agent_dir = self.config.agent_dir.clone();
@@ -317,6 +357,7 @@ impl Worker {
                 );
                 let path = session_dir.join(session_file_name(created.session_id()));
                 created.set_path(path.clone());
+                created.trace_upload = traces(&created.path);
                 let acquired = {
                     let path = path.clone();
                     let agent_dir = self.config.agent_dir.clone();
@@ -343,9 +384,14 @@ impl Worker {
                     "create",
                     "Session cannot be both no-session and session-pathed",
                     None,
-                )
+                );
             }
         };
+        // The worker owns the session file; the engine reads it for the
+        // system prompt's conversation-log path and the local harness dir.
+        if !store.path.as_os_str().is_empty() {
+            self.engine.set_session_file(store.path.clone());
+        }
 
         // The `models` patterns (else settings `enabledModels`) resolve once into
         // the scoped list, AFTER the store open (the saved-model restore's wait
@@ -356,21 +402,29 @@ impl Worker {
                 .filter_map(Value::as_str)
                 .map(str::to_string)
                 .collect::<Vec<String>>(),
-            None => pa_core::settings::SettingsManager::create(&cwd, &self.config.agent_dir)
-                .get_enabled_models()
-                .unwrap_or_default(),
+            None => settings.get_enabled_models().unwrap_or_default(),
         };
+        let is_continuing = opened_existing_session;
         let scoped_models = if model_patterns.is_empty() {
             Vec::new()
         } else {
-            let registry = crate::state_getters::worker_model_registry(&self.config.agent_dir);
-            let available: Vec<pa_types::ai::Model> =
-                registry.get_available().into_iter().cloned().collect();
-            pa_core::models::resolve_model_scope_from_models(&model_patterns, &available)
+            let mut registry = crate::state_getters::worker_model_registry(&self.config.agent_dir);
+            pa_core::models::resolve_model_scope_from_models_with_readiness(
+                &mut registry,
+                &model_patterns,
+                settings
+                    .get_default_provider()
+                    .zip(settings.get_default_model()),
+                is_continuing,
+                pa_core::models::SESSION_MODEL_RESTORE_READINESS_TIMEOUT_MS,
+            )
+            .await
         };
-        let is_continuing = opened_existing_session;
-        self.engine
-            .configure_startup_scope(scoped_models.clone(), is_continuing);
+        self.engine.configure_startup_scope(
+            scoped_models.clone(),
+            model_patterns.clone(),
+            is_continuing,
+        );
         // The fresh arms' deferred creation prefix runs here, against the
         // registered scope; the continuing arm wrote its own prefix above, so
         // the scope never changes a continuing file's pinned model and thinking.
@@ -429,27 +483,18 @@ impl Worker {
                 }
             }
         }
-        let restored_tier = store
-            .has_service_tier()
-            .then(|| store.restored_settings().service_tier);
         // Restore the persisted queue snapshot (crash/respawn recovery) from
         // the worker recovery journal.
-        let (steering, follow_up) = {
+        let (steering, follow_up, restored_suspended) = {
             let guard = self.recovery.lock().unwrap();
             match guard.as_ref() {
                 Some(journal) => restore_queue_snapshot(journal, &self.config.active_session_id),
-                None => (VecDeque::new(), VecDeque::new()),
+                None => (VecDeque::new(), VecDeque::new(), false),
             }
         };
-        // The worker owns the session file; the engine reads it for the
-        // system prompt's conversation-log path and the local harness dir.
-        if !store.path.as_os_str().is_empty() {
-            self.engine.set_session_file(store.path.clone());
-        }
         // The session's settings-seeded switches: a restarted session re-seeds
         // its auto-compaction flag from the persisted `compaction.enabled`.
         let (service_tier, steering_mode, follow_up_mode, auto_compaction_enabled) = {
-            let settings = pa_core::settings::SettingsManager::create(&cwd, &self.config.agent_dir);
             let queue_mode = |mode: pa_core::settings::QueueModeSetting| -> String {
                 match mode {
                     pa_core::settings::QueueModeSetting::All => "all".to_string(),
@@ -485,6 +530,12 @@ impl Worker {
             core.cwd = cwd;
             core.steering = steering;
             core.follow_up = follow_up;
+            // The restored lanes carry their suspension: a user-aborted queue
+            // revives still parked, never auto-running its prompts.
+            core.queued_input_suspended = restored_suspended;
+            // A resumed session's tool counter re-seeds from its file: a
+            // revived worker keeps the count its roster rows carried.
+            core.tool_use_count = store.tool_call_count();
             core.store = Some(store);
             if let Some(disclosure) = &interrupted_compaction {
                 if let Some(store) = core.store.as_mut() {
@@ -506,8 +557,10 @@ impl Worker {
             }
             core.created = true;
             core.abort_requested = false;
-            // A fresh session starts live: the previous close's
-            // `session_closed` marker clears with the new session.
+            core.turn_cancelled = false;
+            core.turn_completed = false;
+            // A fresh session starts live: the previous close ends with
+            // the new session.
             if let Some(agent_engine) = &self.agent_engine {
                 agent_engine.clear_session_closed();
             }
@@ -516,7 +569,10 @@ impl Worker {
             core.active_service_tier = clamped_tier;
             core.steering_mode.clone_from(&steering_mode);
             core.follow_up_mode.clone_from(&follow_up_mode);
-            core.forced_all_steering = false;
+            // The restored rows carry their forced-batch flag: the batch
+            // gate rides the lane, so a restored forced batch keeps its
+            // one-turn semantics.
+            core.forced_all_steering = core.steering.iter().any(|item| item.forced_batch);
             core.scoped_models.clone_from(&scoped_entries);
             core.retry_abort_requested = false;
             // The session's depth falls back to the opened file's header: a resumed
@@ -552,10 +608,13 @@ impl Worker {
             thinking,
             child_script: child_script.clone(),
             semantic_spawn,
+            factory_child,
         }) {
             return response_failure(None, "create", &error.to_string(), None);
         }
-        self.reseed_rlm_children().await;
+        if opened_existing_session {
+            self.reseed_rlm_children().await;
+        }
         // The built-in Herdr connector binds here, per session: the pane
         // identity comes from the create payload's client env (the client
         // that owns the pane sent it), never from this process's ambient
@@ -727,7 +786,14 @@ pub(super) fn active_session_id_of(payload: &[u8]) -> String {
 pub(super) fn worker_server_capabilities(agent_dir: &std::path::Path) -> Vec<String> {
     // The factory lane advertises only while its opt-in gate reads
     // enabled (`factory.enabled`, default off).
-    crate::factory_activity::advertised_server_capabilities(agent_dir)
+    let mut capabilities = crate::factory_activity::advertised_server_capabilities(agent_dir);
+    // The session-plane capability this worker's command set supports:
+    // the idle cancel's scoped abort. A client consults the SERVING
+    // worker's own advertisement, never the supervisor's — a
+    // mixed-version daemon must not route a scoped abort to a worker
+    // that would read it as the full abort.
+    capabilities.push("background_cell_abort".to_string());
+    capabilities
 }
 
 /// RLM depth fields of a create payload: `(depth, max_depth)`. Values must

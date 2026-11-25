@@ -35,21 +35,17 @@ pub struct AnalyticsSink {
 
 impl AnalyticsSink {
     /// Sink posting to `endpoint` (the product passes [`ANALYTICS_ENDPOINT`];
-    /// tests pass a local stub) with the TS-parity 1.5s request timeout.
-    #[must_use]
-    pub fn new(endpoint: impl Into<String>) -> Self {
-        Self::with_timeout(endpoint, DEFAULT_REQUEST_TIMEOUT)
-    }
-
-    /// Sink with an explicit request timeout (tests).
+    /// tests pass a local stub) through the caller's HTTP client builder (the
+    /// product's shared TLS trust set), with the TS-parity 1.5s request
+    /// timeout.
     ///
     /// # Panics
     ///
-    /// Panics if the reqwest HTTP client (rustls backend) cannot be built.
+    /// Panics if the supplied HTTP client builder cannot be built.
     #[must_use]
-    pub fn with_timeout(endpoint: impl Into<String>, timeout: Duration) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(timeout)
+    pub fn new(endpoint: impl Into<String>, http_builder: reqwest::ClientBuilder) -> Self {
+        let http = http_builder
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             .build()
             .expect("reqwest client with rustls");
         Self {

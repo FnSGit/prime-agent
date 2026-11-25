@@ -2,7 +2,7 @@
 //! the session resume/list/switch surfaces.
 use super::{
     anyhow, info_commands, key_event_to_id, AgentView, DaemonClient, DaemonCommand, DockFold,
-    Duration, InfoContent, InteractiveOptions, KeyEvent, Map, RebuildKind, Result,
+    Duration, InfoContent, InteractiveOptions, KeyEvent, Map, Overlay, RebuildKind, Result,
     SessionSelection, SessionUi, TreeSelector, TreeSelectorAction, UserMessageSelector,
     UserMessageSelectorAction, Value, UI_REQUEST_TIMEOUT_MS,
 };
@@ -44,7 +44,7 @@ impl SessionUi {
         ) {
             Some(mut selector) => {
                 selector.set_initial_selection(initial_selected);
-                view.tree_selector = Some(selector);
+                view.overlay = Some(Overlay::Tree(selector));
             }
             None => self.note("No entries in session", view),
         }
@@ -62,7 +62,7 @@ impl SessionUi {
             return Ok(());
         };
         let action = {
-            let Some(selector) = view.tree_selector.as_mut() else {
+            let Some(Overlay::Tree(selector)) = view.overlay.as_mut() else {
                 return Ok(());
             };
             let kb = view.editor.keybindings();
@@ -71,7 +71,7 @@ impl SessionUi {
         match action {
             TreeSelectorAction::None => {}
             TreeSelectorAction::Cancel => {
-                view.tree_selector = None;
+                view.overlay = None;
             }
             TreeSelectorAction::LabelChange { entry_id, label } => {
                 let request = DaemonCommand::SetSessionEntryLabel {
@@ -86,7 +86,7 @@ impl SessionUi {
                     .await
                 {
                     Ok(_) => {
-                        if let Some(selector) = view.tree_selector.as_mut() {
+                        if let Some(Overlay::Tree(selector)) = view.overlay.as_mut() {
                             selector.update_label(&entry_id, label.as_deref());
                         }
                     }
@@ -99,11 +99,10 @@ impl SessionUi {
                 custom_instructions,
             } => {
                 // Selecting the current leaf is a no-op.
-                let leaf = view
-                    .tree_selector
-                    .as_ref()
-                    .and_then(|selector| selector.current_leaf_id().map(str::to_string));
-                view.tree_selector = None;
+                let leaf = match view.overlay.take() {
+                    Some(Overlay::Tree(selector)) => selector.current_leaf_id().map(str::to_string),
+                    _ => None,
+                };
                 if leaf.as_deref() == Some(target_id.as_str()) {
                     self.note("Already at this point", view);
                     self.dirty = true;
@@ -198,7 +197,7 @@ impl SessionUi {
             self.note("No messages to fork from", view);
             return Ok(());
         }
-        view.fork_selector = Some(UserMessageSelector::new(messages));
+        view.overlay = Some(Overlay::Fork(UserMessageSelector::new(messages)));
         self.dirty = true;
         Ok(())
     }
@@ -213,7 +212,7 @@ impl SessionUi {
             return Ok(());
         };
         let action = {
-            let Some(selector) = view.fork_selector.as_mut() else {
+            let Some(Overlay::Fork(selector)) = view.overlay.as_mut() else {
                 return Ok(());
             };
             let kb = view.editor.keybindings();
@@ -221,11 +220,11 @@ impl SessionUi {
         };
         match action {
             UserMessageSelectorAction::Select(entry_id) => {
-                view.fork_selector = None;
+                view.overlay = None;
                 self.fork(&entry_id, None, view).await?;
             }
             UserMessageSelectorAction::Cancel => {
-                view.fork_selector = None;
+                view.overlay = None;
             }
             UserMessageSelectorAction::None => {}
         }
@@ -513,6 +512,14 @@ pub(super) async fn create_session(
         let env = pa_types::daemon::herdr_env::collect_client_env(|key| std::env::var(key).ok());
         (!env.is_empty()).then_some(env)
     };
+    // TS main.ts `launchEnv` (:1092): the client's own environment
+    // travels on the create so the session's worker runs in the
+    // environment of the terminal that opened it, not the daemon's
+    // boot environment.
+    let launch_env = {
+        let env = pa_types::daemon::launch_env::collect_process_launch_env();
+        (!env.is_empty()).then_some(env)
+    };
     let data = match client
         .request_ok(DaemonCommand::Create {
             id: None,
@@ -532,7 +539,7 @@ pub(super) async fn create_session(
                 .then_some(DaemonSessionLifecycle::ClientOwned),
             // The client's Herdr pane identity travels on the create.
             env: client_env,
-            launch_env: None,
+            launch_env,
             rest: Map::default(),
         })
         .await

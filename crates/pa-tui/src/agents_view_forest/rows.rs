@@ -4,13 +4,17 @@ use serde_json::Value;
 
 use super::lineage::{depth_consistent_parent, is_subagent_descendant};
 use super::{
-    session_model, session_title, AgentsViewRow, AgentsViewScope, Rollup, RowKind,
-    SUMMARY_ROW_PREFIX,
+    session_model, session_title, ActivityCounts, AgentsViewRow, AgentsViewScope, Rollup, RowKind,
+    SessionActivity, SUMMARY_ROW_PREFIX,
 };
 use crate::agents_view_state::{
-    now_ms, relative_age, section_rank, summary_for_record, Section, UnifiedRecord,
+    is_unnamed_empty, now_ms, relative_age, section_rank, summary_for_record, Section,
+    UnifiedRecord,
 };
-use crate::subagents::{is_subagent_summary, summary_identity_keys, summary_parent_keys};
+use crate::bash_view::ShellCounts;
+use crate::subagents::{
+    is_decision_child_summary, is_subagent_summary, summary_identity_keys, summary_parent_keys,
+};
 
 struct BaseRow {
     kind: RowKind,
@@ -26,6 +30,8 @@ struct BaseRow {
     descendant_cost: f64,
     descendant_count: usize,
     running_subagent_count: usize,
+    /// The session's own shells and factory counts (never subtree-aggregated).
+    activity: SessionActivity,
     record: usize,
     search_score: Option<f64>,
 }
@@ -39,6 +45,7 @@ pub(crate) fn build_rows<S: std::hash::BuildHasher + Default>(
     expanded: &HashSet<String, S>,
     program_shown: &HashSet<String, S>,
     rollups: &HashMap<String, Rollup, S>,
+    activity: &ActivityCounts,
     anchor: Option<&str>,
 ) -> Vec<AgentsViewRow> {
     let now = now_ms();
@@ -65,6 +72,12 @@ pub(crate) fn build_rows<S: std::hash::BuildHasher + Default>(
     let mut base: Vec<BaseRow> = Vec::with_capacity(records.len());
     for (position, record) in records.iter().enumerate() {
         let summary = summary_for_record(record);
+        // The Decision API child (`decisionChild`): a System 1 server the
+        // user never interacts with — no row renders, while its record
+        // stays in the rollups so the parent's spend still covers it.
+        if is_decision_child_summary(&summary) {
+            continue;
+        }
         let kind = if !is_direct_scope_child(&summary)
             && (is_subagent_summary(&summary)
                 || records
@@ -95,6 +108,33 @@ pub(crate) fn build_rows<S: std::hash::BuildHasher + Default>(
         );
         let rollup = rollups.get(&record.identity).copied().unwrap_or_default();
         let model = session_model(&summary);
+        let live = match summary.get("activeSessionId").and_then(Value::as_str) {
+            Some(active) => activity.live.get(active).copied().unwrap_or_default(),
+            // Without a live kernel, the catalog row's stored factory specs.
+            None => SessionActivity {
+                shells: ShellCounts::default(),
+                factory: crate::factory_view::FactoryCounts {
+                    specs: record
+                        .saved
+                        .as_ref()
+                        .map_or(0, crate::factory_view::stored_spec_count),
+                    runs: crate::factory_view::FactoryRunCounts::default(),
+                },
+            },
+        };
+        // Persistent shells count from the daemon list only; the kernel adds its other shells.
+        let persistent = summary
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .and_then(|session_id| activity.persistent_shells.get(session_id))
+            .map_or(0, |shells| shells.persistent);
+        let activity = SessionActivity {
+            shells: ShellCounts {
+                running: live.shells.running - live.shells.persistent + persistent,
+                persistent,
+            },
+            ..live
+        };
         base.push(BaseRow {
             kind,
             section: record.section,
@@ -112,6 +152,7 @@ pub(crate) fn build_rows<S: std::hash::BuildHasher + Default>(
             descendant_cost: rollup.descendants,
             descendant_count: rollup.descendant_count,
             running_subagent_count: 0,
+            activity,
             summary,
             record: position,
         });
@@ -243,8 +284,8 @@ struct RowForest<'a, S: std::hash::BuildHasher + Default> {
 }
 
 impl<S: std::hash::BuildHasher + Default> RowForest<'_, S> {
-    /// Emit one row, then its ONE summary line, then its expanded children: the line expands to
-    /// the FULL roster in one group, the running children first.
+    /// Emit one row, then its subagents block, then its shells and factory lines (after the
+    /// block, so an expanded summary line stays directly above its children).
     fn emit(
         &self,
         index: usize,
@@ -254,9 +295,21 @@ impl<S: std::hash::BuildHasher + Default> RowForest<'_, S> {
     ) {
         let row = &self.base[index];
         rows.push(agents_row(row, depth, parent_identity));
-        let Some(children) = self.children_by_parent.get(&index) else {
-            return;
-        };
+        if let Some(children) = self.children_by_parent.get(&index) {
+            self.emit_subagents(row, children, depth, rows);
+        }
+        rows.extend(activity_rows(row, depth + 1));
+    }
+
+    /// The ONE summary line, then its expanded children: the line expands to the FULL roster in
+    /// one group, the running children first.
+    fn emit_subagents(
+        &self,
+        row: &BaseRow,
+        children: &[usize],
+        depth: usize,
+        rows: &mut Vec<AgentsViewRow>,
+    ) {
         if children.is_empty() {
             return;
         }
@@ -269,7 +322,7 @@ impl<S: std::hash::BuildHasher + Default> RowForest<'_, S> {
         if !is_expanded {
             return;
         }
-        let mut sorted = children.clone();
+        let mut sorted = children.to_vec();
         sorted.sort_by(|a, b| compare_base(&self.base[*a], &self.base[*b], self.anchor));
         // One group, one order (the operator's contract): the running rows first — the
         // partition is explicit rather than left to the comparator's section ordering.
@@ -327,7 +380,7 @@ fn agents_row(row: &BaseRow, depth: usize, parent_identity: Option<&str>) -> Age
 }
 
 /// The subagents line under one agent (the operator's 2026-09-28 one-dropdown directive):
-/// `"{total} subagents ({running} running)"` — `total` = the FULL descendant roster, `running` =
+/// `"{total} subagents · {running} running"` — `total` = the FULL descendant roster, `running` =
 /// the running subset — expanding to the whole roster in one group, the running rows first (a
 /// sanctioned divergence: TS titles one `"{n} subagents running"` line). The line reuses its
 /// parent's summary so the open action and selection keys resolve the parent; the `cost` cell is
@@ -341,7 +394,10 @@ fn merged_summary_row(parent: &BaseRow, depth: usize, expanded: bool) -> AgentsV
         identity: format!("{SUMMARY_ROW_PREFIX}{}", parent.identity),
         parent_identity: Some(parent.identity.clone()),
         summary: parent.summary.clone(),
-        title: format!("{total} subagents ({running} running)"),
+        title: format!(
+            "{total} subagent{} \u{b7} {running} running",
+            if total == 1 { "" } else { "s" }
+        ),
         model: String::new(),
         cost: parent.descendant_cost,
         age: String::new(),
@@ -351,6 +407,54 @@ fn merged_summary_row(parent: &BaseRow, depth: usize, expanded: bool) -> AgentsV
         expanded,
         has_spawn_code: false,
     }
+}
+
+/// The node's own `$ N shells[ · M persistent]` and `⚙ N factories · M running[ · K paused]` lines,
+/// each only when one of its counts is nonzero.
+/// Like the summary line they reuse the parent's summary, so the open action resolves the parent.
+fn activity_rows(parent: &BaseRow, depth: usize) -> Vec<AgentsViewRow> {
+    let line = |kind: RowKind, prefix: &str, title: String| AgentsViewRow {
+        kind,
+        section: parent.section,
+        identity: format!("{prefix}{}", parent.identity),
+        parent_identity: Some(parent.identity.clone()),
+        summary: parent.summary.clone(),
+        title,
+        model: String::new(),
+        cost: 0.0,
+        age: String::new(),
+        depth,
+        descendant_count: 0,
+        running_subagent_count: 0,
+        expanded: false,
+        has_spawn_code: false,
+    };
+    let SessionActivity { shells, factory } = parent.activity;
+    let mut rows = Vec::new();
+    if shells.running > 0 {
+        let persistent = if shells.persistent > 0 {
+            format!(" · {} persistent", shells.persistent)
+        } else {
+            String::new()
+        };
+        rows.push(line(
+            RowKind::Shells,
+            super::SHELLS_ROW_PREFIX,
+            format!(
+                "$ {} shell{}{persistent}",
+                shells.running,
+                if shells.running == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    if let Some(label) = factory.label() {
+        rows.push(line(
+            RowKind::FactoryRuns,
+            super::FACTORY_ROW_PREFIX,
+            format!("\u{2699} {label}"),
+        ));
+    }
+    rows
 }
 
 /// The summary's `spawnCode` is a string with a non-blank trim — the ONE predicate and the
@@ -410,7 +514,7 @@ fn spawn_code_rows(
     rows
 }
 
-/// Section rank, then empty sessions sink, then recency, then title, then session id.
+/// Section rank, then unnamed empty sessions sink, then recency, then title, then session id.
 fn compare_base(a: &BaseRow, b: &BaseRow, anchor: Option<&str>) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     fn get_str<'a>(summary: &'a Value, field: &str) -> Option<&'a str> {
@@ -450,14 +554,9 @@ fn compare_base(a: &BaseRow, b: &BaseRow, anchor: Option<&str>) -> std::cmp::Ord
     if section != Ordering::Equal {
         return section;
     }
-    // Message-less rows sink to the bottom of their section (anchor exempt).
+    // Unnamed message-less rows sink to the bottom of their section (anchor exempt).
     let empty = |row: &BaseRow| {
-        row.summary
-            .get("messageCount")
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            == 0
-            && get_str(&row.summary, "sessionId") != anchor
+        is_unnamed_empty(&row.summary) && get_str(&row.summary, "sessionId") != anchor
     };
     let empty_rank = empty(a).cmp(&empty(b));
     if empty_rank != Ordering::Equal {
